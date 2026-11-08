@@ -30,6 +30,7 @@ const state = {
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
+const ROW_CLICK_SELECTOR = "[data-product-model-row], [data-product-id], [data-bom-level1-row], [data-bom-level2-row], [data-tree-group], tr[data-edit-material]";
 const content = $("#pageContent");
 const modalLayer = $("#modalLayer");
 const modalBody = $("#modalBody");
@@ -269,6 +270,7 @@ async function loadCoreData() {
 
 async function renderPage(page = state.page) {
   setNav(page);
+  content.dataset.view = page;
   content.innerHTML = '<div class="loading-state"><span class="spinner"></span>Loading your workspace…</div>';
   try {
     if (page === "dashboard") return await renderDashboard();
@@ -1393,6 +1395,11 @@ document.addEventListener("click", async (event) => {
     try { return await expandBomTree(treeExpand); }
     catch (error) { toast(error.message, true); return; }
   }
+  // Edit / Delete columns (last two cells) are not part of the row's click area:
+  // only the buttons themselves act there.
+  const clickedCell = event.target.closest("td");
+  const clickedRow = clickedCell?.parentElement;
+  if (clickedRow?.matches(ROW_CLICK_SELECTOR) && clickedCell.cellIndex >= clickedRow.cells.length - 2 && !event.target.closest("button, a")) return;
   const treeGroup = event.target.closest("[data-tree-group]");
   if (treeGroup && !event.target.closest("button, a, input, select")) {
     treeGroup.querySelector("[data-tree-expand]")?.click();

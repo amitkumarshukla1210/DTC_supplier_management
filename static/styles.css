@@ -288,9 +288,16 @@ tr[data-tree-depth="3"] > td { font-size: 12px; }
 .master-details h3 { margin: 17px 0 0; font-size: 12px; }
 .empty-bom-action { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 12px; padding: 18px; color: #718397; font-size: 11px; }
 .clickable-row { cursor: pointer; }
-.clickable-row:hover, .clickable-row:focus-visible { background: #e7f2fa !important; outline: 2px solid #8fc2df; outline-offset: -2px; }
+/* Row highlight stops before the Edit / Delete columns (last two cells). */
+.clickable-row:hover, .clickable-row:focus-visible, tr[data-edit-material]:hover, tr[data-edit-material]:focus-visible { outline: none; }
+.clickable-row:hover > td:not(:nth-last-child(-n+2)), .clickable-row:focus-visible > td:not(:nth-last-child(-n+2)),
+tr[data-edit-material]:hover > td:not(:nth-last-child(-n+2)), tr[data-edit-material]:focus-visible > td:not(:nth-last-child(-n+2)) { background: #e7f2fa !important; box-shadow: inset 0 2px 0 #8fc2df, inset 0 -2px 0 #8fc2df; }
+.clickable-row:hover > td:first-child, .clickable-row:focus-visible > td:first-child,
+tr[data-edit-material]:hover > td:first-child, tr[data-edit-material]:focus-visible > td:first-child { box-shadow: inset 2px 2px 0 #8fc2df, inset 0 -2px 0 #8fc2df; }
+tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 .clickable-row[data-has-bom="false"] { cursor: default; }
-.clickable-row[data-has-bom="false"]:hover, .clickable-row[data-has-bom="false"]:focus-visible { background: inherit !important; outline: none; }
+.clickable-row[data-has-bom="false"]:hover > td:not(:nth-last-child(-n+2)), .clickable-row[data-has-bom="false"]:focus-visible > td:not(:nth-last-child(-n+2)),
+.clickable-row[data-has-bom="false"]:hover > td:first-child, .clickable-row[data-has-bom="false"]:focus-visible > td:first-child { background: inherit !important; box-shadow: none !important; }
 .plan-editor-warning { margin: 0; padding: 12px 17px; background: var(--amber-light); color: #8c671c; font-size: 11px; }
 .plan-editor-table { max-height: 65vh; }
 .plan-editor-table table { min-width: 1900px; }
@@ -416,3 +423,34 @@ tr[data-tree-depth="3"] > td { font-size: 12px; }
 .new-bom-head .field { min-width: 280px; }
 .new-bom-lines th, .new-bom-lines td { padding: 6px; font-size: 12px; }
 .new-bom-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* ---- Master-data tables (Product Master, BOM Level 1/2/3, Material Master): clean, consistent look ---- */
+#pageContent[data-view="master"] table { border-collapse: separate; border-spacing: 0; }
+#pageContent[data-view="master"] th { padding: 11px 14px; border: 0; border-bottom: 1px solid #d3dde6; background: #f1f5f8; color: #2c4256; font-size: 12.5px; font-weight: 600; line-height: 1.3; letter-spacing: 0; text-transform: none; }
+#pageContent[data-view="master"] th + th { box-shadow: inset 1px 0 0 #e1e8ee; }
+#pageContent[data-view="master"] th .table-column-filter summary { min-height: 0; padding: 2px 0; color: #2c4256; font-size: 12.5px; font-weight: 600; white-space: normal; }
+#pageContent[data-view="master"] td { padding: 10px 14px; border: 0; border-bottom: 1px solid #ebf0f4; color: #1f3446; font-size: 13px; line-height: 1.35; vertical-align: middle; }
+#pageContent[data-view="master"] tr[data-tree-depth] > td { font-size: 13px; }
+#pageContent[data-view="master"] tbody > tr:last-child > td { border-bottom: 0; }
+#pageContent[data-view="master"] tbody tr:hover { background: transparent; }
+#pageContent[data-view="master"] td .text-button { padding: 4px 12px; border: 1px solid #bcd5e8; border-radius: 6px; background: #fff; color: #1f6ea8; font-size: 12px; font-weight: 600; line-height: 1.2; }
+#pageContent[data-view="master"] td .text-button:hover { border-color: #7fb3d8; background: #eaf5fd; }
+#pageContent[data-view="master"] td .text-button.button-danger { border-color: #efc9cc; color: #be3f48; }
+#pageContent[data-view="master"] td .text-button.button-danger:hover { border-color: #e29aa0; background: #fff0f0; }
+/* Expanded tree: no repeated header; indented with a guide line */
+#pageContent[data-view="master"] .bom-tree-row thead { display: none; }
+#pageContent[data-view="master"] .bom-tree-row > td { padding: 0 0 0 26px; border-bottom: 1px solid #dbe5ed; background: #f5f9fc; }
+#pageContent[data-view="master"] .bom-tree-row .table-wrap { border-left: 3px solid #6aaed6; }
+#pageContent[data-view="master"] .bom-tree-row .table-wrap tbody td { background: transparent; }
+#pageContent[data-view="master"] .bom-tree-row .bom-tree-row > td { background: #edf4f9; }
+#pageContent[data-view="master"] .bom-tree-row .bom-tree-row .bom-tree-row > td { background: #e6eff6; }
+/* Level 2 / 3 pages: nested lines use the same column widths as the main header, so columns line up */
+#pageContent[data-view="master"] .part-bom-page .bom-tree-row > td { padding-left: 0; }
+.part-bom-page td:first-child { width: 4%; }
+.part-bom-page td:nth-child(2), .part-bom-page td:nth-child(3) { width: 12%; }
+.part-bom-page td:nth-child(4), .part-bom-page td:nth-child(5) { width: 13%; }
+.part-bom-page td:nth-child(6) { width: 12%; }
+.part-bom-page td:nth-child(7) { width: 7%; }
+.part-bom-page td:nth-child(8) { width: 9%; }
+.part-bom-page td:nth-child(9) { width: 8%; }
+.part-bom-page td:nth-child(10) { width: 10%; }
