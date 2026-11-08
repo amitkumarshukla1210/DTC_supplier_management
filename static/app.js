@@ -21,6 +21,8 @@ const state = {
   selectedBomParent: "",
   selectedBomParentIds: [],
   bomParentOptions: [],
+  bomParentAll: [],
+  materialCategories: [],
   bomOffset: 0,
   searchTimer: null,
   workspace: "trial",
@@ -160,6 +162,12 @@ function field(label, name, type = "text", options = {}) {
   return `<label class="field"><span>${esc(label)}</span><input class="form-control" name="${esc(name)}" type="${type}" ${options.required ? "required" : ""} ${options.min !== undefined ? `min="${options.min}"` : ""} ${options.step ? `step="${options.step}"` : ""} ${options.maxlength ? `maxlength="${options.maxlength}"` : ""} ${options.value !== undefined ? `value="${esc(options.value)}"` : ""} ${options.placeholder ? `placeholder="${esc(options.placeholder)}"` : ""} /></label>`;
 }
 
+function categoryField(selected) {
+  const names = [...state.materialCategories];
+  if (selected && !names.some((name) => name.toLowerCase() === selected.toLowerCase())) names.unshift(selected);
+  return `<label class="field"><span>Category</span><select class="form-control" name="category_choice" id="categorySelect" required>${names.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(selected).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control category-new" id="categoryNew" name="category_new" placeholder="Type new category name" minlength="2" maxlength="80" hidden /></label>`;
+}
+
 function unitField(label = "Unit", name = "uom", selected = "ea") {
   const units = [...new Set([...state.materials.map((material) => material.uom), "ea", "PCS", "Nos", "kg", "g", "grm", "m", "mtr", "mm", "cm", "L", "ml", "set", "pair", "roll", "box", "pack", "lot"].filter(Boolean))];
   return `<label class="field"><span>${esc(label)}</span><select class="form-control" name="${esc(name)}" required>${units.map((unit) => `<option value="${esc(unit)}" ${unit === selected ? "selected" : ""}>${esc(unit)}</option>`).join("")}</select></label>`;
@@ -253,6 +261,7 @@ async function loadCoreData() {
   const [products, models, materials] = await Promise.all([
     api("/api/planning/products"), api("/api/planning/models"), api("/api/planning/materials?offset=0&limit=500"),
   ]);
+  try { state.materialCategories = (await api("/api/planning/material-categories")).items; } catch { state.materialCategories = []; }
   state.products = products;
   state.models = models;
   state.materials = materials.items;
@@ -491,8 +500,9 @@ async function renderMaster() {
       ${state.bomTab === "Model BOM Level 1" && state.selectedModel ? tableExportLinks("bom", { model_id: state.selectedModel, tab: state.bomTab }) : ""}
       ${state.bomTab !== "Model BOM Level 1" && state.selectedBomParent ? tableExportLinks("bom", { parent_item_id: state.selectedBomParent, tab: state.bomTab }) : ""}
       <button class="button button-small" data-action="clear-table-filters">Clear all filters</button>
-      ${state.bomTab === "Model BOM Level 1" ? '<button class="button button-small button-primary" data-action="new-bom">Add line</button>' : '<button class="button button-small button-primary" id="newPartBomButton" data-action="new-bom" disabled>Select one parent part</button>'}
+      ${state.bomTab === "Model BOM Level 1" ? '<button class="button button-small button-primary" data-action="new-bom">Add line</button>' : '<button class="button button-small button-primary" id="newPartBomButton" data-action="new-bom" disabled>Select one parent part</button><button class="button button-small button-primary" data-action="new-part-bom">New BOM</button>'}
       </div>
+      ${state.bomTab === "Model BOM Level 1" ? "" : '<div id="newBomEditor"></div>'}
       <div id="masterTable">${state.bomTab === "Model BOM Level 1"
         ? table(["", "Model code", "Model name", "Level", "Part code", "Part name", "Quantity in model", "Unit", "Part price", "Edit", "Delete"], "", "Select one or more models to view their BOM.")
         : table(["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"], "", "Select a parent part to view this BOM level.")}</div>
@@ -545,7 +555,10 @@ async function renderMaster() {
 async function loadBomParentOptions() {
   const query = new URLSearchParams({ tab: state.bomTab });
   const result = await api(`/api/planning/bom-part-parents?${query}`);
-  state.bomParentOptions = result.items;
+  // Dropdown and tree show only parents that already have a BOM; parents without one
+  // are offered by "New BOM".
+  state.bomParentAll = result.items;
+  state.bomParentOptions = result.items.filter((item) => item.has_bom);
   const validIds = new Set(result.items.map((item) => String(item.id)));
   state.selectedBomParentIds = state.selectedBomParentIds.filter((id) => validIds.has(String(id)));
   state.selectedBomParent = state.selectedBomParentIds.length === 1 ? String(state.selectedBomParentIds[0]) : "";
@@ -583,22 +596,17 @@ async function applyParentSelection() {
   return renderMaster();
 }
 
-async function loadPartBomTab(offset = 0) {
+async function loadPartBomTab() {
+  const headers = ["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"];
   if (!state.bomParentOptions.length) {
-    $("#masterTable").innerHTML = table(["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"], "", `No parent parts available for ${esc(state.bomTab)}.`);
+    $("#masterTable").innerHTML = table(headers, "", `No ${esc(state.bomTab)} yet. Use New BOM to create one.`);
     return;
   }
-  const pageSize = 500;
-  const query = new URLSearchParams({ tab: state.bomTab, offset: String(offset), limit: String(pageSize) });
-  const allParentIds = state.bomParentOptions.map((item) => item.id);
-  const selectedIds = state.selectedBomParentIds;
-  const selectsAllParents = !selectedIds.length || allParentIds.every((id) => selectedIds.includes(id));
-  if (!selectsAllParents) selectedIds.forEach((parentId) => query.append("parent_material_id", String(parentId)));
-  const result = await api(`/api/planning/part-boms?${query}`);
-  state.bomOffset = offset;
-  const rows = result.items.map((row) => `<tr class="clickable-row" data-bom-level2-row data-has-bom="${state.bomTab === "Level 2 Part BOM" && row.has_bom}" data-tree-depth="${state.bomTab === "Level 2 Part BOM" ? 2 : 3}" data-material-id="${row.material_id}" data-edit-component-row="${row.component_id}" data-parent-item="${row.parent.id}" data-quantity="${row.quantity}" data-uom="${esc(row.uom)}" tabindex="0"><td>${state.bomTab === "Level 2 Part BOM" && row.has_bom ? `<button type="button" class="tree-toggle" aria-label="Expand level 3 BOM for ${esc(row.code)}" data-tree-expand="part" data-tree-parent-id="${row.material_id}" data-tree-level="Level 3 Part BOM" aria-expanded="false">+</button>` : ""}</td><td>${esc(row.parent.code)}</td><td>${esc(row.parent.name)}</td><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${number(row.quantity)}</td><td>${esc(row.uom)}</td><td>${row.unit_price === undefined ? "Restricted" : money(row.unit_price, row.currency)}</td><td><button class="text-button" data-edit-component-row="${row.component_id}" data-parent-item="${row.parent.id}" data-material-id="${row.material_id}" data-quantity="${row.quantity}" data-uom="${esc(row.uom)}">Edit</button></td><td><button class="text-button button-danger" data-delete-component-row="${row.component_id}" data-parent-item="${row.parent.id}">Delete</button></td></tr>`).join("");
-  const headers = ["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"];
-  $("#masterTable").innerHTML = `${table(headers, rows, `No ${esc(state.bomTab)} lines found.`)}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${Math.min(offset + result.items.length, result.total).toLocaleString()} of ${result.total.toLocaleString()}` : "No BOM rows"}</span><div><button class="button button-small" data-part-bom-page="${Math.max(0, offset - pageSize)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-part-bom-page="${offset + pageSize}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+  const selected = state.selectedBomParentIds.length ? new Set(state.selectedBomParentIds.map(String)) : null;
+  const parents = state.bomParentOptions.filter((item) => !selected || selected.has(String(item.id)));
+  const depth = state.bomTab === "Level 2 Part BOM" ? 1 : 2;
+  const rows = parents.map((item) => `<tr class="clickable-row" data-tree-group data-tree-depth="${depth}" tabindex="0"><td><button type="button" class="tree-toggle" aria-label="Expand ${esc(item.code)} BOM" data-tree-expand="part" data-tree-parent-id="${item.id}" data-tree-level="${esc(state.bomTab)}" aria-expanded="false">+</button></td><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>`).join("");
+  $("#masterTable").innerHTML = `${table(headers, rows, `No ${esc(state.bomTab)} lines found.`)}<div class="table-toolbar pagination-toolbar"><span>${parents.length.toLocaleString()} parent part${parents.length === 1 ? "" : "s"} with BOM</span></div>`;
 }
 
 function treeBomTable(items, tab, modelId = null, parent = null) {
@@ -659,6 +667,77 @@ async function expandBomTree(button) {
   } catch (error) {
     treeRow.firstElementChild.innerHTML = `<div class="tree-loading tree-error">${esc(error.message)}</div>`;
   }
+}
+
+function materialOptions(items, labelKey, selectedId, placeholder) {
+  return `<option value="">${placeholder}</option>${items.map((item) => `<option value="${item.id}" data-uom="${esc(item.uom)}" ${String(item.id) === String(selectedId) ? "selected" : ""}>${esc(item[labelKey])}</option>`).join("")}`;
+}
+
+function newBomLineRow() {
+  return `<tr data-new-bom-line><td><input class="form-control" type="search" data-line-search placeholder="Search code / name" /></td><td><select class="form-control" data-line-code>${materialOptions(state.materials, "code", "", "Select part code")}</select></td><td><select class="form-control" data-line-name>${materialOptions(state.materials, "name", "", "Select part name")}</select></td><td><input class="form-control" type="number" step="any" data-line-qty placeholder="e.g. 2 or -0.3" /></td><td><input class="form-control" data-line-unit readonly /></td><td><button type="button" class="text-button button-danger" data-new-bom-remove aria-label="Remove line">Remove</button></td></tr>`;
+}
+
+function openNewBomEditor() {
+  const holder = $("#newBomEditor");
+  if (!holder) return;
+  const candidates = state.bomParentAll.filter((item) => !item.has_bom);
+  const levelName = state.bomTab === "Level 2 Part BOM" ? "Level 1" : "Level 2";
+  if (!candidates.length) return toast(`Every ${levelName} part already has a BOM. Add lines to an existing BOM instead.`, true);
+  holder.innerHTML = `<div class="new-bom-editor"><div class="new-bom-head"><label class="field"><span>Parent part (${levelName} part without BOM)</span><select class="form-control" id="newBomParent"><option value="">Select parent part</option>${candidates.map((item) => `<option value="${item.id}">${esc(item.code)} · ${esc(item.name)}</option>`).join("")}</select></label><p class="subtle">Parts come from Material Master only. Use a negative quantity for scrap or a by-product; zero is not allowed.</p></div><div class="table-wrap"><table class="new-bom-lines"><thead><tr><th>Search</th><th>Part code</th><th>Part name</th><th>Quantity per parent</th><th>Unit</th><th></th></tr></thead><tbody id="newBomLines">${newBomLineRow()}</tbody></table></div><div class="new-bom-actions"><button type="button" class="button button-small" data-new-bom-add>+ Add line</button><button type="button" class="button button-small button-primary" data-new-bom-save>Save BOM</button><button type="button" class="button button-small" data-new-bom-cancel>Cancel</button></div></div>`;
+  const lines = $("#newBomLines");
+  const syncLine = (row, id) => {
+    row.querySelector("[data-line-code]").value = id;
+    row.querySelector("[data-line-name]").value = id;
+    const option = row.querySelector("[data-line-code]").selectedOptions[0];
+    row.querySelector("[data-line-unit]").value = id ? option?.dataset.uom || "" : "";
+  };
+  lines.addEventListener("change", (event) => {
+    const select = event.target.closest("[data-line-code], [data-line-name]");
+    if (select) syncLine(select.closest("tr"), select.value);
+  });
+  lines.addEventListener("input", (event) => {
+    const search = event.target.closest("[data-line-search]");
+    if (!search) return;
+    const row = search.closest("tr");
+    clearTimeout(row.searchTimer);
+    row.searchTimer = setTimeout(async () => {
+      try {
+        const query = new URLSearchParams({ offset: "0", limit: "100", search: search.value });
+        const result = await api(`/api/planning/materials?${query}`);
+        const current = row.querySelector("[data-line-code]").value;
+        const keep = result.items.some((item) => String(item.id) === current) ? current : "";
+        row.querySelector("[data-line-code]").innerHTML = materialOptions(result.items, "code", keep, "Select part code");
+        row.querySelector("[data-line-name]").innerHTML = materialOptions(result.items, "name", keep, "Select part name");
+        syncLine(row, keep || (result.items.length === 1 ? String(result.items[0].id) : ""));
+      } catch (error) { toast(error.message, true); }
+    }, 250);
+  });
+  holder.querySelector("[data-new-bom-add]").addEventListener("click", () => lines.insertAdjacentHTML("beforeend", newBomLineRow()));
+  lines.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-new-bom-remove]")) return;
+    if (lines.rows.length > 1) event.target.closest("tr").remove();
+    else toast("A BOM needs at least one line.", true);
+  });
+  holder.querySelector("[data-new-bom-cancel]").addEventListener("click", () => { holder.innerHTML = ""; });
+  holder.querySelector("[data-new-bom-save]").addEventListener("click", async () => {
+    const parentId = Number($("#newBomParent").value);
+    if (!parentId) return toast("Select the parent part.", true);
+    const payload = [];
+    for (const [index, row] of [...lines.rows].entries()) {
+      const childId = Number(row.querySelector("[data-line-code]").value);
+      const quantity = Number(row.querySelector("[data-line-qty]").value);
+      if (!childId) return toast(`Line ${index + 1}: select a part.`, true);
+      if (!quantity || !Number.isFinite(quantity)) return toast(`Line ${index + 1}: quantity must be a non-zero number.`, true);
+      payload.push({ child_item_id: childId, quantity });
+    }
+    try {
+      const result = await api(`/api/planning/part-bom/${parentId}/new`, { method: "POST", body: JSON.stringify({ tab: state.bomTab, lines: payload }) });
+      // Clear the parent filter so the new BOM is visible in the tree.
+      state.selectedBomParentIds = [];
+      await renderMaster();
+      toast(`New BOM saved for ${result.parent_code} (${result.rows} line${result.rows === 1 ? "" : "s"})`);
+    } catch (error) { toast(error.message, true); }
+  });
 }
 
 async function applyModelSelection() {
@@ -1143,7 +1222,7 @@ function openModal(type, record = {}) {
     form = `<form id="modalForm" class="form-grid">${field("Model code", "code", "text", { required: true, value: record.code })}${field("Model name", "name", "text", { required: true, value: record.name })}<label class="field full"><span>Assigned products (optional; select multiple)</span><select class="form-control" name="product_ids" multiple size="6">${products}</select></label><div class="modal-footer field full"><button class="button button-primary">Save model</button></div></form>`;
   } else if (type === "material") {
     title = record.id ? "Edit material" : "Add material";
-    form = `<form id="modalForm" class="form-grid">${field("Material code", "code", "text", { required: true, value: record.code })}${field("Material name", "name", "text", { required: true, value: record.name })}${field("Category", "category", "text", { required: true, value: record.category || "Raw material" })}${unitField("Unit of measure", "uom", record.uom || "ea")}${field("Opening stock", "stock_on_hand", "number", { required: true, min: 0, step: "any", value: record.stock_on_hand ?? 0 })}${field("Own-location buffer (days)", "buffer_days", "number", { required: true, min: 0, value: record.buffer_days ?? 0 })}${state.user.can_view_prices || state.user.role === "Admin" ? `${field("Current unit cost", "unit_cost", "number", { required: true, min: 0, step: "any", value: record.unit_cost ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["USD", "INR", "EUR", "GBP"].map((currency) => `<option ${currency === (record.currency || "USD") ? "selected" : ""}>${currency}</option>`).join("")}</select></label>` : '<input type="hidden" name="unit_cost" value="0" /><input type="hidden" name="currency" value="USD" />'}<div class="modal-footer field full"><button class="button button-primary">Save material</button></div></form>`;
+    form = `<form id="modalForm" class="form-grid">${field("Material code", "code", "text", { required: true, value: record.code })}${field("Material name", "name", "text", { required: true, value: record.name })}${categoryField(record.category || "Raw material")}${unitField("Unit of measure", "uom", record.uom || "ea")}${field("Opening stock", "stock_on_hand", "number", { required: true, min: 0, step: "any", value: record.stock_on_hand ?? 0 })}${field("Own-location buffer (days)", "buffer_days", "number", { required: true, min: 0, value: record.buffer_days ?? 0 })}${state.user.can_view_prices || state.user.role === "Admin" ? `${field("Current unit cost", "unit_cost", "number", { required: true, min: 0, step: "any", value: record.unit_cost ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["USD", "INR", "EUR", "GBP"].map((currency) => `<option ${currency === (record.currency || "USD") ? "selected" : ""}>${currency}</option>`).join("")}</select></label>` : '<input type="hidden" name="unit_cost" value="0" /><input type="hidden" name="currency" value="USD" />'}<div class="modal-footer field full"><button class="button button-primary">Save material</button></div></form>`;
   } else if (type === "bom") {
     title = record.root_bom_id ? `Edit ${state.bomTab} line` : `Add ${state.bomTab} line`;
     const materialUnit = record.uom || state.materials.find((m) => String(m.id) === String(record.material_id))?.uom || "ea";
@@ -1170,6 +1249,18 @@ function openModal(type, record = {}) {
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = form;
   modalLayer.hidden = false;
+  if (type === "material") {
+    const choice = $("#categorySelect");
+    const fresh = $("#categoryNew");
+    const sync = () => {
+      const adding = choice.value === "__new__";
+      fresh.hidden = !adding;
+      fresh.required = adding;
+      if (adding) fresh.focus();
+    };
+    choice.addEventListener("change", sync);
+    sync();
+  }
   if (type === "component") bindMaterialSearch("modalMaterialSearch", "modalMaterialSelect", "modalMaterialNameSelect");
   if (type === "bom" && !record.root_bom_id) bindMaterialSearch("modalMaterialSearch", "modalMaterialSelect", "modalMaterialName");
   if (type === "bom") {
@@ -1217,6 +1308,11 @@ function openModal(type, record = {}) {
         result = await api(record.id ? `/api/planning/models/${record.id}` : "/api/planning/models", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
       if (type === "material") {
+        values.category = values.category_choice === "__new__" ? (values.category_new || "").trim() : values.category_choice;
+        const known = state.materialCategories.find((name) => name.toLowerCase() === values.category.toLowerCase());
+        if (known) values.category = known;
+        delete values.category_choice;
+        delete values.category_new;
         for (const key of ["stock_on_hand", "buffer_days", "unit_cost"]) values[key] = Number(values[key] || 0);
         result = await api(record.id ? `/api/planning/materials/${record.id}` : "/api/planning/materials", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
@@ -1297,6 +1393,12 @@ document.addEventListener("click", async (event) => {
     try { return await expandBomTree(treeExpand); }
     catch (error) { toast(error.message, true); return; }
   }
+  const treeGroup = event.target.closest("[data-tree-group]");
+  if (treeGroup && !event.target.closest("button, a, input, select")) {
+    treeGroup.querySelector("[data-tree-expand]")?.click();
+    return;
+  }
+  if (event.target.closest('[data-action="new-part-bom"]')) return openNewBomEditor();
   if (event.target.closest("[data-execute-master-search]")) return applyTableSearch({ target: $("#masterSearch") });
   if (event.target.closest("[data-execute-model-search]")) return applyTableSearch({ target: $("#modelMasterSearch") });
   const isDeleteAction = event.target.closest("[data-delete-product], [data-delete-model], [data-delete-material], [data-delete-bom-row], [data-delete-component-row]");
@@ -1439,11 +1541,6 @@ document.addEventListener("click", async (event) => {
   const bomPage = event.target.closest("[data-bom-page]");
   if (bomPage) {
     try { return await loadBomTab(Number(bomPage.dataset.bomPage)); }
-    catch (error) { toast(error.message, true); }
-  }
-  const partBomPage = event.target.closest("[data-part-bom-page]");
-  if (partBomPage) {
-    try { return await loadPartBomTab(Number(partBomPage.dataset.partBomPage)); }
     catch (error) { toast(error.message, true); }
   }
   const supplierPage = event.target.closest("[data-supplier-page]");

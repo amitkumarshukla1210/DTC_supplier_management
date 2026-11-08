@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 data/
+tests/e2e/*.png
+tests/e2e/*.json
+*.db

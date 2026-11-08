@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -315,6 +315,23 @@ class ModelBOMInput(BaseModel):
     material_id: int
     quantity: float = Field(gt=0, le=1_000_000_000)
     uom: str = Field(default="ea", min_length=1, max_length=24)
+
+
+class NewPartBOMLine(BaseModel):
+    child_item_id: int
+    quantity: float = Field(ge=-1_000_000_000, le=1_000_000_000, allow_inf_nan=False)
+
+    @field_validator("quantity")
+    @classmethod
+    def quantity_must_be_nonzero(cls, value: float) -> float:
+        if value == 0:
+            raise ValueError("BOM quantity must be non-zero")
+        return value
+
+
+class NewPartBOMInput(BaseModel):
+    tab: str = Field(pattern=r"^Level [23] Part BOM$")
+    lines: list[NewPartBOMLine] = Field(min_length=1, max_length=500)
 
 
 class SupplierPartInput(BaseModel):
@@ -1242,6 +1259,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 } for item in rows],
             }
 
+    @app.get("/api/planning/material-categories")
+    def material_categories(request: Request):
+        current_user(request)
+        with open_db() as db:
+            names = db.scalars(select(Item.category).distinct()).all()
+        unique: dict[str, str] = {}
+        for name in names:
+            text = (name or "").strip()
+            if text:
+                unique.setdefault(text.casefold(), text)
+        return {"items": sorted(unique.values(), key=str.casefold)}
+
     @app.post("/api/planning/materials", status_code=201)
     def add_material(payload: MaterialInput, request: Request):
         current_user(request)
@@ -1446,9 +1475,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if selected_models:
                 ids = {item_id for item_id in ids if model_ids_by_parent.get(item_id, set()) & selected_models}
             items = db.scalars(select(Item).where(Item.id.in_(ids)).order_by(Item.code)).all() if ids else []
+            # Parents that already have their own BOM lines (shown in the parent dropdown);
+            # the rest can be picked when starting a new BOM.
+            with_bom = set(db.scalars(
+                select(BOMComponent.parent_item_id).where(BOMComponent.parent_item_id.in_(ids)).distinct()
+            ).all()) if ids else set()
             return {"items": [
                 {"id": item.id, "code": item.code, "name": item.name, "uom": item.uom,
-                 "model_ids": sorted(model_ids_by_parent.get(item.id, set()))}
+                 "model_ids": sorted(model_ids_by_parent.get(item.id, set())),
+                 "has_bom": item.id in with_bom}
                 for item in items
             ]}
 
@@ -1623,6 +1658,46 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     db.add(BOMComponent(parent_item_id=parent_material_id, child_item_id=child_id, quantity=quantity))
             db.commit()
             return {"parent_id": parent_material_id, "parent_code": parent.code, "tab": tab, "rows": len(parsed)}
+
+    @app.post("/api/planning/part-bom/{parent_material_id}/new", status_code=201)
+    def create_part_bom(parent_material_id: int, payload: NewPartBOMInput, request: Request):
+        current_user(request)
+        if request.state.user["role"] not in SUPPLY_ROLES:
+            raise HTTPException(status_code=403, detail="Master-data editing access is required")
+        with open_db() as db:
+            if parent_material_id not in bom_parent_material_ids(db, payload.tab):
+                raise HTTPException(status_code=422, detail=f"This parent part is not linked at {payload.tab}")
+            parent = db.get(Item, parent_material_id)
+            if db.scalar(select(BOMComponent.id).where(BOMComponent.parent_item_id == parent_material_id).limit(1)):
+                raise HTTPException(status_code=409, detail=f"{parent.code} already has a BOM; add lines to it instead")
+            graph: dict[int, set[int]] = {}
+            for link in db.scalars(select(BOMComponent)).all():
+                graph.setdefault(link.parent_item_id, set()).add(link.child_item_id)
+
+            def reaches(start_id: int, target_id: int) -> bool:
+                pending, visited = [start_id], set()
+                while pending:
+                    current = pending.pop()
+                    if current == target_id:
+                        return True
+                    if current not in visited:
+                        visited.add(current)
+                        pending.extend(graph.get(current, ()))
+                return False
+
+            seen: set[int] = set()
+            for number, line in enumerate(payload.lines, start=1):
+                child = db.get(Item, line.child_item_id)
+                if not child:
+                    raise HTTPException(status_code=422, detail=f"Line {number}: part is not in Material Master")
+                if child.id in seen:
+                    raise HTTPException(status_code=422, detail=f"Line {number}: {child.code} is entered twice")
+                if child.id == parent_material_id or reaches(child.id, parent_material_id):
+                    raise HTTPException(status_code=422, detail=f"Line {number}: {child.code} would create a circular BOM")
+                seen.add(child.id)
+                db.add(BOMComponent(parent_item_id=parent_material_id, child_item_id=child.id, quantity=line.quantity))
+            db.commit()
+            return {"parent_id": parent_material_id, "parent_code": parent.code, "tab": payload.tab, "rows": len(payload.lines)}
 
     @app.post("/api/planning/model-bom/{model_id}/upload", status_code=201)
     async def upload_model_bom_excel(model_id: int, request: Request, tab: str):

@@ -52,7 +52,9 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn('data-tree-expand="part"', frontend.text)
         self.assertIn('data-has-bom="${model.has_bom}"', frontend.text)
         self.assertIn('bom-controls-part', frontend.text)
-        self.assertIn('state.bomTab === "Level 2 Part BOM" ? 2 : 3', frontend.text)
+        self.assertIn('data-tree-group data-tree-depth="${depth}"', frontend.text)
+        self.assertIn('data-action="new-part-bom"', frontend.text)
+        self.assertIn('id="categorySelect"', frontend.text)
         self.assertIn('Level ${state.bomTab === "Model BOM Level 1" ? "1"', frontend.text)
         self.assertNotIn('data-model-apply>Execute', frontend.text)
         self.assertIn('aria-label="Select ${esc(state.bomTab)} Excel workbook"', frontend.text)
@@ -658,6 +660,83 @@ class SupplierHubApiTests(unittest.TestCase):
             ["ASSY-001", "SUB-001", 2, "ea"],
         )
         self.assertEqual(rejected_model_upload.status_code, 422, rejected_model_upload.text)
+
+    def test_new_part_bom_parents_categories_and_validation(self):
+        # Expected values below are written out by hand from the data this test creates.
+        def material(code, category="Raw material", uom="ea"):
+            response = self.client.post("/api/planning/materials", json={
+                "code": code, "name": f"{code} name", "category": category, "uom": uom,
+            })
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+
+        l1a, l1b = material("NB-L1A"), material("NB-L1B")
+        c1, c2, c3 = material("NB-C1", "Electrical"), material("NB-C2", "electrical"), material("NB-C3", "Packing")
+        model = self.client.post("/api/planning/models", json={"code": "NB-MODEL", "name": "New BOM model"})
+        self.assertEqual(model.status_code, 201, model.text)
+        for part in (l1a, l1b):
+            root = self.client.post(f"/api/planning/model-bom/{model.json()['id']}", json={"material_id": part, "quantity": 1, "uom": "ea"})
+            self.assertEqual(root.status_code, 201, root.text)
+
+        # Categories: distinct, case-insensitive ("Electrical" / "electrical" count once), sorted
+        categories = self.client.get("/api/planning/material-categories").json()["items"]
+        self.assertEqual(len([name for name in categories if name.lower() == "electrical"]), 1)
+        self.assertIn("Packing", categories)
+        self.assertEqual(categories, sorted(categories, key=str.casefold))
+
+        def parents(tab):
+            rows = self.client.get("/api/planning/bom-part-parents", params={"tab": tab}).json()["items"]
+            return {row["id"]: row["has_bom"] for row in rows}
+
+        level2 = "Level 2 Part BOM"
+        self.assertFalse(parents(level2)[l1a])
+        self.assertFalse(parents(level2)[l1b])
+
+        def new_bom(parent, lines, tab=level2):
+            return self.client.post(f"/api/planning/part-bom/{parent}/new", json={"tab": tab, "lines": lines})
+
+        # Rejected inputs save nothing
+        self.assertEqual(new_bom(l1a, []).status_code, 422)
+        self.assertEqual(new_bom(l1a, [{"child_item_id": c1, "quantity": 0}]).status_code, 422)
+        self.assertEqual(new_bom(l1a, [{"child_item_id": 999999, "quantity": 1}]).status_code, 422)
+        # Duplicate line must give a clear message (not a server error from the database)
+        plain = TestClient(self.client.app, raise_server_exceptions=False)
+        plain.cookies = self.client.cookies
+        duplicate = plain.post(f"/api/planning/part-bom/{l1a}/new", json={"tab": level2, "lines": [{"child_item_id": c1, "quantity": 1}, {"child_item_id": c1, "quantity": 2}]})
+        self.assertEqual(duplicate.status_code, 422, duplicate.text)
+        self.assertIn("entered twice", duplicate.json()["detail"])
+        self.assertEqual(new_bom(l1a, [{"child_item_id": l1a, "quantity": 1}]).status_code, 422)
+        self.assertEqual(new_bom(c3, [{"child_item_id": c1, "quantity": 1}]).status_code, 422)  # not a Level 1 part
+        self.assertEqual(new_bom(l1a, [{"child_item_id": c1, "quantity": 1}, {"child_item_id": 999999, "quantity": 1}]).status_code, 422)
+        self.assertFalse(parents(level2)[l1a], "a failed save must not leave partial lines")
+
+        # Multi-line save, incl. negative scrap quantity
+        saved = new_bom(l1a, [{"child_item_id": c1, "quantity": 2}, {"child_item_id": c2, "quantity": -0.3}])
+        self.assertEqual(saved.status_code, 201, saved.text)
+        self.assertEqual(saved.json()["rows"], 2)
+        self.assertTrue(parents(level2)[l1a])
+        self.assertFalse(parents(level2)[l1b])
+        lines = self.client.get(f"/api/planning/part-bom/{l1a}", params={"tab": level2}).json()["items"]
+        self.assertEqual(sorted((row["material_id"], row["quantity"]) for row in lines), sorted([(c1, 2.0), (c2, -0.3)]))
+
+        # A parent that already has a BOM cannot get a second "new" BOM
+        self.assertEqual(new_bom(l1a, [{"child_item_id": c3, "quantity": 1}]).status_code, 409)
+
+        # Level 3: parents are the Level 2 parts (c1, c2); circular link back to l1a is rejected
+        level3 = "Level 3 Part BOM"
+        self.assertEqual(set(parents(level3)) & {c1, c2, c3}, {c1, c2})
+        self.assertEqual(new_bom(c1, [{"child_item_id": l1a, "quantity": 1}], level3).status_code, 422)
+        self.assertEqual(new_bom(c1, [{"child_item_id": c3, "quantity": 4}], level3).status_code, 201)
+        self.assertTrue(parents(level3)[c1])
+        self.assertFalse(parents(level3)[c2])
+
+        # View-only roles cannot create a BOM
+        user = self.client.post("/api/users", json={"username": "viewer1", "full_name": "Viewer", "password": "Viewer-pass-2026!", "role": "User"})
+        self.assertEqual(user.status_code, 201, user.text)
+        self.client.post("/api/auth/logout")
+        login = self.client.post("/api/auth/login", json={"username": "viewer1", "password": "Viewer-pass-2026!"})
+        self.assertEqual(login.status_code, 200, login.text)
+        self.assertEqual(new_bom(l1b, [{"child_item_id": c3, "quantity": 1}]).status_code, 403)
 
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
