@@ -666,7 +666,8 @@ function treeRowHtml(tab, row) {
 }
 
 function treePrice(item) {
-  return item.unit_price === undefined ? "Restricted" : money(item.unit_price, item.currency);
+  if (item.unit_price === undefined) return "Restricted";
+  return `<span title="${esc(item.price_source || "")}">${money(item.unit_price, item.currency)}</span>`;
 }
 
 function level1RowHtml(tab, item, modelId, depth, showModel, inherit) {

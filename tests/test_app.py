@@ -861,6 +861,61 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertNotIn("Part price", headers)
         self.assertEqual(headers[-2:], ["Quantity", "Unit"])
 
+    def test_bom_price_is_sob_weighted_supplier_price(self):
+        # Hand-worked: A 100 INR @ 60% + B 110 INR @ 40% = (6000 + 4400) / 100 = 104 INR
+        part = self.client.post("/api/planning/materials", json={"code": "WP-STEEL", "name": "Steel 0.8", "uom": "kg", "unit_cost": 90, "currency": "INR"}).json()["id"]
+        parent = self.client.post("/api/planning/materials", json={"code": "WP-MOTOR", "name": "Motor", "uom": "PCS"}).json()["id"]
+        model = self.client.post("/api/planning/models", json={"code": "WP-12000", "name": "Eva"}).json()["id"]
+        self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": part, "quantity": 1, "uom": "kg"}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": parent, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{parent}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": part, "quantity": 2}]}).status_code, 201)
+        suppliers = [row["id"] for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]
+        self.assertGreaterEqual(len(suppliers), 3)
+
+        def l1_price():
+            row = next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == part)
+            return round(row["unit_price"], 4), row["currency"], row["price_source"]
+
+        def l2_price():
+            row = self.client.get(f"/api/planning/part-bom/{parent}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]
+            return round(row["unit_price"], 4), row["currency"]
+
+        self.assertEqual(l1_price(), (90, "INR", "Material Master"))
+        def link(supplier, sob, price, currency="INR", tier="Direct", parent_supplier=None):
+            response = self.client.post("/api/planning/supplier-parts", json={
+                "material_id": part, "supplier_id": supplier, "sob_percent": sob, "unit_price": price, "currency": currency,
+                "tier": tier, "parent_supplier_id": parent_supplier})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        a = link(suppliers[0], 60, 100)
+        self.assertEqual(l1_price(), (100, "INR", "SOB-weighted (1 supplier)"))
+        b = link(suppliers[1], 40, 110)
+        self.assertEqual(l1_price(), (104, "INR", "SOB-weighted (2 suppliers)"))
+        self.assertEqual(l2_price(), (104, "INR"))
+        # A Tier-2 link (supplies the T1 supplier, not us) does not change our price
+        link(suppliers[2], 100, 50, tier="Tier 2", parent_supplier=suppliers[0])
+        self.assertEqual(l1_price()[0], 104)
+        # BOM tree export uses the same price
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/bom-tree/xlsx", params={"tab": "Model BOM Level 1", "model_id": model}).content)).active
+        headers = [cell.value for cell in sheet[4]]
+        price_col = headers.index("Part price") + 1
+        steel_rows = [r for r in range(5, sheet.max_row + 1) if sheet.cell(r, headers.index("L1 part code") + 1).value == "WP-STEEL"]
+        self.assertEqual(round(sheet.cell(steel_rows[0], price_col).value, 4), 104)
+        # Different currencies cannot be averaged -> Material Master price, reason shown
+        self.assertEqual(self.client.patch(f"/api/planning/supplier-parts/{b}", json={"currency": "USD"}).status_code, 200)
+        self.assertEqual(l1_price(), (90, "INR", "Material Master (suppliers in different currencies)"))
+        # A supplier with 0 SOB or no price is ignored
+        self.assertEqual(self.client.patch(f"/api/planning/supplier-parts/{b}", json={"currency": "INR", "sob_percent": 0}).status_code, 200)
+        self.assertEqual(l1_price()[0], 100)
+        # All suppliers at 0% SOB -> Material Master price (no divide-by-zero error)
+        self.assertEqual(self.client.patch(f"/api/planning/supplier-parts/{a}", json={"sob_percent": 0}).status_code, 200)
+        plain = TestClient(self.client.app, raise_server_exceptions=False)
+        plain.cookies = self.client.cookies
+        response = plain.get(f"/api/planning/model-bom/{model}")
+        self.assertEqual(response.status_code, 200, response.text)
+        row = next(r for r in response.json()["items"] if r["material_id"] == part)
+        self.assertEqual((row["unit_price"], row["price_source"]), (90, "Material Master"))
+
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
         suppliers = [row for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]

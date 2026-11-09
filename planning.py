@@ -1508,9 +1508,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 rows = [r for r in rows if needle in r["code"].lower() or needle in r["name"].lower()]
             can_price = _check_price_access(request)
             if can_price:
+                price = bom_price_lookup(db)
                 for row in rows:
-                    row["unit_price"] = items[row["material_id"]].unit_cost
-                    row["currency"] = items[row["material_id"]].currency
+                    row.update(price(items[row["material_id"]]))
             return {"model_id": model_id, "model_code": model.code, "model_name": model.name, "tab": tab, "total": len(rows), "offset": offset, "limit": limit, "items": rows[offset:offset + limit]}
 
     @app.post("/api/planning/model-bom/{model_id}", status_code=201)
@@ -1564,6 +1564,27 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.delete(entry)
             db.commit()
             return Response(status_code=204)
+
+    def bom_price_lookup(db: Session):
+        """BOM part price = SOB-weighted price of the code's Direct suppliers:
+        sum(price x SOB) / sum(SOB). Falls back to the Material Master price when no Direct
+        supplier has a price, or when the suppliers quote in different currencies."""
+        links: dict[int, list[SupplierPart]] = {}
+        for link in db.scalars(select(SupplierPart).where(
+            SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None),
+            SupplierPart.sob_percent > 0, SupplierPart.unit_price > 0,
+        )).all():
+            links.setdefault(link.material_id, []).append(link)
+
+        def price(item: Item) -> dict:
+            quoted = links.get(item.id, [])
+            if quoted and len({link.currency for link in quoted}) == 1:
+                share = sum(link.sob_percent for link in quoted)
+                return {"unit_price": sum(link.unit_price * link.sob_percent for link in quoted) / share,
+                        "currency": quoted[0].currency, "price_source": f"SOB-weighted ({len(quoted)} supplier{'s' if len(quoted) > 1 else ''})"}
+            source = "Material Master (suppliers in different currencies)" if quoted else "Material Master"
+            return {"unit_price": item.unit_cost, "currency": item.currency, "price_source": source}
+        return price
 
     def bom_parent_material_ids(db: Session, tab: str) -> set[int]:
         level1_ids = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
@@ -1644,9 +1665,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 rows = [row for row in rows if name_needle in row["name"].casefold()]
             can_price = _check_price_access(request)
             if can_price:
+                price = bom_price_lookup(db)
                 for row in rows:
-                    material = items_by_id[row["material_id"]]
-                    row.update(unit_price=material.unit_cost, currency=material.currency)
+                    row.update(price(items_by_id[row["material_id"]]))
             return {
                 "tab": tab, "parent": {"id": parent.id, "code": parent.code, "name": parent.name},
                 "total": len(rows), "offset": offset, "limit": limit, "items": rows[offset:offset + limit],
@@ -1682,6 +1703,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 .distinct()
             ).all()) if child_ids else set()
             can_price = _check_price_access(request)
+            price = bom_price_lookup(db)
             rows = []
             for link, parent_code, parent_name in links:
                 child = children_by_id.get(link.child_item_id)
@@ -1695,7 +1717,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     "has_bom": child.id in parents_with_bom,
                 }
                 if can_price:
-                    row.update(unit_price=child.unit_cost, currency=child.currency)
+                    row.update(price(child))
                 rows.append(row)
             return {
                 "tab": tab, "total": len(rows), "offset": offset, "limit": limit,
@@ -2579,6 +2601,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         tree: list[dict] = []
         with open_db() as db:
             items = {item.id: item for item in db.scalars(select(Item)).all()}
+            price = bom_price_lookup(db)
+            prices = {item_id: price(item) for item_id, item in items.items()}
             children: dict[int, list[BOMComponent]] = {}
             for link in db.scalars(select(BOMComponent).order_by(BOMComponent.id)).all():
                 children.setdefault(link.parent_item_id, []).append(link)
@@ -2652,7 +2676,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 values.extend(entry["path"].get(level, ("", "")))
             values += [entry["quantity"] if entry["quantity"] is not None else "", item.uom if item else ""]
             if can_price:
-                values += [item.unit_cost if item else "", item.currency if item else ""]
+                priced = prices.get(item.id) if item else None
+                values += [priced["unit_price"] if priced else "", priced["currency"] if priced else ""]
             rows.append({"depth": entry["depth"], "has_children": entry["has_children"], "values": values})
         title = f"{tab if tab.endswith('BOM') else tab + ' BOM'} tree"
         if file_format == "xlsx":
