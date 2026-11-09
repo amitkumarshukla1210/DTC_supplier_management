@@ -782,6 +782,28 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual([bool(sheet.cell(r, 2).font.b) for r in mine], [True, True, True, False, False, False, False])
         self.assertEqual([sheet.cell(r, 14).value for r in mine[1:5]], [1200, 200, 350, 0])
         self.assertIs(sheet.sheet_properties.outlinePr.summaryBelow, False, "+/- must sit on the parent row above its lines")
+        # Opens collapsed: only top-level rows visible, parents marked collapsed ("+")
+        self.assertEqual([bool(sheet.row_dimensions[r].hidden) for r in mine], [False, True, True, True, True, True, False])
+        self.assertEqual([bool(sheet.row_dimensions[r].collapsed) for r in mine], [True, True, True, False, False, False, False])
+        # Locked without password: title / logo cannot be deleted; filters still allowed
+        self.assertTrue(sheet.protection.sheet)
+        self.assertIsNone(sheet.protection.password)
+        self.assertFalse(sheet.protection.autoFilter, "filters must stay usable on the locked sheet")
+        self.assertEqual(sheet["D1"].value, "Design to Cost")
+        self.assertEqual(sheet["D2"].value, "Supply Chain Management · Product Master BOM tree")
+        self.assertEqual(len(sheet._images), 1, "logo image")
+
+        # PDF: parent rows bold, plain lines normal, numbers tidy (1 not 1.0; prices 2 decimals)
+        from planning import _bom_tree_pdf_cells
+        pdf_headers = ["Level", "L1 part code", "Quantity", "Part price"]
+        cells = _bom_tree_pdf_cells(pdf_headers, [
+            {"has_children": True, "values": ["L1", "BT-MOTOR", 1.0, 1200.0]},
+            {"has_children": False, "values": ["L2", "BT-ROTOR", -0.2, 0.0]},
+        ])
+        self.assertEqual([c.style.fontName for c in cells[1]], ["Helvetica-Bold"] * 4)
+        self.assertEqual([c.style.fontName for c in cells[2]], ["Helvetica"] * 4)
+        self.assertEqual([c.text for c in cells[1]], ["L1", "BT-MOTOR", "1", "1,200.00"])
+        self.assertEqual([c.text for c in cells[2]], ["L2", "BT-ROTOR", "-0.2", "0.00"])
 
         # Model BOM Level 1, filtered to one model: model + L1 + L2 + L3 columns
         sheet, headers, rows = download({"tab": "Model BOM Level 1", "model_id": m1})

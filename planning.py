@@ -849,7 +849,10 @@ def _bom_tree_workbook(title: str, headers: list[str], rows: list[dict]) -> io.B
         for offset, row in enumerate(rows):
             row_index = 4 + offset
             cell_format = parent_format if row["has_children"] else leaf_format
-            sheet.set_row(row_index, None, cell_format, {"level": min(row["depth"], 7)})
+            # Opens collapsed: only top-level rows show, each with "+".
+            sheet.set_row(row_index, None, cell_format, {
+                "level": min(row["depth"], 7), "hidden": row["depth"] > 0, "collapsed": row["has_children"],
+            })
             for column_index, value in enumerate(row["values"]):
                 if value is None or value == "":
                     sheet.write_blank(row_index, column_index, None, cell_format)
@@ -861,8 +864,63 @@ def _bom_tree_workbook(title: str, headers: list[str], rows: list[dict]) -> io.B
         sheet.set_column(1, len(headers) - 1, 16)
         sheet.freeze_panes(4, 0)
         sheet.autofilter(3, 0, max(3, 3 + len(rows)), len(headers) - 1)
+        # Locked (no password) so the logo and title cannot be deleted; filters and column
+        # widths stay usable. Review > Unprotect Sheet enables the +/- buttons.
+        sheet.protect("", {"autofilter": True, "format_columns": True})
         workbook.close()
         return io.BytesIO(workbook_path.read_bytes())
+
+
+def _bom_tree_pdf_cells(headers: list[str], rows: list[dict]) -> list[list[Paragraph]]:
+    """Table cells for the BOM tree PDF: wrapped text, parent rows bold, tidy numbers."""
+    styles = getSampleStyleSheet()
+    plain = styles["BodyText"].clone("bomTreePlain", fontName="Helvetica", fontSize=6.5, leading=8, textColor=colors.HexColor("#4f6275"))
+    bold = plain.clone("bomTreeBold", fontName="Helvetica-Bold", textColor=colors.HexColor("#12263a"))
+    head = plain.clone("bomTreeHead", fontName="Helvetica-Bold", textColor=colors.white)
+
+    def text(header: str, value: Any) -> str:
+        if value is None or value == "":
+            return ""
+        if isinstance(value, float) and header == "Part price":
+            return f"{value:,.2f}"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    cells = [[Paragraph(_xml_escape(header), head) for header in headers]]
+    for row in rows:
+        style = bold if row["has_children"] else plain
+        cells.append([Paragraph(_xml_escape(text(header, value)), style) for header, value in zip(headers, row["values"])])
+    return cells
+
+
+def _xml_escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _bom_tree_pdf(title: str, headers: list[str], rows: list[dict]) -> io.BytesIO:
+    output = io.BytesIO()
+    document = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=10 * mm, leftMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm)
+    styles = getSampleStyleSheet()
+    story = []
+    logo_path = Path(__file__).resolve().parent / "static" / "logo.png"
+    try:
+        story.append(Image(str(logo_path), width=16 * mm, height=16 * mm))
+    except OSError:
+        pass
+    story.extend([Paragraph("Design to Cost", styles["Title"]), Paragraph(f"Supply Chain Management · {_xml_escape(title)}", styles["Heading2"]), Spacer(1, 4 * mm)])
+    width = 277 * mm / max(1, len(headers))
+    table = Table(_bom_tree_pdf_cells(headers, rows), repeatRows=1, colWidths=[width] * len(headers))
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12263a")),
+        ("GRID", (0, 0), (-1, -1), .25, colors.HexColor("#dce4ea")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f8fa")]),
+    ]))
+    story.append(table)
+    document.build(story)
+    output.seek(0)
+    return output
 
 
 def _generic_pdf(title: str, headers: list[str], rows: list[list[Any]]) -> io.BytesIO:
@@ -2580,7 +2638,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             output = _bom_tree_workbook(title, headers, rows)
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         else:
-            output = _generic_pdf(title, headers, [row["values"] for row in rows])
+            output = _bom_tree_pdf(title, headers, rows)
             media_type = "application/pdf"
         filename = f"{tab.lower().replace(' ', '-')}-bom-tree.{file_format}"
         return StreamingResponse(output, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
