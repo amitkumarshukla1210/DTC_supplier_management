@@ -164,7 +164,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.screenshot({ path: __dirname + "/look_material.png" });
 
   // Download buttons on the BOM tabs give the tree file of that tab (and its selection)
-  for (const [tab, file] of [["Product Master", "product-master-bom-tree.xlsx"], ["Level 2 Part BOM", "level-2-part-bom-bom-tree.xlsx"]]) {
+  for (const [tab, file] of [["Product Master", "product-master-bom-tree.xlsx"], ["Level 2 Part BOM", "level-2-part-bom-tree.xlsx"]]) {
     await page.click(`[data-bom-tab="${tab}"]`);
     await page.waitForSelector(`.tab-button.active[data-bom-tab="${tab}"]`);
     const [download] = await Promise.all([page.waitForEvent("download"), page.click('[data-bom-tree-export="xlsx"]')]);

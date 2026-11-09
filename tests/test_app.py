@@ -785,25 +785,49 @@ class SupplierHubApiTests(unittest.TestCase):
         # Opens collapsed: only top-level rows visible, parents marked collapsed ("+")
         self.assertEqual([bool(sheet.row_dimensions[r].hidden) for r in mine], [False, True, True, True, True, True, False])
         self.assertEqual([bool(sheet.row_dimensions[r].collapsed) for r in mine], [True, True, True, False, False, False, False])
-        # Locked without password: title / logo cannot be deleted; filters still allowed
-        self.assertTrue(sheet.protection.sheet)
-        self.assertIsNone(sheet.protection.password)
-        self.assertFalse(sheet.protection.autoFilter, "filters must stay usable on the locked sheet")
+        # Not locked: Excel allows the +/- buttons only on an unprotected sheet
+        self.assertFalse(sheet.protection.sheet)
         self.assertEqual(sheet["D1"].value, "Design to Cost")
         self.assertEqual(sheet["D2"].value, "Supply Chain Management · Product Master BOM tree")
         self.assertEqual(len(sheet._images), 1, "logo image")
 
-        # PDF: parent rows bold, plain lines normal, numbers tidy (1 not 1.0; prices 2 decimals)
-        from planning import _bom_tree_pdf_cells
-        pdf_headers = ["Level", "L1 part code", "Quantity", "Part price"]
-        cells = _bom_tree_pdf_cells(pdf_headers, [
-            {"has_children": True, "values": ["L1", "BT-MOTOR", 1.0, 1200.0]},
-            {"has_children": False, "values": ["L2", "BT-ROTOR", -0.2, 0.0]},
+        # PDF layout: every cell fits on one line, table fits the page, parent rows bold, tidy numbers
+        from reportlab.pdfbase import pdfmetrics
+        from planning import _bom_tree_pdf_layout
+        pdf_headers = ["Level", "L1 part code", "L1 part name", "Quantity", "Part price"]
+        layout = _bom_tree_pdf_layout(pdf_headers, [
+            {"has_children": True, "values": ["L1", "FL001MOTOR1", "MOTOR1", 1.0, 1200.0]},
+            {"has_children": False, "values": ["L2", "FL001STEEL0.8", "Aluminimum scrap long name", -0.2, 0.0]},
         ])
-        self.assertEqual([c.style.fontName for c in cells[1]], ["Helvetica-Bold"] * 4)
-        self.assertEqual([c.style.fontName for c in cells[2]], ["Helvetica"] * 4)
-        self.assertEqual([c.text for c in cells[1]], ["L1", "BT-MOTOR", "1", "1,200.00"])
-        self.assertEqual([c.text for c in cells[2]], ["L2", "BT-ROTOR", "-0.2", "0.00"])
+        self.assertEqual(layout["data"][1], ["L1", "FL001MOTOR1", "MOTOR1", "1", "1,200.00"])
+        self.assertEqual(layout["data"][2], ["L2", "FL001STEEL0.8", "Aluminimum scrap long name", "-0.2", "0.00"])
+        self.assertEqual(layout["bold_rows"], [0, 1])
+        for line in layout["data"]:
+            for column, value in enumerate(line):
+                needed = pdfmetrics.stringWidth(value, "Helvetica-Bold", layout["font_size"]) + 8
+                self.assertGreaterEqual(layout["widths"][column] + 0.01, needed, f"{value!r} would wrap")
+        self.assertLessEqual(sum(layout["widths"]), layout["pagesize"][0] - 56.69 + 0.01)
+        # Realistic full Product Master row (15 columns): no cell wraps, table fits the page
+        full = _bom_tree_pdf_layout(headers, [{"has_children": False, "values": [
+            "L3", "1000", "FL", "FL12000", "Eva 8014", "FL001MOTOR1", "MOTOR1", "FL001ROTOR", "ROTOR1",
+            "FL001STEEL0.8", "Aluminimum scrap", -0.2, "kg", 1200.0, "INR"]}])
+        for line in full["data"]:
+            for column, value in enumerate(line):
+                self.assertGreaterEqual(full["widths"][column] + 0.01, pdfmetrics.stringWidth(value, "Helvetica-Bold", full["font_size"]) + 8, f"{value!r} would wrap")
+        self.assertLessEqual(sum(full["widths"]), full["pagesize"][0] - 56.69 + 0.01)
+        # Long names: stays on A4 with a smaller font (not wrapped, not moved to A3)
+        from reportlab.lib.pagesizes import A4, landscape
+        longer = _bom_tree_pdf_layout(headers, [{"has_children": False, "values": [
+            "L3", "1000", "FL", "FL12000", "Eva 8014", "FL001MOTOR1", "Long motor assembly description text here", "FL001ROTOR", "ROTOR1",
+            "FL001STEEL0.8", "Aluminium scrap from die casting process", -0.2, "kg", 1200.0, "INR"]}])
+        self.assertEqual(longer["pagesize"], landscape(A4))
+        self.assertTrue(5.0 <= longer["font_size"] < 7.0, longer["font_size"])
+        # Extreme widths: page widens so every row is still one line inside the page
+        wide = _bom_tree_pdf_layout(headers, [{"has_children": False, "values": ["X" * 60] * 15}])
+        self.assertEqual(wide["font_size"], 5.0)
+        for column, value in enumerate(wide["data"][1]):
+            self.assertGreaterEqual(wide["widths"][column] + 0.01, pdfmetrics.stringWidth(value, "Helvetica-Bold", wide["font_size"]) + 8)
+        self.assertLessEqual(sum(wide["widths"]), wide["pagesize"][0] - 56.69 + 0.01, "wide table must fit the page")
 
         # Model BOM Level 1, filtered to one model: model + L1 + L2 + L3 columns
         sheet, headers, rows = download({"tab": "Model BOM Level 1", "model_id": m1})

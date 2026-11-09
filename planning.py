@@ -19,7 +19,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 from pydantic import BaseModel, Field, field_validator
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A3, A4, landscape
+from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
@@ -864,20 +865,14 @@ def _bom_tree_workbook(title: str, headers: list[str], rows: list[dict]) -> io.B
         sheet.set_column(1, len(headers) - 1, 16)
         sheet.freeze_panes(4, 0)
         sheet.autofilter(3, 0, max(3, 3 + len(rows)), len(headers) - 1)
-        # Locked (no password) so the logo and title cannot be deleted; filters and column
-        # widths stay usable. Review > Unprotect Sheet enables the +/- buttons.
-        sheet.protect("", {"autofilter": True, "format_columns": True})
         workbook.close()
         return io.BytesIO(workbook_path.read_bytes())
 
 
-def _bom_tree_pdf_cells(headers: list[str], rows: list[dict]) -> list[list[Paragraph]]:
-    """Table cells for the BOM tree PDF: wrapped text, parent rows bold, tidy numbers."""
-    styles = getSampleStyleSheet()
-    plain = styles["BodyText"].clone("bomTreePlain", fontName="Helvetica", fontSize=6.5, leading=8, textColor=colors.HexColor("#4f6275"))
-    bold = plain.clone("bomTreeBold", fontName="Helvetica-Bold", textColor=colors.HexColor("#12263a"))
-    head = plain.clone("bomTreeHead", fontName="Helvetica-Bold", textColor=colors.white)
-
+def _bom_tree_pdf_layout(headers: list[str], rows: list[dict]) -> dict:
+    """BOM tree PDF layout: every row on one line. Column widths fit the longest text; if
+    the table is wider than A4 landscape the font shrinks (down to 5 pt), then A3 is used;
+    an extremely wide table gets a page as wide as the table (print with "fit to page")."""
     def text(header: str, value: Any) -> str:
         if value is None or value == "":
             return ""
@@ -887,20 +882,36 @@ def _bom_tree_pdf_cells(headers: list[str], rows: list[dict]) -> list[list[Parag
             return str(int(value))
         return str(value)
 
-    cells = [[Paragraph(_xml_escape(header), head) for header in headers]]
-    for row in rows:
-        style = bold if row["has_children"] else plain
-        cells.append([Paragraph(_xml_escape(text(header, value)), style) for header, value in zip(headers, row["values"])])
-    return cells
+    data = [list(headers)] + [[text(header, value) for header, value in zip(headers, row["values"])] for row in rows]
+    bold_rows = [0] + [index + 1 for index, row in enumerate(rows) if row["has_children"]]
+    padding = 8  # points, left + right cell padding
 
+    def natural_widths(size: float) -> list[float]:
+        return [max(pdfmetrics.stringWidth(line[column], "Helvetica-Bold", size) for line in data) + padding
+                for column in range(len(headers))]
 
-def _xml_escape(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    font_size = 7.0
+    for pagesize in (landscape(A4), landscape(A3)):
+        available = pagesize[0] - 20 * mm
+        widths = natural_widths(font_size)
+        if sum(widths) > available:
+            font_size = max(5.0, font_size * (available - padding * len(headers)) / (sum(widths) - padding * len(headers)))
+            widths = natural_widths(font_size)
+        if sum(widths) <= available or pagesize == landscape(A3):
+            if sum(widths) > available:
+                pagesize = (sum(widths) + 20 * mm, pagesize[1])
+                available = sum(widths)
+            spare = max(0.0, available - sum(widths)) / len(headers)
+            return {"data": data, "widths": [width + spare for width in widths], "font_size": font_size,
+                    "bold_rows": bold_rows, "pagesize": pagesize}
+        font_size = 7.0
+    raise AssertionError("unreachable")
 
 
 def _bom_tree_pdf(title: str, headers: list[str], rows: list[dict]) -> io.BytesIO:
+    layout = _bom_tree_pdf_layout(headers, rows)
     output = io.BytesIO()
-    document = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=10 * mm, leftMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm)
+    document = SimpleDocTemplate(output, pagesize=layout["pagesize"], rightMargin=10 * mm, leftMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm)
     styles = getSampleStyleSheet()
     story = []
     logo_path = Path(__file__).resolve().parent / "static" / "logo.png"
@@ -908,15 +919,25 @@ def _bom_tree_pdf(title: str, headers: list[str], rows: list[dict]) -> io.BytesI
         story.append(Image(str(logo_path), width=16 * mm, height=16 * mm))
     except OSError:
         pass
-    story.extend([Paragraph("Design to Cost", styles["Title"]), Paragraph(f"Supply Chain Management · {_xml_escape(title)}", styles["Heading2"]), Spacer(1, 4 * mm)])
-    width = 277 * mm / max(1, len(headers))
-    table = Table(_bom_tree_pdf_cells(headers, rows), repeatRows=1, colWidths=[width] * len(headers))
-    table.setStyle(TableStyle([
+    story.extend([Paragraph("Design to Cost", styles["Title"]), Paragraph(f"Supply Chain Management · {title}", styles["Heading2"]), Spacer(1, 4 * mm)])
+    table = Table(layout["data"], repeatRows=1, colWidths=layout["widths"])
+    commands = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12263a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), layout["font_size"]),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#4f6275")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ("GRID", (0, 0), (-1, -1), .25, colors.HexColor("#dce4ea")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f8fa")]),
-    ]))
+    ]
+    for row_index in layout["bold_rows"]:
+        commands.append(("FONTNAME", (0, row_index), (-1, row_index), "Helvetica-Bold"))
+        if row_index:
+            commands.append(("TEXTCOLOR", (0, row_index), (-1, row_index), colors.HexColor("#12263a")))
+    table.setStyle(TableStyle(commands))
     story.append(table)
     document.build(story)
     output.seek(0)
@@ -2633,14 +2654,14 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if can_price:
                 values += [item.unit_cost if item else "", item.currency if item else ""]
             rows.append({"depth": entry["depth"], "has_children": entry["has_children"], "values": values})
-        title = f"{tab} BOM tree"
+        title = f"{tab if tab.endswith('BOM') else tab + ' BOM'} tree"
         if file_format == "xlsx":
             output = _bom_tree_workbook(title, headers, rows)
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         else:
             output = _bom_tree_pdf(title, headers, rows)
             media_type = "application/pdf"
-        filename = f"{tab.lower().replace(' ', '-')}-bom-tree.{file_format}"
+        filename = f"{title.lower().replace(' ', '-')}.{file_format}"
         return StreamingResponse(output, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.get("/api/planning/tables/{kind}/{file_format}")
