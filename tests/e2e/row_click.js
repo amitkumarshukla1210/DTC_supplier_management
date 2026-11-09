@@ -47,11 +47,18 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   };
 
   // Header text above the row's first filled data cell (after the toggle column)
-  const headerOfFilledCell = async (tableSel, row) => {
-    const index = await row.evaluate((tr) => [...tr.cells].findIndex((td, i) => i > 0 && td.textContent.trim() !== ""));
-    return (await page.locator(`${tableSel} > .table-wrap > table > thead th`).nth(index).locator("summary").textContent()).trim();
+  // Text of the row's cell under the header with this name
+  const cellUnder = async (tableSel, row, headerName) => {
+    const names = await page.locator(`${tableSel} > .table-wrap > table > thead th`).evaluateAll((ths) => ths.map((th) => th.querySelector("summary")?.textContent.trim() || ""));
+    const index = names.indexOf(headerName);
+    return row.evaluate((tr, i) => tr.cells[i]?.textContent.trim(), index);
   };
-  const rowCodes = (tableSel) => page.locator(`${tableSel} tbody tr`).evaluateAll((trs) => trs.map((tr) => [...tr.cells].slice(1).find((td) => td.textContent.trim())?.textContent.trim()));
+  // Each row's own (deepest) code: last filled code column of the level columns
+  const rowCodes = (tableSel, levelCount) => page.locator(`${tableSel} tbody tr`).evaluateAll((trs, n) => trs.map((tr) => {
+    for (let k = n - 1; k >= 0; k -= 1) { const text = tr.cells[1 + 2 * k]?.textContent.trim(); if (text) return text; }
+    return "";
+  }), levelCount);
+  const isBold = (row) => row.locator("td").nth(1).evaluate((td) => Number(getComputedStyle(td).fontWeight) >= 600);
 
   async function checkRow(tabName, row, opts) {
     const cells = row.locator(":scope > td");
@@ -87,16 +94,21 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const pmL1 = page.locator("#productMasterTable tr[data-bom-level1-row]").first();
   await pmL1.waitFor();
   check("Product Master: one table, no nested header", (await page.locator("#productMasterTable thead").count()) === 1);
-  check("Product Master: L1 part sits under 'L1 part code'", (await headerOfFilledCell("#productMasterTable", pmL1)) === "L1 part code");
+  check("Product Master: L1 part sits under 'L1 part code'", (await cellUnder("#productMasterTable", pmL1, "L1 part code")) === "RC-MOTOR");
+  check("Product Master: L1 row repeats product and model", (await cellUnder("#productMasterTable", pmL1, "Product code")) === "RC-1000" && (await cellUnder("#productMasterTable", pmL1, "Model name")) === "Eva 8014");
   await pmL1.locator("[data-tree-expand]").click();
   const pmL2 = page.locator("#productMasterTable tr[data-bom-level2-row]").first();
   await pmL2.waitFor();
-  check("Product Master: L2 part sits under 'L2 part code'", (await headerOfFilledCell("#productMasterTable", pmL2)) === "L2 part code");
+  check("Product Master: L2 part sits under 'L2 part code'", (await cellUnder("#productMasterTable", pmL2, "L2 part code")) === "RC-STEEL");
+  check("Product Master: L2 row repeats L1 part", (await cellUnder("#productMasterTable", pmL2, "L1 part code")) === "RC-MOTOR" && (await cellUnder("#productMasterTable", pmL2, "L1 part name")) === "Motor");
   await pmL2.locator("[data-tree-expand]").click();
   await page.waitForFunction(() => document.querySelectorAll("#productMasterTable tr[data-bom-level2-row]").length === 2);
   const pmL3 = page.locator("#productMasterTable tr[data-bom-level2-row]").nth(1);
-  check("Product Master: L3 part sits under 'L3 part code'", (await headerOfFilledCell("#productMasterTable", pmL3)) === "L3 part code");
-  check("Product Master: tree order Product > L1 > L2 > L3", JSON.stringify(await rowCodes("#productMasterTable")) === JSON.stringify(["RC-1000", "RC-MOTOR", "RC-STEEL", "RC-WIRE", "RC-1000"]), JSON.stringify(await rowCodes("#productMasterTable")));
+  check("Product Master: L3 part sits under 'L3 part code'", (await cellUnder("#productMasterTable", pmL3, "L3 part code")) === "RC-WIRE");
+  check("Product Master: L3 row repeats the full path", (await cellUnder("#productMasterTable", pmL3, "Product code")) === "RC-1000" && (await cellUnder("#productMasterTable", pmL3, "L1 part code")) === "RC-MOTOR" && (await cellUnder("#productMasterTable", pmL3, "L2 part code")) === "RC-STEEL");
+  const order = await rowCodes("#productMasterTable", 5);
+  check("Product Master: tree order Model > L1 > L2 > L3", JSON.stringify(order) === JSON.stringify(["RC-12000", "RC-MOTOR", "RC-STEEL", "RC-WIRE", "RC-13000"]), JSON.stringify(order));
+  check("Product Master: rows with lines under them are bold, the last level is not", (await isBold(productRow)) && (await isBold(pmL1)) && (await isBold(pmL2)) && !(await isBold(pmL3)));
   await page.screenshot({ path: __dirname + "/look_product.png" });
   await productRow.locator("[data-tree-expand]").click();
   check("Product Master: collapsing the product removes all levels below it", (await page.locator("#productMasterTable tbody tr").count()) === 2);
@@ -119,8 +131,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const l2Row = page.locator("#masterTable tr[data-bom-level2-row]").first();
   await l2Row.waitFor();
   check("Level 2: one table, no nested header", (await page.locator("#masterTable thead").count()) === 1);
-  check("Level 2: parent sits under 'L1 part code'", (await headerOfFilledCell("#masterTable", group)) === "L1 part code");
-  check("Level 2: line sits under 'L2 part code'", (await headerOfFilledCell("#masterTable", l2Row)) === "L2 part code");
+  check("Level 2: parent sits under 'L1 part code'", (await cellUnder("#masterTable", group, "L1 part code")) === "RC-MOTOR");
+  check("Level 2: line sits under 'L2 part code' and repeats its L1 parent", (await cellUnder("#masterTable", l2Row, "L2 part code")) === "RC-STEEL" && (await cellUnder("#masterTable", l2Row, "L1 part code")) === "RC-MOTOR");
   await page.screenshot({ path: __dirname + "/look_level2.png" });
   await checkRow("Level 2 Part BOM", l2Row, { dataCell: 3 });
   const groupCells = group.locator(":scope > td");
@@ -151,6 +163,13 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.mouse.move(5, 5);
   await page.screenshot({ path: __dirname + "/look_material.png" });
 
+  // Download buttons on the BOM tabs give the tree file of that tab (and its selection)
+  for (const [tab, file] of [["Product Master", "product-master-bom-tree.xlsx"], ["Level 2 Part BOM", "level-2-part-bom-bom-tree.xlsx"]]) {
+    await page.click(`[data-bom-tab="${tab}"]`);
+    await page.waitForSelector(`.tab-button.active[data-bom-tab="${tab}"]`);
+    const [download] = await Promise.all([page.waitForEvent("download"), page.click('[data-bom-tree-export="xlsx"]')]);
+    check(`${tab}: Download Excel gives the BOM tree file`, download.suggestedFilename() === file && download.url().includes("/api/planning/bom-tree/xlsx"), download.suggestedFilename());
+  }
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
   const failed = results.filter((r) => !r.ok).length;

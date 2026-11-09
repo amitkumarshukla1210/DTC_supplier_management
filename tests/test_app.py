@@ -739,6 +739,82 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(login.status_code, 200, login.text)
         self.assertEqual(new_bom(l1b, [{"child_item_id": c3, "quantity": 1}]).status_code, 403)
 
+    def test_bom_tree_export_has_full_paths_outline_levels_and_bold_parents(self):
+        # Data: product BT-1000 -> model BT-12000 -> L1 BT-MOTOR -> L2 BT-ROTOR -> L3 BT-ADC (2), BT-SCRAP (-0.2)
+        #                                                         -> L2 BT-STATOR (no L3)
+        #       second model BT-13000 (no BOM) on the same product
+        def material(code, name, uom="ea", cost=0):
+            response = self.client.post("/api/planning/materials", json={"code": code, "name": name, "uom": uom, "unit_cost": cost, "currency": "INR"})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        motor, rotor, stator = material("BT-MOTOR", "Motor", "PCS", 1200), material("BT-ROTOR", "Rotor", "PCS", 200), material("BT-STATOR", "Stator", "Nos")
+        adc, scrap = material("BT-ADC", "ADC12", "kg", 350), material("BT-SCRAP", "Al scrap", "kg")
+        m1 = self.client.post("/api/planning/models", json={"code": "BT-12000", "name": "Eva"}).json()["id"]
+        m2 = self.client.post("/api/planning/models", json={"code": "BT-13000", "name": "Serena"}).json()["id"]
+        self.assertEqual(self.client.post("/api/planning/products", json={"code": "BT-1000", "name": "FL", "model_ids": [m1, m2]}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/model-bom/{m1}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": rotor, "quantity": 1}, {"child_item_id": stator, "quantity": 1}]}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{rotor}/new", json={"tab": "Level 3 Part BOM", "lines": [{"child_item_id": adc, "quantity": 2}, {"child_item_id": scrap, "quantity": -0.2}]}).status_code, 201)
+
+        def download(params):
+            response = self.client.get("/api/planning/bom-tree/xlsx", params=params)
+            self.assertEqual(response.status_code, 200, response.text)
+            sheet = load_workbook(io.BytesIO(response.content)).active
+            headers = [cell.value for cell in sheet[4]]
+            rows = [r for r in range(5, sheet.max_row + 1) if sheet.cell(r, 1).value]
+            return sheet, headers, rows
+
+        sheet, headers, rows = download({"tab": "Product Master"})
+        self.assertEqual(headers, ["Level", "Product code", "Product name", "Model code", "Model name", "L1 part code", "L1 part name",
+                                   "L2 part code", "L2 part name", "L3 part code", "L3 part name", "Quantity", "Unit", "Part price", "Currency"])
+        mine = [r for r in rows if sheet.cell(r, 2).value == "BT-1000"]
+        values = [[sheet.cell(r, c).value for c in range(1, 14)] for r in mine]
+        self.assertEqual(values, [
+            ["Model", "BT-1000", "FL", "BT-12000", "Eva", None, None, None, None, None, None, None, None],
+            ["L1", "BT-1000", "FL", "BT-12000", "Eva", "BT-MOTOR", "Motor", None, None, None, None, 1, "PCS"],
+            ["L2", "BT-1000", "FL", "BT-12000", "Eva", "BT-MOTOR", "Motor", "BT-ROTOR", "Rotor", None, None, 1, "PCS"],
+            ["L3", "BT-1000", "FL", "BT-12000", "Eva", "BT-MOTOR", "Motor", "BT-ROTOR", "Rotor", "BT-ADC", "ADC12", 2, "kg"],
+            ["L3", "BT-1000", "FL", "BT-12000", "Eva", "BT-MOTOR", "Motor", "BT-ROTOR", "Rotor", "BT-SCRAP", "Al scrap", -0.2, "kg"],
+            ["L2", "BT-1000", "FL", "BT-12000", "Eva", "BT-MOTOR", "Motor", "BT-STATOR", "Stator", None, None, 1, "Nos"],
+            ["Model", "BT-1000", "FL", "BT-13000", "Serena", None, None, None, None, None, None, None, None],
+        ])
+        self.assertEqual([sheet.row_dimensions[r].outlineLevel for r in mine], [0, 1, 2, 3, 3, 2, 0])
+        self.assertEqual([bool(sheet.cell(r, 2).font.b) for r in mine], [True, True, True, False, False, False, False])
+        self.assertEqual([sheet.cell(r, 14).value for r in mine[1:5]], [1200, 200, 350, 0])
+        self.assertIs(sheet.sheet_properties.outlinePr.summaryBelow, False, "+/- must sit on the parent row above its lines")
+
+        # Model BOM Level 1, filtered to one model: model + L1 + L2 + L3 columns
+        sheet, headers, rows = download({"tab": "Model BOM Level 1", "model_id": m1})
+        self.assertEqual(headers[:3], ["Level", "Model code", "Model name"])
+        self.assertEqual([sheet.cell(r, 4).value for r in rows], ["BT-MOTOR"] * 5)
+        self.assertEqual([sheet.row_dimensions[r].outlineLevel for r in rows], [0, 1, 2, 2, 1])
+
+        # Level 2, filtered to BT-MOTOR: parent row then its L2 / L3 lines
+        sheet, headers, rows = download({"tab": "Level 2 Part BOM", "parent_item_id": motor})
+        self.assertEqual(headers[:3], ["Level", "L1 part code", "L1 part name"])
+        self.assertEqual([[sheet.cell(r, c).value for c in (1, 2, 4, 6)] for r in rows], [
+            ["L1", "BT-MOTOR", None, None], ["L2", "BT-MOTOR", "BT-ROTOR", None], ["L3", "BT-MOTOR", "BT-ROTOR", "BT-ADC"],
+            ["L3", "BT-MOTOR", "BT-ROTOR", "BT-SCRAP"], ["L2", "BT-MOTOR", "BT-STATOR", None]])
+
+        # Level 3: only L2 parts that have a BOM (BT-ROTOR, not BT-STATOR)
+        sheet, headers, rows = download({"tab": "Level 3 Part BOM"})
+        self.assertEqual(headers[:5], ["Level", "L2 part code", "L2 part name", "L3 part code", "L3 part name"])
+        self.assertEqual([[sheet.cell(r, c).value for c in (2, 4)] for r in rows if str(sheet.cell(r, 2).value).startswith("BT-")],
+                         [["BT-ROTOR", None], ["BT-ROTOR", "BT-ADC"], ["BT-ROTOR", "BT-SCRAP"]])
+
+        pdf = self.client.get("/api/planning/bom-tree/pdf", params={"tab": "Product Master"})
+        self.assertEqual(pdf.status_code, 200)
+        self.assertTrue(pdf.content.startswith(b"%PDF"))
+        self.assertEqual(self.client.get("/api/planning/bom-tree/xlsx", params={"tab": "Bogus"}).status_code, 422)
+
+        # Users without price permission get no price columns
+        self.assertEqual(self.client.post("/api/users", json={"username": "noprice", "full_name": "No Price", "password": "No-price-pass-2026!", "role": "User"}).status_code, 201)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "noprice", "password": "No-price-pass-2026!"}).status_code, 200)
+        sheet, headers, rows = download({"tab": "Product Master"})
+        self.assertNotIn("Part price", headers)
+        self.assertEqual(headers[-2:], ["Quantity", "Unit"])
+
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
         suppliers = [row for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]

@@ -827,6 +827,44 @@ def _generic_workbook(title: str, headers: list[str], rows: list[list[Any]]) -> 
     return _branded_workbook(title, headers, rows)
 
 
+def _bom_tree_workbook(title: str, headers: list[str], rows: list[dict]) -> io.BytesIO:
+    """BOM tree as an Excel outline: each row's outline level = its tree depth, so Excel's
+    own +/- buttons open and close the levels; rows that have children are bold."""
+    logo_path = Path(__file__).resolve().parent / "static" / "logo.png"
+    with tempfile.TemporaryDirectory(prefix="dtc-export-") as temp_dir:
+        workbook_path = Path(temp_dir) / "bom-tree.xlsx"
+        workbook = xlsxwriter.Workbook(str(workbook_path))
+        sheet = workbook.add_worksheet("BOM tree")
+        title_format = workbook.add_format({"bold": True, "font_name": "Aptos Display", "font_size": 16, "font_color": "#12263A"})
+        subtitle_format = workbook.add_format({"font_name": "Aptos", "font_size": 11, "font_color": "#425466"})
+        header_format = workbook.add_format({"bold": True, "font_name": "Aptos", "font_color": "#FFFFFF", "bg_color": "#12263A", "text_wrap": True, "valign": "vcenter"})
+        parent_format = workbook.add_format({"bold": True, "font_name": "Aptos", "font_color": "#12263A", "bottom": 1, "bottom_color": "#C9D6E0"})
+        leaf_format = workbook.add_format({"font_name": "Aptos", "font_color": "#4F6275", "bottom": 1, "bottom_color": "#E4EBF0"})
+        if logo_path.is_file():
+            sheet.insert_image("A1", str(logo_path), {"x_scale": 0.45, "y_scale": 0.45, "object_position": 1})
+        sheet.write_string("D1", "Design to Cost", title_format)
+        sheet.write_string("D2", f"Supply Chain Management · {title}", subtitle_format)
+        sheet.write_row(3, 0, headers, header_format)
+        sheet.outline_settings(True, False, False, False)  # +/- button on the parent row above its lines
+        for offset, row in enumerate(rows):
+            row_index = 4 + offset
+            cell_format = parent_format if row["has_children"] else leaf_format
+            sheet.set_row(row_index, None, cell_format, {"level": min(row["depth"], 7)})
+            for column_index, value in enumerate(row["values"]):
+                if value is None or value == "":
+                    sheet.write_blank(row_index, column_index, None, cell_format)
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    sheet.write_number(row_index, column_index, value, cell_format)
+                else:
+                    sheet.write_string(row_index, column_index, str(value), cell_format)
+        sheet.set_column(0, 0, 9)
+        sheet.set_column(1, len(headers) - 1, 16)
+        sheet.freeze_panes(4, 0)
+        sheet.autofilter(3, 0, max(3, 3 + len(rows)), len(headers) - 1)
+        workbook.close()
+        return io.BytesIO(workbook_path.read_bytes())
+
+
 def _generic_pdf(title: str, headers: list[str], rows: list[list[Any]]) -> io.BytesIO:
     output = io.BytesIO()
     document = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=10 * mm, leftMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm)
@@ -2432,6 +2470,120 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         rows = [[r["supplier_code"], r["supplier_name"], r["tier"], r["currency"], r["po_count"], r.get("po_value") if _check_price_access(request) else "Restricted"] for r in report]
         output = _generic_pdf(f"Supplier business · {start_month} to {end_month}", headers, rows)
         return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="dtc-supplier-business-{start_month}-{end_month}.pdf"'})
+
+    BOM_TREE_LEVELS = {
+        "Product Master": ["product", "model", "l1", "l2", "l3"],
+        "Model BOM Level 1": ["model", "l1", "l2", "l3"],
+        "Level 2 Part BOM": ["l1", "l2", "l3"],
+        "Level 3 Part BOM": ["l2", "l3"],
+    }
+    BOM_TREE_LABELS = {
+        "product": ("Product code", "Product name"), "model": ("Model code", "Model name"),
+        "l1": ("L1 part code", "L1 part name"), "l2": ("L2 part code", "L2 part name"), "l3": ("L3 part code", "L3 part name"),
+    }
+    BOM_TREE_LEVEL_NAMES = {"product": "Product", "model": "Model", "l1": "L1", "l2": "L2", "l3": "L3"}
+
+    @app.get("/api/planning/bom-tree/{file_format}")
+    def export_bom_tree(
+        file_format: str, request: Request, tab: str = "Product Master",
+        model_id: list[int] = Query(default=[]), parent_item_id: list[int] = Query(default=[]),
+    ):
+        """Full BOM tree breakdown of a BOM tab (same columns as the screen), every row
+        repeating its parents' codes and names."""
+        current_user(request)
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export format not supported")
+        if tab not in BOM_TREE_LEVELS:
+            raise HTTPException(status_code=422, detail="Unknown BOM tab")
+        levels = BOM_TREE_LEVELS[tab]
+        can_price = _check_price_access(request)
+        tree: list[dict] = []
+        with open_db() as db:
+            items = {item.id: item for item in db.scalars(select(Item)).all()}
+            children: dict[int, list[BOMComponent]] = {}
+            for link in db.scalars(select(BOMComponent).order_by(BOMComponent.id)).all():
+                children.setdefault(link.parent_item_id, []).append(link)
+
+            def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None) -> None:
+                tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity, "item": item})
+
+            def part_lines(parent_id: int, level: str, depth: int, path: dict) -> None:
+                for link in children.get(parent_id, []):
+                    child = items.get(link.child_item_id)
+                    if not child:
+                        continue
+                    child_path = {**path, level: (child.code, child.name)}
+                    deeper = level == "l2" and bool(children.get(child.id))
+                    emit(depth, level, child_path, deeper, link.quantity, child)
+                    if deeper:
+                        part_lines(child.id, "l3", depth + 1, child_path)
+
+            def model_lines(model: ProductModel, depth: int, path: dict) -> None:
+                for root in db.scalars(select(ModelBOM).where(ModelBOM.model_id == model.id).order_by(ModelBOM.id)).all():
+                    item = items.get(root.material_id)
+                    if not item:
+                        continue
+                    line_path = {**path, "l1": (item.code, item.name)}
+                    deeper = bool(children.get(item.id))
+                    emit(depth, "l1", line_path, deeper, root.quantity, item)
+                    if deeper:
+                        part_lines(item.id, "l2", depth + 1, line_path)
+
+            if tab == "Product Master":
+                models = {model.id: model for model in db.scalars(select(ProductModel)).all()}
+                links: dict[int, list[ProductModel]] = {}
+                for link in db.scalars(select(ProductModelProduct)).all():
+                    if link.model_id in models:
+                        links.setdefault(link.product_id, []).append(models[link.model_id])
+                products = db.scalars(select(Product).where(Product.code != MODEL_CATALOG_PRODUCT_CODE).order_by(Product.code)).all()
+                for product in products:
+                    product_models = sorted(links.get(product.id, []), key=lambda model: model.code)
+                    if not product_models:
+                        emit(0, "product", {"product": (product.code, product.name)}, False)
+                    for model in product_models:
+                        path = {"product": (product.code, product.name), "model": (model.code, model.name)}
+                        has_lines = db.scalar(select(ModelBOM.id).where(ModelBOM.model_id == model.id).limit(1)) is not None
+                        emit(0, "model", path, has_lines)
+                        model_lines(model, 1, path)
+            elif tab == "Model BOM Level 1":
+                statement = select(ProductModel).order_by(ProductModel.code)
+                if model_id:
+                    statement = statement.where(ProductModel.id.in_(model_id))
+                for model in db.scalars(statement).all():
+                    model_lines(model, 0, {"model": (model.code, model.name)})
+            else:
+                parent_level = "l1" if tab == "Level 2 Part BOM" else "l2"
+                line_level = "l2" if tab == "Level 2 Part BOM" else "l3"
+                parent_ids = {item_id for item_id in bom_parent_material_ids(db, tab) if children.get(item_id)}
+                if parent_item_id:
+                    parent_ids &= set(parent_item_id)
+                for parent in sorted((items[item_id] for item_id in parent_ids if item_id in items), key=lambda item: item.code):
+                    path = {parent_level: (parent.code, parent.name)}
+                    emit(0, parent_level, path, True)
+                    part_lines(parent.id, line_level, 1, path)
+
+        headers = ["Level", *[label for level in levels for label in BOM_TREE_LABELS[level]], "Quantity", "Unit"]
+        if can_price:
+            headers += ["Part price", "Currency"]
+        rows = []
+        for entry in tree:
+            item = entry["item"]
+            values = [BOM_TREE_LEVEL_NAMES[entry["level"]]]
+            for level in levels:
+                values.extend(entry["path"].get(level, ("", "")))
+            values += [entry["quantity"] if entry["quantity"] is not None else "", item.uom if item else ""]
+            if can_price:
+                values += [item.unit_cost if item else "", item.currency if item else ""]
+            rows.append({"depth": entry["depth"], "has_children": entry["has_children"], "values": values})
+        title = f"{tab} BOM tree"
+        if file_format == "xlsx":
+            output = _bom_tree_workbook(title, headers, rows)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            output = _generic_pdf(title, headers, [row["values"] for row in rows])
+            media_type = "application/pdf"
+        filename = f"{tab.lower().replace(' ', '-')}-bom-tree.{file_format}"
+        return StreamingResponse(output, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.get("/api/planning/tables/{kind}/{file_format}")
     def export_table(

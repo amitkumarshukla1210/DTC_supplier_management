@@ -137,6 +137,19 @@ function tableExportLinks(kind, parameters = {}) {
   return `<a class="button button-small" href="/api/planning/tables/${encodeURIComponent(kind)}/xlsx${suffix}">Download Excel</a><a class="button button-small" href="/api/planning/tables/${encodeURIComponent(kind)}/pdf${suffix}">Download PDF</a>`;
 }
 
+// BOM tabs download the full tree breakdown (Excel opens with +/- outline buttons).
+// The link is built on click so it uses the models / parent parts selected at that moment.
+function bomTreeExportLinks() {
+  return '<a class="button button-small" href="#" data-bom-tree-export="xlsx">Download Excel</a><a class="button button-small" href="#" data-bom-tree-export="pdf">Download PDF</a>';
+}
+
+function bomTreeExportUrl(fileFormat) {
+  const query = new URLSearchParams({ tab: state.bomTab });
+  if (state.bomTab === "Model BOM Level 1") state.selectedModelIds.forEach((id) => query.append("model_id", String(id)));
+  if (state.bomTab === "Level 2 Part BOM" || state.bomTab === "Level 3 Part BOM") state.selectedBomParentIds.forEach((id) => query.append("parent_item_id", String(id)));
+  return `/api/planning/bom-tree/${fileFormat}?${query}`;
+}
+
 function panelHeader(title, description = "") {
   return `<header class="panel-header brand-panel-heading"><img src="/static/logo.png" alt="" /><div><h2>Supply Chain Management · ${esc(title)}</h2>${description ? `<p>${esc(description)}</p>` : ""}</div></header>`;
 }
@@ -491,7 +504,7 @@ async function renderMaster() {
   content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in Material Master, define units once, and manage each model’s BOM by level.", actions)}
     <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab)}</button>`).join("")}</div>
     ${state.bomTab === "Product Master" ? `<section class="panel table-panel">${panelHeader("Product Master")}
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${tableExportLinks("products")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${bomTreeExportLinks()}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="productMasterTable">${table(treeHeaders("Product Master"), productRows, "No products yet.")}</div></section>`
     : state.bomTab === "Material Master" ? `<section class="panel table-panel">${panelHeader("Material Master", "Define each material code once. The unit selected here is used throughout its BOM and supply chain records.")}
       <div class="master-summaries"><article class="mini-stat"><span>Materials</span><strong>${state.materials.length}</strong></article><article class="mini-stat"><span>Models</span><strong>${state.models.length}</strong></article><article class="mini-stat"><span>Products</span><strong>${state.products.length}</strong></article></div>
@@ -507,8 +520,7 @@ async function renderMaster() {
           : bomParentPickerMarkup()}
       </div>
       ${bomTemplateKind ? `<form id="bomUploadForm" class="bom-upload-inline"><input class="form-control bom-file-input" type="file" name="workbook" accept=".xlsx" aria-label="Select ${esc(state.bomTab)} Excel workbook" required /><button class="button button-small button-primary" id="bomUploadButton" type="submit" ${state.bomTab === "Model BOM Level 1" ? (state.selectedModelIds.length === 1 ? "" : "disabled") : (state.selectedBomParent ? "" : "disabled")}>Upload BOM</button></form><a class="button button-small" href="/api/planning/templates/${bomTemplateKind}.xlsx">Level ${state.bomTab === "Model BOM Level 1" ? "1" : state.bomTab === "Level 2 Part BOM" ? "2" : "3"} template</a>` : ""}
-      ${state.bomTab === "Model BOM Level 1" && state.selectedModel ? tableExportLinks("bom", { model_id: state.selectedModel, tab: state.bomTab }) : ""}
-      ${state.bomTab !== "Model BOM Level 1" && state.selectedBomParent ? tableExportLinks("bom", { parent_item_id: state.selectedBomParent, tab: state.bomTab }) : ""}
+      ${bomTreeExportLinks()}
       <button class="button button-small" data-action="clear-table-filters">Clear all filters</button>
       ${state.bomTab === "Model BOM Level 1" ? '<button class="button button-small button-primary" data-action="new-bom">Add line</button>' : '<button class="button button-small button-primary" id="newPartBomButton" data-action="new-bom" disabled>Select one parent part</button><button class="button button-small button-primary" data-action="new-part-bom">New BOM</button>'}
       </div>
@@ -645,20 +657,22 @@ function treeToggle(label, attributes) {
 }
 
 function treeRowHtml(tab, row) {
-  const levelCells = TREE_LEVELS[tab].map((level) => row.cells[level]
+  // Columns this row does not fill itself repeat the parent row's code / name (row.inherit).
+  const levelCells = TREE_LEVELS[tab].map((level, index) => row.cells[level]
     ? `<td>${esc(row.cells[level][0])}</td><td>${esc(row.cells[level][1])}</td>`
-    : "<td></td><td></td>").join("");
-  return `<tr class="${row.className || ""}" ${row.attributes || ""} data-tree-depth="${row.depth}" tabindex="0"><td class="tree-toggle-cell">${row.toggle || ""}</td>${levelCells}<td>${row.quantity ?? ""}</td><td>${esc(row.uom || "")}</td><td>${row.price ?? ""}</td><td>${row.edit || ""}</td><td>${row.remove || ""}</td></tr>`;
+    : [0, 1].map((part) => `<td class="tree-inherited">${esc(row.inherit?.[index * 2 + part] || "")}</td>`).join("")).join("");
+  const className = `${row.className || ""}${row.toggle ? " tree-has-children" : ""}`;
+  return `<tr class="${className}" ${row.attributes || ""} data-tree-depth="${row.depth}" tabindex="0"><td class="tree-toggle-cell">${row.toggle || ""}</td>${levelCells}<td>${row.quantity ?? ""}</td><td>${esc(row.uom || "")}</td><td>${row.price ?? ""}</td><td>${row.edit || ""}</td><td>${row.remove || ""}</td></tr>`;
 }
 
 function treePrice(item) {
   return item.unit_price === undefined ? "Restricted" : money(item.unit_price, item.currency);
 }
 
-function level1RowHtml(tab, item, modelId, depth, showModel) {
+function level1RowHtml(tab, item, modelId, depth, showModel, inherit) {
   const data = `data-model-id="${modelId}" data-material-id="${item.material_id}" data-quantity="${item.edit_quantity}" data-uom="${esc(item.uom)}"`;
   return treeRowHtml(tab, {
-    depth, className: "clickable-row",
+    depth, inherit, className: "clickable-row",
     attributes: `data-bom-level1-row data-has-bom="${item.has_bom}" data-edit-bom-row="${item.root_bom_id || ""}" ${data}`,
     cells: { ...(showModel ? { model: [item.model_code, item.model_name] } : {}), l1: [item.code, item.name] },
     toggle: item.has_bom ? treeToggle(item.code, `data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 2 Part BOM"`) : "",
@@ -668,12 +682,12 @@ function level1RowHtml(tab, item, modelId, depth, showModel) {
   });
 }
 
-function partRowHtml(tab, item, parent, lineLevel, depth) {
+function partRowHtml(tab, item, parent, lineLevel, depth, inherit) {
   const level = lineLevel === "Level 2 Part BOM" ? "l2" : "l3";
   const expandable = level === "l2" && item.has_bom;
   const data = `data-parent-item="${parent.id}" data-material-id="${item.material_id}" data-quantity="${item.quantity}" data-uom="${esc(item.uom)}"`;
   return treeRowHtml(tab, {
-    depth, className: "clickable-row",
+    depth, inherit, className: "clickable-row",
     attributes: `data-bom-level2-row data-has-bom="${expandable}" data-edit-component-row="${item.component_id}" ${data}`,
     cells: { [level]: [item.code, item.name] },
     toggle: expandable ? treeToggle(item.code, `data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 3 Part BOM"`) : "",
@@ -693,18 +707,19 @@ async function expandBomTree(button) {
     return;
   }
   button.disabled = true;
+  const inherit = [...row.cells].slice(1, 1 + TREE_LEVELS[state.bomTab].length * 2).map((cell) => cell.textContent);
   try {
     let rows;
     if (button.dataset.treeExpand === "model") {
       const modelId = Number(button.dataset.treeModelId);
       const query = new URLSearchParams({ tab: "Model BOM Level 1", offset: "0", limit: "500" });
       const result = await api(`/api/planning/model-bom/${modelId}?${query}`);
-      rows = result.items.map((item) => level1RowHtml(state.bomTab, item, modelId, depth + 1, false));
+      rows = result.items.map((item) => level1RowHtml(state.bomTab, item, modelId, depth + 1, false, inherit));
     } else {
       const level = button.dataset.treeLevel;
       const query = new URLSearchParams({ tab: level, offset: "0", limit: "500" });
       const result = await api(`/api/planning/part-bom/${Number(button.dataset.treeParentId)}?${query}`);
-      rows = result.items.map((item) => partRowHtml(state.bomTab, item, result.parent, level, depth + 1));
+      rows = result.items.map((item) => partRowHtml(state.bomTab, item, result.parent, level, depth + 1, inherit));
     }
     if (!rows.length) {
       button.remove();
@@ -1503,6 +1518,12 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (event.target.closest('[data-action="new-part-bom"]')) return openNewBomEditor();
+  const treeExport = event.target.closest("[data-bom-tree-export]");
+  if (treeExport) {
+    event.preventDefault();
+    window.location.href = bomTreeExportUrl(treeExport.dataset.bomTreeExport);
+    return;
+  }
   if (event.target.closest("[data-execute-master-search]")) return applyTableSearch({ target: $("#masterSearch") });
   if (event.target.closest("[data-execute-model-search]")) return applyTableSearch({ target: $("#modelMasterSearch") });
   const isDeleteAction = event.target.closest("[data-delete-product], [data-delete-model], [data-delete-material], [data-delete-bom-row], [data-delete-component-row]");

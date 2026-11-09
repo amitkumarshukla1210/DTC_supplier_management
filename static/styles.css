@@ -441,3 +441,6 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 /* Level 2 / 3: wider first (+) column */
 #pageContent[data-view="master"] .part-bom-page .tree-column-heading,
 #pageContent[data-view="master"] .part-bom-page .tree-toggle-cell { width: 96px; min-width: 96px; }
+/* Tree rows that have lines under them are bold; repeated parent values are softer on plain lines */
+#pageContent[data-view="master"] tr.tree-has-children > td { color: #12263a; font-weight: 650; }
+#pageContent[data-view="master"] tr:not(.tree-has-children) > td.tree-inherited { color: #6a7f92; }
