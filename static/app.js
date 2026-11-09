@@ -502,7 +502,8 @@ async function renderMaster() {
     }));
   }).join("");
   const modelRows = state.models.map((item) => `<tr data-edit-model="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.product_names?.join(", ") || "Unassigned")}</td><td><button class="text-button" data-edit-model="${item.id}">Edit</button><button class="text-button button-danger" data-delete-model="${item.id}">Delete</button></td></tr>`).join("");
-  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master"];
+  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master"];
+  const tierTab = TIER_TABS[state.bomTab];
   const bomTemplateKind = {
     "Model BOM Level 1": "bom-oem", "Level 2 Part BOM": "bom-level-2", "Level 3 Part BOM": "bom-level-3",
   }[state.bomTab];
@@ -510,19 +511,23 @@ async function renderMaster() {
     ? '<button class="button button-primary" data-action="new-product">Add line</button>'
     : state.bomTab === "Material Master"
       ? '<button class="button" data-action="new-model">Add model</button><button class="button button-primary" data-action="new-material">Add material</button>'
-      : "";
-  content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in Material Master, define units once, and manage each model’s BOM by level.", actions)}
-    <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab)}</button>`).join("")}</div>
+      : tierTab ? `<button class="button button-primary" data-action="new-tier-material">Add ${tierTab} material</button>` : "";
+  content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", actions)}
+    <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab === "Material Master" ? "T1 Material Master" : tab)}</button>`).join("")}</div>
     ${state.bomTab === "Product Master" ? `<section class="panel table-panel">${panelHeader("Product Master")}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${bomTreeExportLinks()}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="productMasterTable">${table(treeHeaders("Product Master"), productRows, "No products yet.")}</div></section>`
-    : state.bomTab === "Material Master" ? `<section class="panel table-panel">${panelHeader("Material Master", "Define each material code once. The unit selected here is used throughout its BOM and supply chain records.")}
+    : state.bomTab === "Material Master" ? `<section class="panel table-panel">${panelHeader("T1 Material Master", "Codes your company uses directly or indirectly and buys from T1 suppliers. Define each code once; the unit selected here is used throughout its BOM and supply chain records. A code can be in only one of T1, T2 or T3.")}
       <div class="master-summaries"><article class="mini-stat"><span>Materials</span><strong id="materialCount">…</strong></article><article class="mini-stat"><span>Models</span><strong>${state.models.length}</strong></article><article class="mini-stat"><span>Products</span><strong>${state.products.length}</strong></article></div>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search material code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/own-stock.xlsx">Stock template</a>${tableExportLinks("materials")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="materialMasterTable"></div>
       <h3 class="subtable-heading">Model Master <button class="button button-small button-primary" data-action="new-model">Add line</button>${tableExportLinks("models")}</h3>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="modelMasterSearch" type="search" placeholder="Search model code or name" /></label><button class="button button-small" type="button" data-execute-model-search>Execute</button><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="modelMasterTable">${table(["Model code", "Model name", "Assigned products", "Action"], modelRows, "No models yet.")}</div></section>`
+    : tierTab ? `<section class="panel table-panel">${panelHeader(`${tierTab} Material Master`, `Codes used further down the supply chain (${tierTab === "T2" ? "by your T1 suppliers' suppliers" : "by your T2 suppliers' suppliers"}). Not part of your planning; suppliers pick them into their own material master. A code can be in only one of T1, T2 or T3.`)}
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <form id="tierUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload ${tierTab} Material Master (Code, Name, Category, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
+      <div id="tierMaterialTable"></div></section>`
     : `<section class="panel table-panel ${state.bomTab === "Model BOM Level 1" ? "" : "part-bom-page"}">${panelHeader(state.bomTab)}
       <div class="table-toolbar bom-controls ${state.bomTab === "Model BOM Level 1" ? "" : "bom-controls-part"}"><div class="toolbar-group">
         ${state.bomTab === "Model BOM Level 1"
@@ -545,6 +550,18 @@ async function renderMaster() {
   } else if (state.bomTab === "Material Master") {
     $("#masterSearch").dataset.tableFilterRoot = "#materialMasterTable";
     $("#modelMasterSearch").dataset.tableFilterRoot = "#modelMasterTable";
+  } else if (tierTab) {
+    await loadTierMaterialPage(0);
+    $("#tierUploadForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      try {
+        const result = await uploadExcel(`/api/planning/tier-materials/upload?tier=${tierTab}`, new FormData(form).get("workbook"));
+        toast(`${result.rows} row(s): ${result.added} added, ${result.updated} updated`);
+        form.reset();
+        loadTierMaterialPage(0);
+      } catch (error) { toast(error.message, true); }
+    });
   } else {
     $("#masterTable").dataset.filtertable = "true";
   }
@@ -858,6 +875,37 @@ async function loadBomTab() {
   $("#masterTable").innerHTML = table(treeHeaders("Model BOM Level 1"), items.map((item) => level1RowHtml("Model BOM Level 1", item, item.model_id, 0, true)).join(""), "No Model BOM Level 1 lines found.") + pager;
 }
 
+const TIER_TABS = { "T2 Material Master": "T2", "T3 Material Master": "T3" };
+
+async function loadTierMaterialPage(offset = 0) {
+  const target = $("#tierMaterialTable");
+  const tier = TIER_TABS[state.bomTab];
+  if (!target || !tier) return;
+  const search = $("#masterSearch")?.value.trim() || "";
+  const result = await api(`/api/planning/tier-materials?${new URLSearchParams({ tier, offset: String(offset), limit: "500", search })}`);
+  state.tierItems = result.items;
+  const rows = result.items.map((m) => `<tr><td>${esc(m.code)}</td><td>${esc(m.name)}</td><td>${esc(m.category)}</td><td>${esc(m.uom)}</td><td>${m.unit_price === undefined ? "Restricted" : number(m.unit_price, 2)}</td><td>${esc(m.currency || "")}</td><td><button class="text-button" data-tier-edit="${m.id}">Edit</button></td><td><button class="text-button button-danger" data-tier-delete="${m.id}">Delete</button></td></tr>`).join("");
+  target.innerHTML = `${table(["Code", "Name", "Category", "Unit", "Reference price", "Currency", "Edit", "Delete"], rows, search ? "No codes match this search." : `No ${tier} codes yet.`)}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No codes"}</span><div><button class="button button-small" data-tier-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-tier-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+}
+
+function openTierMaterial(material = null) {
+  const tier = TIER_TABS[state.bomTab];
+  $("#modalTitle").textContent = material ? `Edit ${material.code}` : `Add ${tier} material`;
+  $("#modalBody").innerHTML = `<form id="tierForm" class="form-grid">${field("Code", "code", "text", { required: true, maxlength: 48, value: material?.code })}${field("Name", "name", "text", { required: true, maxlength: 180, value: material?.name })}${field("Category", "category", "text", { required: true, value: material?.category || "Raw material" })}${unitField("Unit", "uom", material?.uom || "kg")}${canSeePrices() ? `${field("Reference price", "unit_price", "number", { min: 0, step: "0.0001", value: material?.unit_price ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === (material?.currency || "INR") ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<div class="modal-footer field full"><button class="button button-primary">Save ${tier} material</button></div></form>`;
+  modalLayer.hidden = false;
+  $("#tierForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const body = { tier, code: values.code, name: values.name, category: values.category, uom: values.uom, unit_price: Number(values.unit_price ?? material?.unit_price ?? 0), currency: values.currency || material?.currency || "INR" };
+    try {
+      await api(material ? `/api/planning/tier-materials/${material.id}` : "/api/planning/tier-materials", { method: material ? "PATCH" : "POST", body: JSON.stringify(body) });
+      modalLayer.hidden = true;
+      toast(`${tier} material saved`);
+      loadTierMaterialPage(0);
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
 // Material Master: 500 a page from the server; search covers all codes
 async function loadMaterialMasterPage(offset = 0) {
   const target = $("#materialMasterTable");
@@ -942,15 +990,45 @@ function initSupplierMaterialsTab() {
   const reload = () => loadSupplierMaterials();
   choose.addEventListener("change", () => { state.smSupplier = choose.value; reload(); });
   $("#smSearch").addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(reload, 250); });
+  const from = $("#smFrom");
+  const pickSearch = $("#smPickSearch");
+  const refreshPick = async () => {
+    if (from.value === "Own") return;
+    try {
+      const result = await api(`/api/planning/master-codes?${new URLSearchParams({ tier: from.value, search: pickSearch.value, limit: "100" })}`);
+      const previous = $("#smPick").value;
+      $("#smPick").innerHTML = result.items.map((m) => `<option value="${m.id}">${esc(m.code)} · ${esc(m.name)}</option>`).join("") || '<option value="">No codes found</option>';
+      if ([...$("#smPick").options].some((o) => o.value === previous)) $("#smPick").value = previous;
+    } catch (error) { toast(error.message, true); }
+  };
+  const switchFrom = () => {
+    const own = from.value === "Own";
+    content.querySelectorAll(".sm-pick").forEach((node) => { node.hidden = own; });
+    content.querySelectorAll(".sm-own").forEach((node) => { node.hidden = !own; });
+    refreshPick();
+  };
+  from.addEventListener("change", switchFrom);
+  pickSearch.addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(refreshPick, 250); });
+  switchFrom();
   $("#smAddForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
     if (!state.smSupplier) return toast("Choose a supplier first.", true);
     const values = Object.fromEntries(new FormData(form).entries());
+    const body = { supplier_id: Number(state.smSupplier), unit_price: Number(values.unit_price || 0), currency: values.currency,
+      lead_time_days: Number(values.lead_time_days || 0), buffer_days: Number(values.buffer_days || 0) };
+    if (from.value === "Own") Object.assign(body, { code: values.code, name: values.name, uom: values.uom });
+    else {
+      if (!$("#smPick").value) return toast("Choose a code.", true);
+      body[from.value === "T1" ? "item_id" : "tier_material_id"] = Number($("#smPick").value);
+    }
     try {
-      await api("/api/planning/supplier-materials", { method: "POST", body: JSON.stringify({ ...values, supplier_id: Number(state.smSupplier), unit_price: Number(values.unit_price || 0) }) });
-      toast(`${values.code} added`);
+      const saved = await api("/api/planning/supplier-materials", { method: "POST", body: JSON.stringify(body) });
+      toast(`${saved.code} added to the supplier's master`);
+      const keep = from.value;
       form.reset();
+      from.value = keep;  // keep the chosen source and show its fields
+      switchFrom();
       reload();
     } catch (error) { toast(error.message, true); }
   });
@@ -971,24 +1049,25 @@ function initSupplierMaterialsTab() {
 async function loadSupplierMaterials() {
   const target = $("#smTable");
   if (!target) return;
-  const headers = ["Code", "Name", "Unit", "Unit price", "Currency", "Edit", "Delete"];
-  if (!state.smSupplier) { target.innerHTML = table(headers, "", "Choose a supplier to see its material list."); return; }
+  const headers = ["From", "Code", "Name", "Unit", "Supplier's price", "Currency", "Lead time", "Buffer", "Edit", "Delete"];
+  if (!state.smSupplier) { target.innerHTML = table(headers, "", "Choose a supplier to see its material master."); return; }
   const query = new URLSearchParams({ supplier_id: state.smSupplier, search: $("#smSearch")?.value || "", limit: "1000" });
   const result = await api(`/api/planning/supplier-materials?${query}`);
   state.smItems = result.items;
-  const rows = result.items.map((m) => `<tr><td>${esc(m.code)}</td><td>${esc(m.name)}</td><td>${esc(m.uom)}</td><td>${m.unit_price === undefined ? "Restricted" : number(m.unit_price, 2)}</td><td>${esc(m.currency || "")}</td><td><button class="text-button" data-sm-edit="${m.id}">Edit</button></td><td><button class="text-button button-danger" data-sm-delete="${m.id}">Delete</button></td></tr>`).join("");
+  const rows = result.items.map((m) => `<tr><td>${esc(m.source === "Own" ? "Supplier's own" : m.source)}</td><td>${esc(m.code)}</td><td>${esc(m.name)}</td><td>${esc(m.uom)}</td><td>${m.unit_price === undefined ? "Restricted" : number(m.unit_price, 2)}</td><td>${esc(m.currency || "")}</td><td>${number(m.lead_time_days, 0)} days</td><td>${number(m.buffer_days, 0)} days</td><td><button class="text-button" data-sm-edit="${m.id}">Edit</button></td><td><button class="text-button button-danger" data-sm-delete="${m.id}">Delete</button></td></tr>`).join("");
   target.innerHTML = `${table(headers, rows, "No materials for this supplier yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total.toLocaleString()} material${result.total === 1 ? "" : "s"}${result.total > result.items.length ? ` (first ${result.items.length.toLocaleString()} shown: search to narrow)` : ""}</span></div>`;
 }
 
 function openSupplierMaterialEdit(material) {
-  $("#modalTitle").textContent = `Edit ${material.code}`;
-  $("#modalBody").innerHTML = `<form id="smEditForm" class="form-grid">${field("Code", "code", "text", { required: true, value: material.code })}${field("Name", "name", "text", { required: true, value: material.name })}${unitField("Unit", "uom", material.uom)}${canSeePrices() ? `${field("Unit price", "unit_price", "number", { min: 0, step: "0.0001", value: material.unit_price ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === material.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<div class="modal-footer field full"><button class="button button-primary">Save</button></div></form>`;
+  const own = material.source === "Own";
+  $("#modalTitle").textContent = `Edit ${material.code}${own ? "" : ` (from ${material.source}: code and name follow your master)`}`;
+  $("#modalBody").innerHTML = `<form id="smEditForm" class="form-grid">${own ? `${field("Code", "code", "text", { required: true, value: material.code })}${field("Name", "name", "text", { required: true, value: material.name })}${unitField("Unit", "uom", material.uom)}` : `<label class="field full"><span>Code · name</span><input class="form-control" value="${esc(material.code)} · ${esc(material.name)}" readonly /></label>`}${field("Supplier's lead time (days)", "lead_time_days", "number", { min: 0, value: material.lead_time_days ?? 0 })}${field("Supplier's buffer stock (days)", "buffer_days", "number", { min: 0, value: material.buffer_days ?? 0 })}${canSeePrices() ? `${field("Unit price", "unit_price", "number", { min: 0, step: "0.0001", value: material.unit_price ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === material.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<div class="modal-footer field full"><button class="button button-primary">Save</button></div></form>`;
   modalLayer.hidden = false;
   $("#smEditForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const values = Object.fromEntries(new FormData(event.currentTarget).entries());
     try {
-      await api(`/api/planning/supplier-materials/${material.id}`, { method: "PATCH", body: JSON.stringify({ supplier_id: material.supplier_id, code: values.code, name: values.name, uom: values.uom, unit_price: Number(values.unit_price ?? material.unit_price ?? 0), currency: values.currency || material.currency || "INR" }) });
+      await api(`/api/planning/supplier-materials/${material.id}`, { method: "PATCH", body: JSON.stringify({ supplier_id: material.supplier_id, code: values.code ?? material.code, name: values.name ?? material.name, uom: values.uom ?? material.uom, unit_price: Number(values.unit_price ?? material.unit_price ?? 0), currency: values.currency || material.currency || "INR", lead_time_days: Number(values.lead_time_days || 0), buffer_days: Number(values.buffer_days || 0) }) });
       modalLayer.hidden = true;
       toast("Supplier material saved");
       loadSupplierMaterials();
@@ -1046,7 +1125,7 @@ async function loadSupplierBom() {
     const cells = [...mine, "", "", "", "", "", ""].slice(0, 6).map((text, index) => `<td class="${index < mine.length - 2 ? "tree-inherited" : ""}">${esc(text)}</td>`).join("");
     const priced = line.unit_price !== undefined;
     const sources = line.sources.length ? line.sources.map((src) => `${esc(src.sub_supplier || "(no supplier)")}${src.alternate ? ` · ${esc(src.alternate.code)}` : ""} ${number(src.sob_percent, 0)}%`).join("<br>") : "";
-    return `<tr class="${line.has_children ? "tree-has-children" : ""} ${line.currency_mismatch ? "sb-mismatch" : ""}" data-sb-line="${line.id}" data-tree-depth="${line.depth - 1}"><td class="tree-toggle-cell">${line.has_children ? `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="true">−</button>` : ""}</td>${cells}<td>${line.component.kind === "supplier" ? "Supplier list" : "Our Material Master"}</td><td>${number(line.quantity, 4)}</td><td>${esc(line.component.uom)}</td><td>${priced ? money(line.unit_price, line.currency) : "Restricted"}</td><td>${priced ? money(line.line_cost, line.currency) : "Restricted"}</td><td>${esc(line.price_source)}</td><td>${line.has_children ? "" : `<button class="text-button" data-sb-sources="${line.id}">${line.sources.length ? "Edit" : "Add"}</button>${sources ? `<div class="sb-sources">${sources}</div>` : ""}`}</td><td>${line.depth < 3 ? `<button class="text-button" data-sb-add="${line.id}">+ L${line.depth + 1}</button>` : ""}</td><td><button class="text-button" data-sb-edit="${line.id}">Edit</button></td><td><button class="text-button button-danger" data-sb-delete="${line.id}">Delete</button></td></tr>`;
+    return `<tr class="${line.has_children ? "tree-has-children" : ""} ${line.currency_mismatch ? "sb-mismatch" : ""}" data-sb-line="${line.id}" data-tree-depth="${line.depth - 1}"><td class="tree-toggle-cell">${line.has_children ? `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="true">−</button>` : ""}</td>${cells}<td>${esc(line.component.origin === "Own" ? "Supplier's own" : `${line.component.origin}`)}</td><td>${number(line.quantity, 4)}</td><td>${esc(line.component.uom)}</td><td>${priced ? money(line.unit_price, line.currency) : "Restricted"}</td><td>${priced ? money(line.line_cost, line.currency) : "Restricted"}</td><td>${esc(line.price_source)}</td><td>${line.has_children ? "" : `<button class="text-button" data-sb-sources="${line.id}">${line.sources.length ? "Edit" : "Add"}</button>${sources ? `<div class="sb-sources">${sources}</div>` : ""}`}</td><td>${line.depth < 3 ? `<button class="text-button" data-sb-add="${line.id}">+ L${line.depth + 1}</button>` : ""}</td><td><button class="text-button" data-sb-edit="${line.id}">Edit</button></td><td><button class="text-button button-danger" data-sb-delete="${line.id}">Delete</button></td></tr>`;
   }).join("");
   tableTarget.innerHTML = table(headers, rows, "No BOM lines yet: use Add L1 line or Upload BOM.");
   $("#sbUploadForm").addEventListener("submit", async (event) => {
@@ -1062,8 +1141,7 @@ async function loadSupplierBom() {
 }
 
 function componentPicker() {
-  return `<label class="field"><span>Part from</span><select class="form-control" id="sbKind"><option value="supplier">Supplier's material list</option><option value="our">Our Material Master</option></select></label>
-    <label class="field"><span>Search part</span><input class="form-control" id="sbPartSearch" type="search" placeholder="Type code or name" /></label>
+  return `<label class="field"><span>Search the supplier's material master</span><input class="form-control" id="sbPartSearch" type="search" placeholder="Type code or name" /></label>
     <label class="field full"><span>Part</span><select class="form-control" id="sbPart" required></select></label>`;
 }
 
@@ -1086,8 +1164,7 @@ function openSupplierBomLine(parentLineId, line = null) {
     <div class="modal-footer field full"><button class="button button-primary">Save line</button></div></form>`;
   modalLayer.hidden = false;
   if (!editing) {
-    const refresh = () => fillComponentOptions($("#sbPart"), $("#sbKind").value, $("#sbPartSearch").value).catch((error) => toast(error.message, true));
-    $("#sbKind").addEventListener("change", refresh);
+    const refresh = () => fillComponentOptions($("#sbPart"), "supplier", $("#sbPartSearch").value).catch((error) => toast(error.message, true));
     $("#sbPartSearch").addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(refresh, 250); });
     refresh();
   }
@@ -1119,7 +1196,7 @@ function sourceRow(source = {}) {
   const suppliers = state.suppliers.map((s) => `<option value="${s.id}" ${s.id === source.sub_supplier_id ? "selected" : ""}>${esc(s.code)} · ${esc(s.name)}</option>`).join("");
   const alternate = source.alternate ? `<option value="${source.alternate.kind}:${source.alternate.id}" selected>${esc(source.alternate.code)} · ${esc(source.alternate.name)}</option>` : "";
   return `<tr data-sb-source><td><input class="form-control supplier-search" type="search" data-supplier-search="row" placeholder="Search" /><select class="form-control" data-src-supplier><option value="">(none)</option>${suppliers}</select></td>
-    <td><select class="form-control" data-src-kind><option value="supplier">Supplier list</option><option value="our" ${source.alternate?.kind === "our" ? "selected" : ""}>Our Material Master</option></select><input class="form-control" type="search" data-src-search placeholder="Alternate code (optional)" /><select class="form-control" data-src-alt><option value="">Same code</option>${alternate}</select></td>
+    <td><input class="form-control" type="search" data-src-search placeholder="Alternate code from supplier's master (optional)" /><select class="form-control" data-src-alt><option value="">Same code</option>${alternate}</select></td>
     <td><input class="form-control" type="number" min="0" step="0.0001" data-src-price value="${source.unit_price ?? 0}" /></td>
     <td><select class="form-control" data-src-currency>${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === (source.currency || state.sbView.currency) ? "selected" : ""}>${c}</option>`).join("")}</select></td>
     <td><input class="form-control" type="number" min="0.01" max="100" step="0.01" data-src-sob value="${source.sob_percent ?? 100}" /></td>
@@ -1128,7 +1205,7 @@ function sourceRow(source = {}) {
 
 function openSupplierBomSources(line) {
   $("#modalTitle").textContent = `Sources of ${line.component.code}: sub-suppliers / alternate codes`;
-  $("#modalBody").innerHTML = `<div class="sb-sources-editor"><p class="subtle">Unit price of this line = Σ (price × SOB) ÷ Σ SOB. SOB in total at most 100%. Sub-suppliers come from your Supplier register; an alternate code can come from the supplier's list or your Material Master.</p><div class="table-wrap"><table><thead><tr><th>Sub-supplier</th><th>Alternate code</th><th>Unit price</th><th>Currency</th><th>SOB %</th><th></th></tr></thead><tbody id="sbSourceRows">${(line.sources.length ? line.sources : [{}]).map(sourceRow).join("")}</tbody></table></div>
+  $("#modalBody").innerHTML = `<div class="sb-sources-editor"><p class="subtle">Unit price of this line = Σ (price × SOB) ÷ Σ SOB. SOB in total at most 100%. Sub-suppliers come from your Supplier register; an alternate code comes from the supplier's material master.</p><div class="table-wrap"><table><thead><tr><th>Sub-supplier</th><th>Alternate code</th><th>Unit price</th><th>Currency</th><th>SOB %</th><th></th></tr></thead><tbody id="sbSourceRows">${(line.sources.length ? line.sources : [{}]).map(sourceRow).join("")}</tbody></table></div>
     <div class="new-bom-actions"><button type="button" class="button button-small" id="sbAddSource">+ Add source</button><button type="button" class="button button-small button-primary" id="sbSaveSources">Save sources</button></div></div>`;
   modalLayer.hidden = false;
   const body = $("#sbSourceRows");
@@ -1137,9 +1214,8 @@ function openSupplierBomSources(line) {
     body.querySelectorAll("[data-src-search]:not([data-wired])").forEach((input) => {
       input.dataset.wired = "true";
       const row = input.closest("tr");
-      const refresh = () => fillComponentOptions(row.querySelector("[data-src-alt]"), row.querySelector("[data-src-kind]").value, input.value, true).catch((error) => toast(error.message, true));
+      const refresh = () => fillComponentOptions(row.querySelector("[data-src-alt]"), "supplier", input.value, true).catch((error) => toast(error.message, true));
       input.addEventListener("input", () => { clearTimeout(row.timer); row.timer = setTimeout(refresh, 250); });
-      row.querySelector("[data-src-kind]").addEventListener("change", refresh);
     });
   };
   wire();
@@ -1228,13 +1304,17 @@ async function renderSupplierControl() {
     body = `<section class="panel table-panel">${panelHeader("Supplier materials", "Each supplier's own material codes (e.g. solder wire, paste, connector). They are used only in that supplier's BOMs for cost breakdown.")}
       <div class="table-toolbar"><div class="toolbar-group">${supplierChooser("smSupplier", "Supplier")}<label class="search-field"><input class="form-control" id="smSearch" type="search" placeholder="Search code or name" /></label></div></div>
       <form id="smAddForm" class="panel-body form-grid supplier-inline-form">
-        ${field("Code", "code", "text", { required: true, maxlength: 48 })}${field("Name", "name", "text", { required: true, maxlength: 180 })}
-        ${unitField("Unit", "uom", "ea")}${field("Unit price", "unit_price", "number", { min: 0, step: "0.0001", value: 0 })}
+        <label class="field"><span>Code from</span><select class="form-control" id="smFrom"><option value="T1">T1 Material Master</option><option value="T2">T2 Material Master</option><option value="T3">T3 Material Master</option><option value="Own">Supplier's own code</option></select></label>
+        <label class="field sm-pick"><span>Search code / name</span><input class="form-control" id="smPickSearch" type="search" placeholder="Type to search" /></label>
+        <label class="field sm-pick"><span>Code · name (from your master)</span><select class="form-control" id="smPick"></select></label>
+        <span class="sm-own" hidden>${field("Supplier's code", "code", "text", { maxlength: 48 })}</span><span class="sm-own" hidden>${field("Name", "name", "text", { maxlength: 180 })}</span><span class="sm-own" hidden>${unitField("Unit", "uom", "ea")}</span>
+        ${field("Supplier's unit price", "unit_price", "number", { min: 0, step: "0.0001", value: 0 })}
         <label class="field"><span>Currency</span><select class="form-control" name="currency"><option>INR</option><option>USD</option><option>EUR</option><option>GBP</option><option>JPY</option></select></label>
-        <button class="button button-primary" type="submit">Add material</button>
+        ${field("Supplier's lead time (days)", "lead_time_days", "number", { min: 0, value: 0 })}${field("Supplier's buffer stock (days)", "buffer_days", "number", { min: 0, value: 0 })}
+        <button class="button button-primary" type="submit">Add to supplier's master</button>
       </form>
       <form id="smUploadForm" class="panel-body inline-upload">
-        <label class="field"><span>Upload this supplier's material list (Code, Name, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
+        <label class="field"><span>Upload this supplier's material master (Code, Name, Unit, Unit price / Unit cost, Currency, Lead time, Buffer days; your own headings are fine). Codes in your T1/T2/T3 are linked automatically; other codes are the supplier's own (name needed).</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
         <button class="button" type="submit">Upload list</button>
       </form>
       <div id="smTable"></div>
@@ -1925,8 +2005,20 @@ document.addEventListener("click", async (event) => {
   }
   if (event.target.closest("[data-execute-master-search]")) {
     if (state.bomTab === "Material Master") return loadMaterialMasterPage(0);  // server search over all codes
+    if (TIER_TABS[state.bomTab]) return loadTierMaterialPage(0);
     return applyTableSearch({ target: $("#masterSearch") });
   }
+  if (event.target.closest('[data-action="new-tier-material"]')) return openTierMaterial();
+  const tierEdit = event.target.closest("[data-tier-edit]");
+  if (tierEdit) return openTierMaterial((state.tierItems || []).find((m) => String(m.id) === tierEdit.dataset.tierEdit));
+  const tierDelete = event.target.closest("[data-tier-delete]");
+  if (tierDelete) {
+    if (!window.confirm("Delete this code?")) return;
+    try { await api(`/api/planning/tier-materials/${tierDelete.dataset.tierDelete}`, { method: "DELETE" }); toast("Code deleted"); return loadTierMaterialPage(0); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const tierPage = event.target.closest("[data-tier-page]");
+  if (tierPage) return loadTierMaterialPage(Number(tierPage.dataset.tierPage));
   const materialPage = event.target.closest("[data-material-page]");
   if (materialPage) return loadMaterialMasterPage(Number(materialPage.dataset.materialPage));
   const l1Page = event.target.closest("[data-l1-page]");

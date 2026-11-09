@@ -36,9 +36,15 @@ If port 8000 is already occupied when using `start_app.bat`, the launcher starts
 
 Planning workbooks can be downloaded from the relevant page. API documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
+## T1 / T2 / T3 Material Masters
+
+- **T1 Material Master** (Product Master tab): codes your company uses directly or indirectly and buys from T1 suppliers. Only T1 codes are used in your BOMs, supplier relationships and planning.
+- **T2 / T3 Material Master** tabs: codes used further down the supply chain (by your suppliers' suppliers): code, name, category, unit, reference price. Form, edit/delete, search, Excel upload/download.
+- A code can be in only one of T1, T2 or T3 (checked on every save and upload, case-insensitive).
+
 ## Supplier materials and supplier BOM (cost breakdown)
 
-- **Supplier materials** tab: each supplier's own material codes (code, name, unit, price), by form or Excel upload (your own headings are fine).
+- **Supplier materials** tab: each supplier's material master. An entry is either picked from your T1, T2 or T3 Material Master (code and name follow your master) or the supplier's own code. Each entry carries the supplier's own price (may differ from yours), lead time and buffer stock. Excel upload links codes found in T1/T2/T3 automatically; other codes become the supplier's own. Supplier BOM lines and alternate codes use only codes from that supplier's material master.
 - **Supplier BOM** tab: for a part you buy from a supplier, the supplier's BOM down to L3. Lines use your Material Master codes or that supplier's own codes. Line cost = quantity × unit price; a line with lines below costs their sum. A line's unit price is the SOB-weighted price of its sources (sub-suppliers from the Supplier register, optionally under an alternate code), else the price entered on the line, else the material list price. The top shows should-cost, the supplier's quoted price and the gap. Lines priced in another currency are listed and not added. Excel upload (Parent code, Code, Quantity, Unit price, Source) and Excel/PDF download. Cost view only; planning is not affected.
 
 ## Scale

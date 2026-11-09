@@ -256,6 +256,21 @@ class PlanningPO(Base):
     change_note: Mapped[str] = mapped_column(Text, default="")
 
 
+class TierMaterial(Base):
+    """T2 / T3 Material Master: codes used further down the supply chain (by your
+    suppliers' suppliers). Not planned by you; picked into supplier material masters."""
+    __tablename__ = "tier_materials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tier: Mapped[str] = mapped_column(String(2), index=True)  # "T2" or "T3"
+    code: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    category: Mapped[str] = mapped_column(String(80), default="Raw material")
+    uom: Mapped[str] = mapped_column(String(24), default="ea")
+    unit_price: Mapped[float] = mapped_column(Float, default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="INR")
+
+
 class SupplierMaterial(Base):
     """A supplier's own material code (e.g. Iljin's solder wire), used only in that
     supplier's BOMs for cost breakdown."""
@@ -269,6 +284,13 @@ class SupplierMaterial(Base):
     uom: Mapped[str] = mapped_column(String(24), default="ea")
     unit_price: Mapped[float] = mapped_column(Float, default=0)
     currency: Mapped[str] = mapped_column(String(3), default="INR")
+    # Picked from your T1 Material Master (item_id) or T2/T3 Material Master (tier_material_id);
+    # both empty = the supplier's own code. Code and name follow the picked master entry.
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id"), nullable=True, index=True)
+    tier_material_id: Mapped[int | None] = mapped_column(ForeignKey("tier_materials.id"), nullable=True, index=True)
+    # The supplier's own terms for this code (may differ from yours, e.g. your discounted steel rate)
+    lead_time_days: Mapped[int] = mapped_column(Integer, default=0)
+    buffer_days: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SupplierBOMLine(Base):
@@ -364,10 +386,24 @@ class ModelBOMInput(BaseModel):
     uom: str = Field(default="ea", min_length=1, max_length=24)
 
 
-class SupplierMaterialInput(BaseModel):
-    supplier_id: int
+class TierMaterialInput(BaseModel):
+    tier: str = Field(pattern=r"^T[23]$")
     code: str = Field(min_length=1, max_length=48)
     name: str = Field(min_length=1, max_length=180)
+    category: str = Field(default="Raw material", min_length=1, max_length=80)
+    uom: str = Field(default="ea", min_length=1, max_length=24)
+    unit_price: float = Field(default=0, ge=0, allow_inf_nan=False)
+    currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
+
+
+class SupplierMaterialInput(BaseModel):
+    supplier_id: int
+    item_id: int | None = None
+    tier_material_id: int | None = None
+    code: str = Field(default="", max_length=48)
+    name: str = Field(default="", max_length=180)
+    lead_time_days: int = Field(default=0, ge=0, le=5000)
+    buffer_days: int = Field(default=0, ge=0, le=5000)
     uom: str = Field(default="ea", min_length=1, max_length=24)
     unit_price: float = Field(default=0, ge=0, allow_inf_nan=False)
     currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
@@ -546,6 +582,8 @@ SUPPLIER_MATERIAL_COLUMN_ALIASES = {
     "code": "code", "material_code": "code", "part_code": "code", "item_code": "code",
     "name": "name", "material_name": "name", "part_name": "name", "description": "name",
     "unit": "uom", "uom": "uom", "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price", "currency": "currency",
+    "lead_time_days": "lead_time_days", "lead_time": "lead_time_days", "lead_time_(days)": "lead_time_days",
+    "buffer_days": "buffer_days", "buffer": "buffer_days", "buffer_stock_days": "buffer_days",
 }
 SUPPLIER_BOM_COLUMN_ALIASES = {
     "parent_code": "parent_code", "parent": "parent_code", "parent_part_code": "parent_code",
@@ -553,6 +591,29 @@ SUPPLIER_BOM_COLUMN_ALIASES = {
     "quantity": "quantity", "qty": "quantity", "quantity_per_parent": "quantity",
     "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price", "source": "source",
 }
+
+
+TIER_MATERIAL_COLUMN_ALIASES = {
+    "code": "code", "material_code": "code", "part_code": "code", "item_code": "code",
+    "name": "name", "material_name": "name", "part_name": "name", "description": "name", "category": "category",
+    "unit": "uom", "uom": "uom", "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price",
+    "reference_price": "unit_price", "currency": "currency",
+}
+
+
+def _price_cells(row: dict, row_number: int, can_price: bool) -> tuple[float, str]:
+    try:
+        price = float(row.get("unit_price") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Row {row_number}: unit price must be a number") from exc
+    if price < 0 or not math.isfinite(price):
+        raise HTTPException(status_code=422, detail=f"Row {row_number}: unit price must be zero or more")
+    if price and not can_price:
+        raise HTTPException(status_code=403, detail="Price access is required to upload prices")
+    currency = str(row.get("currency") or "INR").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise HTTPException(status_code=422, detail=f"Row {row_number}: currency must be a 3-letter code such as INR")
+    return price, currency
 
 
 def _read_flexible_sheet(raw: bytes, aliases: dict[str, str], required: set[str]) -> list[dict[str, Any]]:
@@ -1174,6 +1235,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if product and product.code != MODEL_CATALOG_PRODUCT_CODE and link not in existing_links:
                 db.add(ProductModelProduct(product_id=link[0], model_id=link[1]))
         db.commit()
+        # supplier_materials gained item_id / tier_material_id (T1/T2/T3 links); add them to
+        # databases created before this version. Existing rows stay the supplier's own codes.
+        from sqlalchemy import inspect as sa_inspect, text as sa_text
+        present = {column["name"] for column in sa_inspect(db.get_bind()).get_columns("supplier_materials")}
+        for column, definition in (("item_id", "INTEGER"), ("tier_material_id", "INTEGER"),
+                                   ("lead_time_days", "INTEGER NOT NULL DEFAULT 0"), ("buffer_days", "INTEGER NOT NULL DEFAULT 0")):
+            if column not in present:
+                db.execute(sa_text(f"ALTER TABLE supplier_materials ADD COLUMN {column} {definition}"))
+        db.commit()
 
     @app.middleware("http")
     async def require_session_and_hide_prices(request: Request, call_next):
@@ -1549,6 +1619,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             code = payload.code.strip()
             if db.scalar(select(Item.id).where(func.lower(Item.code) == code.lower())):
                 raise HTTPException(status_code=409, detail="Material code already exists")
+            owner = code_owner(db, code)
+            if owner:
+                raise HTTPException(status_code=409, detail=f"{code} already exists in {owner} Material Master")
             item = Item(
                 code=code, name=payload.name.strip(), category=payload.category.strip(),
                 uom=payload.uom.strip(), stock_on_hand=payload.stock_on_hand,
@@ -1580,10 +1653,13 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             code = payload.code.strip()
             if db.scalar(select(Item.id).where(func.lower(Item.code) == code.lower(), Item.id != material_id)):
                 raise HTTPException(status_code=409, detail="Material code already exists")
+            if db.scalar(select(TierMaterial.tier).where(func.lower(TierMaterial.code) == code.lower()).limit(1)):
+                raise HTTPException(status_code=409, detail=f"{code} already exists in {code_owner(db, code)} Material Master")
             item.code, item.name, item.category, item.uom = code, payload.name.strip(), payload.category.strip(), payload.uom.strip()
             item.stock_on_hand, item.buffer_days = payload.stock_on_hand, payload.buffer_days
             if _check_price_access(request):
                 item.unit_cost, item.currency = payload.unit_cost, payload.currency
+            sync_linked_supplier_materials(db, item=item)
             db.commit()
             response_data = {"id": item.id, "code": item.code, "name": item.name, "category": item.category, "uom": item.uom, "stock_on_hand": item.stock_on_hand, "buffer_days": item.buffer_days}
             if _check_price_access(request):
@@ -1606,9 +1682,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 or db.scalar(select(OwnStockSnapshot.id).where(OwnStockSnapshot.material_id == material_id))
                 or db.scalar(select(MaterialTransfer.id).where(MaterialTransfer.material_id == material_id))
                 or db.scalar(select(MaterialRequest.id).where(MaterialRequest.item_id == material_id))
+                or db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.item_id == material_id).limit(1))
+                or db.scalar(select(SupplierBOMLine.id).where(or_(SupplierBOMLine.item_id == material_id, SupplierBOMLine.product_material_id == material_id)).limit(1))
             )
             if referenced:
-                raise HTTPException(status_code=409, detail="This material is used by a BOM, supplier, stock snapshot or transfer; remove those references first")
+                raise HTTPException(status_code=409, detail="This material is used by a BOM, supplier, supplier material master, stock snapshot or transfer; remove those references first")
             db.delete(item)
             db.commit()
             return Response(status_code=204)
@@ -1721,6 +1799,20 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.delete(entry)
             db.commit()
             return Response(status_code=204)
+
+    def code_owner(db: Session, code: str) -> str | None:
+        """Which master already holds this code (case-insensitive): 'T1', 'T2', 'T3' or None."""
+        if db.scalar(select(Item.id).where(func.lower(Item.code) == code.lower()).limit(1)):
+            return "T1"
+        tier = db.scalar(select(TierMaterial.tier).where(func.lower(TierMaterial.code) == code.lower()).limit(1))
+        return tier
+
+    def sync_linked_supplier_materials(db: Session, *, item: Item | None = None, tier_material: TierMaterial | None = None) -> None:
+        """Supplier material entries picked from a master follow its code / name / unit."""
+        source = item or tier_material
+        column = SupplierMaterial.item_id if item else SupplierMaterial.tier_material_id
+        for entry in db.scalars(select(SupplierMaterial).where(column == source.id)).all():
+            entry.code, entry.name, entry.uom = source.code, source.name, source.uom
 
     def not_purchased_reason(db: Session, material_id: int) -> str | None:
         """Parts you do not buy: made in-house (own BOM in Product Master) or generated in
@@ -2262,11 +2354,162 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return {"rows": len(rows), "added": added, "updated": updated, "suppliers_created": created}
 
     # ------------------------------------------------------------------ supplier materials
-    def supplier_material_json(material: SupplierMaterial, can_price: bool) -> dict:
-        data = {"id": material.id, "supplier_id": material.supplier_id, "code": material.code, "name": material.name, "uom": material.uom}
+    # ------------------------------------------------------------------ T2 / T3 Material Master
+    def tier_material_json(material: TierMaterial, can_price: bool) -> dict:
+        data = {"id": material.id, "tier": material.tier, "code": material.code, "name": material.name, "category": material.category, "uom": material.uom}
         if can_price:
             data.update(unit_price=material.unit_price, currency=material.currency)
         return data
+
+    @app.get("/api/planning/tier-materials")
+    def list_tier_materials(request: Request, tier: str, search: str = "", offset: int = 0, limit: int = 100):
+        current_user(request)
+        if tier not in {"T2", "T3"}:
+            raise HTTPException(status_code=422, detail="tier must be T2 or T3")
+        if limit < 1 or limit > 1000 or offset < 0:
+            raise HTTPException(status_code=422, detail="Use limit 1–1000 and a non-negative offset")
+        with open_db() as db:
+            statement = select(TierMaterial).where(TierMaterial.tier == tier).order_by(TierMaterial.code)
+            if search.strip():
+                like = f"%{search.strip()}%"
+                statement = statement.where(TierMaterial.code.ilike(like) | TierMaterial.name.ilike(like))
+            total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+            can_price = _check_price_access(request)
+            return {"total": total, "offset": offset, "limit": limit,
+                    "items": [tier_material_json(m, can_price) for m in db.scalars(statement.offset(offset).limit(limit)).all()]}
+
+    def check_tier_material(db: Session, payload: TierMaterialInput, request: Request, current: TierMaterial | None = None) -> str:
+        _check_supply_role(request)
+        if payload.unit_price and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a price")
+        code = payload.code.strip()
+        if not code:
+            raise HTTPException(status_code=422, detail="Code is required")
+        if not (current and current.code.lower() == code.lower()):
+            owner = code_owner(db, code)
+            if owner:
+                raise HTTPException(status_code=409, detail=f"{code} already exists in {owner} Material Master")
+        return code
+
+    @app.post("/api/planning/tier-materials", status_code=201)
+    def add_tier_material(payload: TierMaterialInput, request: Request):
+        current_user(request)
+        with open_db() as db:
+            code = check_tier_material(db, payload, request)
+            material = TierMaterial(tier=payload.tier, code=code, name=payload.name.strip(), category=payload.category.strip(), uom=payload.uom.strip(),
+                                    unit_price=payload.unit_price, currency=payload.currency)
+            db.add(material)
+            db.commit()
+            return tier_material_json(material, True)
+
+    @app.patch("/api/planning/tier-materials/{material_id}")
+    def update_tier_material(material_id: int, payload: TierMaterialInput, request: Request):
+        current_user(request)
+        with open_db() as db:
+            material = db.get(TierMaterial, material_id)
+            if not material or material.tier != payload.tier:
+                raise HTTPException(status_code=404, detail=f"{payload.tier} material not found")
+            material.code = check_tier_material(db, payload, request, material)
+            material.name, material.category, material.uom = payload.name.strip(), payload.category.strip(), payload.uom.strip()
+            if _check_price_access(request):
+                material.unit_price, material.currency = payload.unit_price, payload.currency
+            sync_linked_supplier_materials(db, tier_material=material)
+            db.commit()
+            return tier_material_json(material, True)
+
+    @app.delete("/api/planning/tier-materials/{material_id}", status_code=204)
+    def delete_tier_material(material_id: int, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            material = db.get(TierMaterial, material_id)
+            if not material:
+                raise HTTPException(status_code=404, detail="Material not found")
+            if db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.tier_material_id == material_id).limit(1)):
+                raise HTTPException(status_code=409, detail=f"{material.code} is used in a supplier's material master; remove it there first")
+            db.delete(material)
+            db.commit()
+            return Response(status_code=204)
+
+    @app.post("/api/planning/tier-materials/upload", status_code=201)
+    async def upload_tier_materials(request: Request, tier: str):
+        """T2 / T3 Material Master from Excel (heading row found automatically): Code, Name,
+        Category, Unit, Unit price / Unit cost, Currency. Existing codes in this master are updated;
+        a code already in another master is refused. All rows or none."""
+        current_user(request)
+        _check_supply_role(request)
+        if tier not in {"T2", "T3"}:
+            raise HTTPException(status_code=422, detail="tier must be T2 or T3")
+        rows = _read_flexible_sheet(await request.body(), TIER_MATERIAL_COLUMN_ALIASES, {"code", "name"})
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            mine = {m.code.lower(): m for m in db.scalars(select(TierMaterial).where(TierMaterial.tier == tier)).all()}
+            seen: set[str] = set()
+            added = updated = 0
+            for row in rows:
+                row_number = row["_excel_row"]
+                code, name = str(row.get("code") or "").strip(), str(row.get("name") or "").strip()
+                if not code or not name:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: code and name are required")
+                if code.lower() in seen:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is repeated in the file")
+                seen.add(code.lower())
+                price, currency = _price_cells(row, row_number, can_price)
+                uom = str(row.get("uom") or "ea").strip() or "ea"
+                category = str(row.get("category") or "Raw material").strip() or "Raw material"
+                material = mine.get(code.lower())
+                if material:
+                    material.name, material.category, material.uom = name, category, uom
+                    if can_price:
+                        material.unit_price, material.currency = price, currency
+                    sync_linked_supplier_materials(db, tier_material=material)
+                    updated += 1
+                else:
+                    owner = code_owner(db, code)
+                    if owner:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} already exists in {owner} Material Master")
+                    db.add(TierMaterial(tier=tier, code=code, name=name, category=category, uom=uom, unit_price=price, currency=currency))
+                    db.flush()
+                    added += 1
+            db.commit()
+            return {"rows": len(rows), "added": added, "updated": updated}
+
+    @app.get("/api/planning/tier-materials/{tier}.{file_format}")
+    def export_tier_materials(tier: str, file_format: str, request: Request):
+        current_user(request)
+        if tier not in {"T2", "T3"} or file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            rows = db.scalars(select(TierMaterial).where(TierMaterial.tier == tier).order_by(TierMaterial.code)).all()
+            headers = ["Code", "Name", "Category", "Unit"] + (["Reference price", "Currency"] if can_price else [])
+            values = [[m.code, m.name, m.category, m.uom] + ([m.unit_price, m.currency] if can_price else []) for m in rows]
+        title = f"{tier} Material Master"
+        output = _generic_workbook(title, headers, values) if file_format == "xlsx" else _generic_pdf(title, headers, values)
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if file_format == "xlsx" else "application/pdf"
+        return StreamingResponse(output, media_type=media, headers={"Content-Disposition": f'attachment; filename="{tier.lower()}-material-master.{file_format}"'})
+
+    # ------------------------------------------------------------------ supplier materials
+    def supplier_material_json(material: SupplierMaterial, can_price: bool) -> dict:
+        source = "T1" if material.item_id else ("T2/T3" if material.tier_material_id else "Own")  # T2 vs T3 filled in by supplier_material_rows
+        data = {"id": material.id, "supplier_id": material.supplier_id, "code": material.code, "name": material.name, "uom": material.uom,
+                "item_id": material.item_id, "tier_material_id": material.tier_material_id, "source": source,
+                "lead_time_days": material.lead_time_days or 0, "buffer_days": material.buffer_days or 0}
+        if can_price:
+            data.update(unit_price=material.unit_price, currency=material.currency)
+        return data
+
+    def supplier_material_rows(db: Session, materials: list[SupplierMaterial], can_price: bool) -> list[dict]:
+        tiers = dict(db.execute(select(TierMaterial.id, TierMaterial.tier).where(
+            TierMaterial.id.in_([m.tier_material_id for m in materials if m.tier_material_id])
+        )).all()) if any(m.tier_material_id for m in materials) else {}
+        rows = []
+        for material in materials:
+            row = supplier_material_json(material, can_price)
+            if material.tier_material_id:
+                row["source"] = tiers.get(material.tier_material_id, "T2/T3")
+            rows.append(row)
+        return rows
 
     @app.get("/api/planning/supplier-materials")
     def list_supplier_materials(request: Request, supplier_id: int, search: str = "", offset: int = 0, limit: int = 100):
@@ -2279,48 +2522,90 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 like = f"%{search.strip()}%"
                 statement = statement.where(SupplierMaterial.code.ilike(like) | SupplierMaterial.name.ilike(like))
             total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
-            can_price = _check_price_access(request)
             return {"total": total, "offset": offset, "limit": limit,
-                    "items": [supplier_material_json(m, can_price) for m in db.scalars(statement.offset(offset).limit(limit)).all()]}
+                    "items": supplier_material_rows(db, db.scalars(statement.offset(offset).limit(limit)).all(), _check_price_access(request))}
 
-    def check_supplier_material(db: Session, payload: SupplierMaterialInput, request: Request, current_id: int | None = None) -> str:
+    @app.get("/api/planning/master-codes")
+    def search_master_codes(request: Request, tier: str, search: str = "", limit: int = 100):
+        """Codes a supplier can pick into its material master: T1 (your Material Master), T2 or T3."""
+        current_user(request)
+        if tier not in {"T1", "T2", "T3"} or limit < 1 or limit > 500:
+            raise HTTPException(status_code=422, detail="tier must be T1, T2 or T3")
+        with open_db() as db:
+            model = Item if tier == "T1" else TierMaterial
+            statement = select(model).order_by(model.code)
+            if tier != "T1":
+                statement = statement.where(TierMaterial.tier == tier)
+            if search.strip():
+                like = f"%{search.strip()}%"
+                statement = statement.where(model.code.ilike(like) | model.name.ilike(like))
+            return {"items": [{"id": m.id, "tier": tier, "code": m.code, "name": m.name, "uom": m.uom} for m in db.scalars(statement.limit(limit)).all()]}
+
+    def resolve_supplier_material(db: Session, payload: SupplierMaterialInput, request: Request, current_id: int | None = None) -> tuple[str, str, str]:
+        """(code, name, unit) for a supplier material entry: from the picked T1/T2/T3 code,
+        or the supplier's own code (which must not be one of your master codes)."""
         if not db.get(Supplier, payload.supplier_id):
             raise HTTPException(status_code=404, detail="Supplier not found")
         if payload.unit_price and not _check_price_access(request):
             raise HTTPException(status_code=403, detail="Price access is required to set a price")
-        code = payload.code.strip()
+        if payload.item_id and payload.tier_material_id:
+            raise HTTPException(status_code=422, detail="Pick one code: from T1, or from T2/T3")
+        if payload.item_id:
+            master = db.get(Item, payload.item_id)
+            if not master:
+                raise HTTPException(status_code=422, detail="Code is not in T1 Material Master")
+            code, name, uom = master.code, master.name, master.uom
+        elif payload.tier_material_id:
+            master = db.get(TierMaterial, payload.tier_material_id)
+            if not master:
+                raise HTTPException(status_code=422, detail="Code is not in T2/T3 Material Master")
+            code, name, uom = master.code, master.name, master.uom
+        else:
+            code, name, uom = payload.code.strip(), payload.name.strip(), payload.uom.strip() or "ea"
+            if not code or not name:
+                raise HTTPException(status_code=422, detail="The supplier's own code needs a code and a name")
+            owner = code_owner(db, code)
+            if owner:
+                raise HTTPException(status_code=422, detail=f"{code} is in your {owner} Material Master; pick it from {owner} instead of typing it as the supplier's own code")
         clash = db.scalar(select(SupplierMaterial.id).where(
             SupplierMaterial.supplier_id == payload.supplier_id, func.lower(SupplierMaterial.code) == code.lower()))
         if clash and clash != current_id:
-            raise HTTPException(status_code=409, detail=f"{code} already exists in this supplier's material list")
-        return code
+            raise HTTPException(status_code=409, detail=f"{code} already exists in this supplier's material master")
+        return code, name, uom
 
     @app.post("/api/planning/supplier-materials", status_code=201)
     def add_supplier_material(payload: SupplierMaterialInput, request: Request):
         current_user(request)
         _check_supply_role(request)
         with open_db() as db:
-            code = check_supplier_material(db, payload, request)
-            material = SupplierMaterial(supplier_id=payload.supplier_id, code=code, name=payload.name.strip(), uom=payload.uom.strip(),
-                                        unit_price=payload.unit_price, currency=payload.currency)
+            code, name, uom = resolve_supplier_material(db, payload, request)
+            material = SupplierMaterial(supplier_id=payload.supplier_id, code=code, name=name, uom=uom, unit_price=payload.unit_price,
+                                        currency=payload.currency, item_id=payload.item_id, tier_material_id=payload.tier_material_id,
+                                        lead_time_days=payload.lead_time_days, buffer_days=payload.buffer_days)
             db.add(material)
             db.commit()
-            return supplier_material_json(material, True)
+            return supplier_material_rows(db, [material], True)[0]
 
     @app.patch("/api/planning/supplier-materials/{material_id}")
     def update_supplier_material(material_id: int, payload: SupplierMaterialInput, request: Request):
+        """Picked entries: only price / currency change (code and name follow your master).
+        The supplier's own code: code, name, unit, price, currency."""
         current_user(request)
         _check_supply_role(request)
         with open_db() as db:
             material = db.get(SupplierMaterial, material_id)
             if not material or material.supplier_id != payload.supplier_id:
                 raise HTTPException(status_code=404, detail="Supplier material not found")
-            material.code = check_supplier_material(db, payload, request, material.id)
-            material.name, material.uom = payload.name.strip(), payload.uom.strip()
+            if not (material.item_id or material.tier_material_id):
+                payload.item_id = payload.tier_material_id = None
+                material.code, material.name, material.uom = resolve_supplier_material(db, payload, request, material.id)
+            elif payload.unit_price and not _check_price_access(request):
+                raise HTTPException(status_code=403, detail="Price access is required to set a price")
+            material.lead_time_days, material.buffer_days = payload.lead_time_days, payload.buffer_days
             if _check_price_access(request):
                 material.unit_price, material.currency = payload.unit_price, payload.currency
             db.commit()
-            return supplier_material_json(material, True)
+            return supplier_material_rows(db, [material], True)[0]
 
     @app.delete("/api/planning/supplier-materials/{material_id}", status_code=204)
     def delete_supplier_material(material_id: int, request: Request):
@@ -2340,50 +2625,69 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     @app.post("/api/planning/supplier-materials/upload", status_code=201)
     async def upload_supplier_materials(request: Request, supplier_id: int):
-        """A supplier's own material list from Excel (heading row found automatically):
-        Code, Name, Unit, Unit price / Unit cost, Currency. Existing codes are updated."""
+        """A supplier's material master from Excel (heading row found automatically): Code, Name,
+        Unit, Unit price / Unit cost, Currency. A code found in your T1/T2/T3 Material Master is
+        linked to it (its name and unit come from there); any other code is the supplier's own
+        code and needs a name. Existing entries are updated. All rows or none."""
         current_user(request)
         _check_supply_role(request)
-        rows = _read_flexible_sheet(await request.body(), SUPPLIER_MATERIAL_COLUMN_ALIASES, {"code", "name"})
+        rows = _read_flexible_sheet(await request.body(), SUPPLIER_MATERIAL_COLUMN_ALIASES, {"code"})
         can_price = _check_price_access(request)
         with open_db() as db:
             if not db.get(Supplier, supplier_id):
                 raise HTTPException(status_code=404, detail="Supplier not found")
             existing = {m.code.lower(): m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id)).all()}
+            t1 = {i.code.lower(): i for i in db.scalars(select(Item)).all()}
+            t23 = {m.code.lower(): m for m in db.scalars(select(TierMaterial)).all()}
             seen: set[str] = set()
-            added = updated = 0
+            added = updated = linked = 0
             for row in rows:
-                number_text = row["_excel_row"]
+                row_number = row["_excel_row"]
                 code = str(row.get("code") or "").strip()
-                name = str(row.get("name") or "").strip()
-                if not code or not name:
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: code and name are required")
+                if not code:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: code is required")
                 if code.lower() in seen:
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: {code} is repeated in the file")
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is repeated in the file")
                 seen.add(code.lower())
-                try:
-                    price = float(row.get("unit_price") or 0)
-                except (TypeError, ValueError) as exc:
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be a number") from exc
-                if price < 0 or not math.isfinite(price):
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be zero or more")
-                if price and not can_price:
-                    raise HTTPException(status_code=403, detail="Price access is required to upload prices")
-                currency = str(row.get("currency") or "INR").strip().upper()
-                if not re.fullmatch(r"[A-Z]{3}", currency):
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: currency must be a 3-letter code such as INR")
-                uom = str(row.get("uom") or "ea").strip() or "ea"
+                price, currency = _price_cells(row, row_number, can_price)
+                item, tier_material = t1.get(code.lower()), t23.get(code.lower())
+                if item or tier_material:
+                    master = item or tier_material
+                    code, name, uom = master.code, master.name, master.uom
+                    linked += 1
+                else:
+                    name = str(row.get("name") or "").strip()
+                    if not name:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is not in your T1/T2/T3 Material Master, so as the supplier's own code it needs a name")
+                    uom = str(row.get("uom") or "ea").strip() or "ea"
+                terms = {}
+                for key in ("lead_time_days", "buffer_days"):
+                    value = row.get(key)
+                    if value is not None and str(value).strip() != "":
+                        try:
+                            terms[key] = int(float(value))
+                        except (TypeError, ValueError) as exc:
+                            raise HTTPException(status_code=422, detail=f"Row {row_number}: {key.replace('_', ' ')} must be a number") from exc
+                        if terms[key] < 0:
+                            raise HTTPException(status_code=422, detail=f"Row {row_number}: {key.replace('_', ' ')} must be zero or more")
                 material = existing.get(code.lower())
                 if material:
-                    material.name, material.uom = name, uom
+                    material.code, material.name, material.uom = code, name, uom
+                    material.item_id, material.tier_material_id = (item.id if item else None), (tier_material.id if tier_material else None)
+                    for key, value in terms.items():
+                        setattr(material, key, value)
                     if can_price:
                         material.unit_price, material.currency = price, currency
                     updated += 1
                 else:
-                    db.add(SupplierMaterial(supplier_id=supplier_id, code=code, name=name, uom=uom, unit_price=price, currency=currency))
+                    material = SupplierMaterial(supplier_id=supplier_id, code=code, name=name, uom=uom, unit_price=price, currency=currency,
+                                                item_id=item.id if item else None, tier_material_id=tier_material.id if tier_material else None,
+                                                lead_time_days=terms.get("lead_time_days", 0), buffer_days=terms.get("buffer_days", 0))
+                    db.add(material)
+                    existing[code.lower()] = material
                     added += 1
             db.commit()
-            return {"rows": len(rows), "added": added, "updated": updated}
+            return {"rows": len(rows), "added": added, "updated": updated, "linked": linked}
 
     # ------------------------------------------------------------------ supplier BOM (cost breakdown)
     def supplier_bom_view(db: Session, supplier_id: int, material_id: int, can_price: bool) -> dict:
@@ -2405,6 +2709,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         sub_ids = {src.sub_supplier_id for group in sources.values() for src in group if src.sub_supplier_id}
         items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(item_ids))).all()} if item_ids else {}
         owns = {m.id: m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.id.in_(own_ids))).all()} if own_ids else {}
+        tier_of = dict(db.execute(select(TierMaterial.id, TierMaterial.tier).where(
+            TierMaterial.id.in_([m.tier_material_id for m in owns.values() if m.tier_material_id])
+        )).all()) if any(m.tier_material_id for m in owns.values()) else {}
         subs = {sub.id: sub for sub in db.scalars(select(Supplier).where(Supplier.id.in_(sub_ids))).all()} if sub_ids else {}
         children: dict[int | None, list[SupplierBOMLine]] = {}
         for line in lines:
@@ -2414,9 +2721,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         def describe(item_id: int | None, own_id: int | None) -> dict:
             if item_id and item_id in items:
                 item = items[item_id]
-                return {"kind": "our", "id": item.id, "code": item.code, "name": item.name, "uom": item.uom, "price": item.unit_cost, "currency": item.currency}
+                return {"kind": "our", "origin": "T1", "id": item.id, "code": item.code, "name": item.name, "uom": item.uom, "price": item.unit_cost, "currency": item.currency}
             own = owns.get(own_id)
-            return {"kind": "supplier", "id": own.id if own else None, "code": own.code if own else "?", "name": own.name if own else "?",
+            origin = ("T1" if own.item_id else tier_of.get(own.tier_material_id, "T2/T3") if own.tier_material_id else "Own") if own else ""
+            return {"kind": "supplier", "origin": origin, "id": own.id if own else None, "code": own.code if own else "?", "name": own.name if own else "?",
                     "uom": own.uom if own else "", "price": own.unit_price if own else 0, "currency": own.currency if own else base_currency}
 
         rows: list[dict] = []
@@ -2425,7 +2733,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             """(unit cost, currency, price source, currency mismatch) of one unit of this line."""
             component = describe(line.item_id, line.supplier_material_id)
             row = {"id": line.id, "parent_line_id": line.parent_line_id, "depth": depth, "level": f"L{depth}",
-                   "component": {key: component[key] for key in ("kind", "id", "code", "name", "uom")}, "quantity": line.quantity,
+                   "component": {key: component[key] for key in ("kind", "origin", "id", "code", "name", "uom")}, "quantity": line.quantity,
                    "entered_price": line.unit_price, "entered_currency": line.currency,
                    "sources": [{"id": src.id, "sub_supplier_id": src.sub_supplier_id, "sub_supplier": subs[src.sub_supplier_id].name if src.sub_supplier_id in subs else "",
                                 "alternate": (lambda c: None if not (src.item_id or src.supplier_material_id) else {key: c[key] for key in ("kind", "id", "code", "name")})(describe(src.item_id, src.supplier_material_id)),
@@ -2500,10 +2808,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return supplier_bom_view(db, supplier_id, material_id, _check_price_access(request))
 
     def check_component(db: Session, supplier_id: int, item_id: int | None, own_id: int | None, label: str) -> None:
-        if bool(item_id) == bool(own_id):
-            raise HTTPException(status_code=422, detail=f"{label}: choose one part, from your Material Master or from the supplier's list")
-        if item_id and not db.get(Item, item_id):
-            raise HTTPException(status_code=422, detail=f"{label}: part is not in your Material Master")
+        # Supplier BOM codes come only from the supplier's material master (which holds the codes
+        # picked from your T1/T2/T3 masters plus the supplier's own codes).
+        if item_id:
+            raise HTTPException(status_code=422, detail=f"{label}: add the code to this supplier's material master first, then pick it from there")
+        if not own_id:
+            raise HTTPException(status_code=422, detail=f"{label}: choose a part from the supplier's material master")
         if own_id:
             own = db.get(SupplierMaterial, own_id)
             if not own or own.supplier_id != supplier_id:
@@ -2609,8 +2919,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     @app.post("/api/planning/supplier-bom/upload", status_code=201)
     async def upload_supplier_bom(request: Request, supplier_id: int, material_id: int):
         """Replace a supplier BOM from Excel: Parent code (blank = L1), Code, Quantity,
-        Unit price (optional), Source (optional: our / supplier). A code is looked up in the
-        supplier's own list first, then in your Material Master."""
+        Unit price (optional). Every code must be in this supplier's material master."""
         current_user(request)
         _check_supply_role(request)
         rows = _read_flexible_sheet(await request.body(), SUPPLIER_BOM_COLUMN_ALIASES, {"code", "quantity"})
@@ -2622,26 +2931,17 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if reason:
                 raise HTTPException(status_code=422, detail=f"{db.get(Item, material_id).code} {reason}; supplier BOMs are only for parts you buy")
             own = {m.code.lower(): m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id)).all()}
-            ours = {item.code.lower(): item for item in db.scalars(select(Item)).all()}
             parsed: list[dict] = []
             by_code: dict[str, list[int]] = {}
             for row in rows:
                 number_text = row["_excel_row"]
                 code = str(row.get("code") or "").strip()
                 parent_code = str(row.get("parent_code") or "").strip()
-                source = str(row.get("source") or "").strip().lower()
                 if not code:
                     raise HTTPException(status_code=422, detail=f"Row {number_text}: code is required")
-                if source in {"supplier", "supplier material", "their"}:
-                    target = ("supplier", own.get(code.lower()))
-                elif source in {"our", "ours", "material master", "oem"}:
-                    target = ("our", ours.get(code.lower()))
-                elif source:
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: source must be 'our' or 'supplier'")
-                else:
-                    target = ("supplier", own[code.lower()]) if code.lower() in own else ("our", ours.get(code.lower()))
+                target = ("supplier", own.get(code.lower()))
                 if target[1] is None:
-                    raise HTTPException(status_code=422, detail=f"Row {number_text}: {code} is not in the supplier's material list or your Material Master")
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: {code} is not in this supplier's material master; add it there first (pick it from T1/T2/T3 or as the supplier's own code)")
                 try:
                     quantity = float(row.get("quantity"))
                 except (TypeError, ValueError) as exc:
@@ -2709,7 +3009,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             parent_path = path.get(line["parent_line_id"], [])
             mine = parent_path + [line["component"]["code"], line["component"]["name"]]
             path[line["id"]] = mine
-            values = [line["level"], *(mine + [""] * 6)[:6], "Supplier list" if line["component"]["kind"] == "supplier" else "Our Material Master",
+            values = [line["level"], *(mine + [""] * 6)[:6], {"Own": "Supplier's own code"}.get(line["component"]["origin"], f"{line['component']['origin']} Material Master"),
                       line["quantity"], line["component"]["uom"]]
             if can_price:
                 values += [line["unit_price"], line["currency"], line["line_cost"], line["price_source"]]

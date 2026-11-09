@@ -25,7 +25,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const mat = async (code, name, uom, cost = 0) => (await api("POST", "/api/planning/materials", { code, name, uom, unit_cost: cost, currency: "INR", category: "Electrical" })).id;
   const pcb = await mat("FL001PCB1", "PCB1", "PCS");
   const chip = await mat("FL001MICROCHIP", "MicroChip", "PCS", 500);
-  await mat("FL001MICROCHIPNEO", "MicroChipNeo", "PCS");
+  const chipNeo = await mat("FL001MICROCHIPNEO", "MicroChipNeo", "PCS");
   const sup = async (name) => (await api("POST", "/api/suppliers", { name, category: "Electrical", country: "India" })).id;
   const iljin = await sup("Iljin Noida");
   await sup("Chip Maker A");
@@ -35,9 +35,12 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const board = await own("BRD", "Bare board", "PCS", 415);
   const icset = await own("ICSET", "IC set", "SET", 0);
   await own("SOLDER", "Solder wire", "kg", 900);
+  // MicroChip / MicroChipNeo are picked from T1 into Iljin's material master (supplier's own price)
+  const chipOwn = (await api("POST", "/api/planning/supplier-materials", { supplier_id: iljin, item_id: chip, unit_price: 505, currency: "INR" })).id;
+  await api("POST", "/api/planning/supplier-materials", { supplier_id: iljin, item_id: chipNeo, unit_price: 0, currency: "INR" });
   const lBoard = (await api("POST", "/api/planning/supplier-bom/lines", { supplier_id: iljin, material_id: pcb, supplier_material_id: board, quantity: 1 })).id;
   const lIc = (await api("POST", "/api/planning/supplier-bom/lines", { supplier_id: iljin, material_id: pcb, supplier_material_id: icset, quantity: 1 })).id;
-  const lChip = (await api("POST", "/api/planning/supplier-bom/lines", { supplier_id: iljin, material_id: pcb, parent_line_id: lIc, item_id: chip, quantity: 2 })).id;
+  const lChip = (await api("POST", "/api/planning/supplier-bom/lines", { supplier_id: iljin, material_id: pcb, parent_line_id: lIc, supplier_material_id: chipOwn, quantity: 2 })).id;
   void lBoard;
 
   await page.goto(BASE);
@@ -48,12 +51,15 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // ---- Supplier materials tab
   await page.click('[data-supplier-tab="Supplier materials"]');
   await page.selectOption("#smSupplier", String(iljin));
-  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 3);
+  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 5);
+  const fromCol = await page.locator("#smTable tbody tr td:first-child").allTextContents();
+  check("Supplier master shows where each code comes from (T1 / own)", fromCol.filter((t) => t === "T1").length === 2 && fromCol.filter((t) => t === "Supplier's own").length === 3, JSON.stringify(fromCol));
+  await page.selectOption("#smFrom", "Own");
   await page.fill('#smAddForm [name="code"]', "TERM");
   await page.fill('#smAddForm [name="name"]', "Terminal");
   await page.fill('#smAddForm [name="unit_price"]', "2");
   await page.click('#smAddForm button[type="submit"]');
-  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 4);
+  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 6);
   check("Add supplier material from the form", (await page.locator("#smTable").textContent()).includes("Terminal"));
   await page.locator('#smTable tr:has-text("TERM") [data-sm-edit]').click();
   await page.fill('#smEditForm [name="name"]', "Terminal 6.3");
@@ -61,7 +67,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForFunction(() => document.querySelector("#smTable").textContent.includes("Terminal 6.3"));
   check("Edit supplier material", true);
   await page.locator('#smTable tr:has-text("TERM") [data-sm-delete]').click();
-  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 3);
+  await page.waitForFunction(() => document.querySelectorAll("#smTable tbody tr").length === 5);
   check("Delete supplier material", true);
 
   // ---- Supplier BOM tab
@@ -91,7 +97,6 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click("#sbAddSource");
   const second = page.locator("#sbSourceRows tr").nth(1);
   await second.locator("[data-src-supplier]").selectOption({ label: (await second.locator("[data-src-supplier] option").allTextContents()).find((t) => t.includes("Chip Maker B")) });
-  await second.locator("[data-src-kind]").selectOption("our");
   await second.locator("[data-src-search]").fill("MICROCHIPNEO");
   await page.waitForFunction(() => { const o = [...document.querySelectorAll("#sbSourceRows tr")[1].querySelectorAll("[data-src-alt] option")]; return o.length === 2 && o[1].textContent.includes("FL001MICROCHIPNEO"); });
   await second.locator("[data-src-alt]").selectOption({ index: 1 });
