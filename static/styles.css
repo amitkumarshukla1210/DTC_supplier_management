@@ -433,3 +433,11 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 #pageContent[data-view="master"] th .table-column-filter summary { white-space: nowrap; }
 #pageContent[data-view="master"] .multi-filter.table-column-filter summary::after { margin-left: 5px; }
 #pageContent[data-view="master"] td { padding: 10px 10px; }
+/* Column resize: visible drag handle at each header edge */
+#pageContent[data-view="master"] th { position: relative; }
+#pageContent[data-view="master"] .table-heading { position: static; }
+#pageContent[data-view="master"] .column-resizer { top: 0; right: -5px; bottom: 0; width: 10px; }
+#pageContent[data-view="master"] th:hover .column-resizer { background: linear-gradient(to right, transparent 4px, #8fbfdf 4px, #8fbfdf 6px, transparent 6px); }
+/* Level 2 / 3: wider first (+) column */
+#pageContent[data-view="master"] .part-bom-page .tree-column-heading,
+#pageContent[data-view="master"] .part-bom-page .tree-toggle-cell { width: 96px; min-width: 96px; }

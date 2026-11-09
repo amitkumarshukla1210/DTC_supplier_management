@@ -1046,7 +1046,58 @@ document.addEventListener("pointermove", (event) => {
   });
 });
 
-document.addEventListener("pointerup", () => { activeColumnResize = null; });
+document.addEventListener("pointerup", () => {
+  if (activeColumnResize) saveColumnWidths(activeColumnResize.tableNode);
+  activeColumnResize = null;
+});
+
+// Master-data tabs remember column widths (per tab and table) in this browser, so a
+// redraw (tab change, filter, reload) keeps them. Double-click a column edge to reset.
+function columnWidthKey(tableNode) {
+  if (content.dataset.view !== "master") return "";
+  const owner = tableNode.closest("[id]")?.id || "";
+  return `dtcColumnWidths:${state.bomTab}:${owner}:${tableNode.tHead?.rows[0]?.cells.length || 0}`;
+}
+
+function saveColumnWidths(tableNode) {
+  const key = columnWidthKey(tableNode);
+  if (!key) return;
+  const widths = [...tableNode.tHead.rows[0].cells].map((cell) => Math.round(cell.getBoundingClientRect().width));
+  try { localStorage.setItem(key, JSON.stringify(widths)); } catch { /* storage unavailable: widths last until redraw */ }
+}
+
+function applySavedColumnWidths(tableNode) {
+  const key = columnWidthKey(tableNode);
+  if (!key || !tableNode.tHead) return;
+  let widths = null;
+  try { widths = JSON.parse(localStorage.getItem(key) || "null"); } catch { widths = null; }
+  const headers = [...tableNode.tHead.rows[0].cells];
+  if (!Array.isArray(widths) || widths.length !== headers.length) return;
+  tableNode.style.tableLayout = "fixed";
+  tableNode.style.width = `${widths.reduce((total, width) => total + width, 0)}px`;
+  headers.forEach((cell, index) => { cell.style.width = `${widths[index]}px`; cell.style.minWidth = `${widths[index]}px`; });
+}
+
+function resetColumnWidths(tableNode) {
+  const key = columnWidthKey(tableNode);
+  try { if (key) localStorage.removeItem(key); } catch { /* ignore */ }
+  tableNode.style.tableLayout = "";
+  tableNode.style.width = "";
+  [...tableNode.rows].forEach((row) => [...row.cells].forEach((cell) => { cell.style.width = ""; cell.style.minWidth = ""; }));
+}
+
+document.addEventListener("dblclick", (event) => {
+  const handle = event.target.closest(".column-resizer");
+  const tableNode = handle?.closest("table");
+  if (tableNode) resetColumnWidths(tableNode);
+});
+
+new MutationObserver(() => {
+  content.querySelectorAll("table:not([data-widths-checked])").forEach((tableNode) => {
+    tableNode.dataset.widthsChecked = "true";
+    applySavedColumnWidths(tableNode);
+  });
+}).observe(content, { childList: true, subtree: true });
 
 function reportRows(rows = state.report) {
   const checked = {};
