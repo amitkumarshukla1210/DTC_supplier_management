@@ -69,15 +69,15 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
 
   // Point 3: collapsed tree, + opens, − closes
   const groups = page.locator("#masterTable > .table-wrap > table > tbody > tr[data-tree-group]");
-  check("Tree starts collapsed: 1 parent row, no child rows", (await groups.count()) === 1 && (await page.locator(".bom-tree-row").count()) === 0);
+  check("Tree starts collapsed: 1 parent row, no child rows", (await groups.count()) === 1 && (await page.locator("#masterTable tr[data-bom-level2-row]").count()) === 0);
   await groups.first().locator("[data-tree-expand]").click();
-  await page.waitForSelector(".bom-tree-row [data-bom-level2-row]");
-  const childCodes = await page.locator(".bom-tree-row [data-bom-level2-row] td:nth-child(4)").allTextContents();
+  await page.waitForSelector("#masterTable tr[data-bom-level2-row]");
+  const childCodes = await page.locator("#masterTable tr[data-bom-level2-row] td:nth-child(4)").allTextContents();
   check("'+' shows MOTOR1 lines STEEL0.7 and SCRAP001", childCodes.join(",") === "FL001STEEL0.7,SCRAP001", childCodes.join(","));
   check("Toggle turns into '−'", (await groups.first().locator("[data-tree-expand]").textContent()).trim() === "−");
   await page.screenshot({ path: __dirname + "/l2_tree.png" });
   await groups.first().locator("td:nth-child(2)").click();
-  check("Clicking the parent row collapses it again", (await page.locator(".bom-tree-row").count()) === 0);
+  check("Clicking the parent row collapses it again", (await page.locator("#masterTable tr[data-bom-level2-row]").count()) === 0);
 
   // Point 4: New BOM for MOTOR2 with two lines picked from Material Master
   await page.click('[data-action="new-part-bom"]');

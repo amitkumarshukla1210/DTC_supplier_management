@@ -27,7 +27,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const steel = await mat("RC-STEEL", "Steel", "kg");
   const wire = await mat("RC-WIRE", "Wire", "kg");
   const model = await api("POST", "/api/planning/models", { code: "RC-12000", name: "Eva 8014" });
-  await api("POST", "/api/planning/products", { code: "RC-1000", name: "FL", model_ids: [model.id] });
+  const model2 = await api("POST", "/api/planning/models", { code: "RC-13000", name: "Serena 8014" });
+  await api("POST", "/api/planning/products", { code: "RC-1000", name: "FL", model_ids: [model.id, model2.id] });
+  await api("POST", `/api/planning/model-bom/${model2.id}`, { material_id: steel, quantity: 3, uom: "kg" });
   await api("POST", `/api/planning/model-bom/${model.id}`, { material_id: motor, quantity: 1, uom: "Nos" });
   await api("POST", `/api/planning/part-bom/${motor}/new`, { tab: "Level 2 Part BOM", lines: [{ child_item_id: steel, quantity: 2 }] });
   await api("POST", `/api/planning/part-bom/${steel}/new`, { tab: "Level 3 Part BOM", lines: [{ child_item_id: wire, quantity: 0.5 }] });
@@ -43,6 +45,13 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     await page.mouse.click(box.x + box.width - 4, box.y + box.height / 2);
     await page.waitForTimeout(400);
   };
+
+  // Header text above the row's first filled data cell (after the toggle column)
+  const headerOfFilledCell = async (tableSel, row) => {
+    const index = await row.evaluate((tr) => [...tr.cells].findIndex((td, i) => i > 0 && td.textContent.trim() !== ""));
+    return (await page.locator(`${tableSel} > .table-wrap > table > thead th`).nth(index).locator("summary").textContent()).trim();
+  };
+  const rowCodes = (tableSel) => page.locator(`${tableSel} tbody tr`).evaluateAll((trs) => trs.map((tr) => [...tr.cells].slice(1).find((td) => td.textContent.trim())?.textContent.trim()));
 
   async function checkRow(tabName, row, opts) {
     const cells = row.locator(":scope > td");
@@ -75,10 +84,22 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const productRow = page.locator("#productMasterTable tbody tr[data-product-model-row]").first();
   await productRow.waitFor();
   await productRow.locator("[data-tree-expand]").click();
-  await page.locator(".bom-tree-row tr[data-bom-level1-row]").first().waitFor();
-  check("Product Master: expanded Level 1 shows no repeated table header", await page.locator(".bom-tree-row thead").first().isHidden());
+  const pmL1 = page.locator("#productMasterTable tr[data-bom-level1-row]").first();
+  await pmL1.waitFor();
+  check("Product Master: one table, no nested header", (await page.locator("#productMasterTable thead").count()) === 1);
+  check("Product Master: L1 part sits under 'L1 part code'", (await headerOfFilledCell("#productMasterTable", pmL1)) === "L1 part code");
+  await pmL1.locator("[data-tree-expand]").click();
+  const pmL2 = page.locator("#productMasterTable tr[data-bom-level2-row]").first();
+  await pmL2.waitFor();
+  check("Product Master: L2 part sits under 'L2 part code'", (await headerOfFilledCell("#productMasterTable", pmL2)) === "L2 part code");
+  await pmL2.locator("[data-tree-expand]").click();
+  await page.waitForFunction(() => document.querySelectorAll("#productMasterTable tr[data-bom-level2-row]").length === 2);
+  const pmL3 = page.locator("#productMasterTable tr[data-bom-level2-row]").nth(1);
+  check("Product Master: L3 part sits under 'L3 part code'", (await headerOfFilledCell("#productMasterTable", pmL3)) === "L3 part code");
+  check("Product Master: tree order Product > L1 > L2 > L3", JSON.stringify(await rowCodes("#productMasterTable")) === JSON.stringify(["RC-1000", "RC-MOTOR", "RC-STEEL", "RC-WIRE", "RC-1000"]), JSON.stringify(await rowCodes("#productMasterTable")));
   await page.screenshot({ path: __dirname + "/look_product.png" });
   await productRow.locator("[data-tree-expand]").click();
+  check("Product Master: collapsing the product removes all levels below it", (await page.locator("#productMasterTable tbody tr").count()) === 2);
   await checkRow("Product Master", productRow, { dataCell: 1 });
   await productRow.locator("td").nth(1).click();
   await page.waitForTimeout(500);
@@ -95,27 +116,26 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const group = page.locator("#masterTable tr[data-tree-group]").first();
   await group.waitFor();
   await group.locator("[data-tree-expand]").click();
-  const l2Row = page.locator(".bom-tree-row tr[data-bom-level2-row]").first();
+  const l2Row = page.locator("#masterTable tr[data-bom-level2-row]").first();
   await l2Row.waitFor();
-  check("Level 2: expanded lines show no repeated table header", await page.locator(".bom-tree-row thead").first().isHidden());
-  const mainCols = await page.locator("#masterTable > .table-wrap > table > thead th").evaluateAll((ths) => ths.map((t) => Math.round(t.getBoundingClientRect().left)));
-  const nestedCols = await l2Row.locator(":scope > td").evaluateAll((tds) => tds.map((t) => Math.round(t.getBoundingClientRect().left)));
-  const offBy = Math.max(...mainCols.slice(1).map((x, i) => Math.abs(x - nestedCols[i + 1])));
-  check("Level 2: expanded lines line up with the main header columns", offBy <= 4, `max offset ${offBy}px`);
+  check("Level 2: one table, no nested header", (await page.locator("#masterTable thead").count()) === 1);
+  check("Level 2: parent sits under 'L1 part code'", (await headerOfFilledCell("#masterTable", group)) === "L1 part code");
+  check("Level 2: line sits under 'L2 part code'", (await headerOfFilledCell("#masterTable", l2Row)) === "L2 part code");
   await page.screenshot({ path: __dirname + "/look_level2.png" });
   await checkRow("Level 2 Part BOM", l2Row, { dataCell: 3 });
   const groupCells = group.locator(":scope > td");
-  await clickCellPadding(groupCells.nth(9));
-  check("Level 2: click in parent row's Delete column does not collapse it", (await page.locator(".bom-tree-row").count()) === 1);
+  await clickCellPadding(groupCells.last());
+  const l2Count = await page.locator("#masterTable tr[data-bom-level2-row]").count();
+  check("Level 2: click in parent row's Delete column does not collapse it", l2Count === 1, `rows=${l2Count}`);
   await groupCells.nth(1).click();
-  check("Level 2: click on parent code still collapses it", (await page.locator(".bom-tree-row").count()) === 0);
+  check("Level 2: click on parent code still collapses it", (await page.locator("#masterTable tr[data-bom-level2-row]").count()) === 0);
 
   // Level 3
   await page.click('[data-bom-tab="Level 3 Part BOM"]');
   const g3 = page.locator("#masterTable tr[data-tree-group]").first();
   await g3.waitFor();
   await g3.locator("[data-tree-expand]").click();
-  const l3Row = page.locator(".bom-tree-row tr[data-bom-level2-row]").first();
+  const l3Row = page.locator("#masterTable tr[data-bom-level2-row]").first();
   await l3Row.waitFor();
   await checkRow("Level 3 Part BOM", l3Row, { dataCell: 3, noDeeperLevel: true });
 

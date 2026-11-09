@@ -467,7 +467,15 @@ async function renderMaster() {
       .filter((model) => (item.model_ids || []).includes(model.id))
       .sort((left, right) => left.code.localeCompare(right.code));
     const display = assigned.length ? assigned : [null];
-    return display.map((model) => `<tr class="${model?.has_bom ? "clickable-row" : ""}" ${model ? `data-product-model-row="${model.id}" data-has-bom="${model.has_bom}"` : `data-product-id="${item.id}"`} data-tree-depth="0" tabindex="0"><td>${model?.has_bom ? `<button type="button" class="tree-toggle" aria-label="Expand ${esc(model.code)} BOM" data-tree-expand="model" data-tree-model-id="${model.id}" aria-expanded="false">+</button>` : ""}</td><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(model?.code || "")}</td><td>${esc(model?.name || (assigned.length ? "" : "No models assigned"))}</td><td><button class="text-button" data-edit-product="${item.id}" data-edit-model-id="${model?.id || ""}">Edit</button></td><td><button class="text-button button-danger" data-delete-product="${item.id}">Delete</button></td></tr>`);
+    return display.map((model) => treeRowHtml("Product Master", {
+      depth: 0,
+      className: model?.has_bom ? "clickable-row" : "",
+      attributes: model ? `data-product-model-row="${model.id}" data-has-bom="${model.has_bom}"` : `data-product-id="${item.id}"`,
+      cells: { product: [item.code, item.name], model: [model?.code || "", model?.name || (assigned.length ? "" : "No models assigned")] },
+      toggle: model?.has_bom ? treeToggle(model.code, `data-tree-expand="model" data-tree-model-id="${model.id}"`) : "",
+      edit: `<button class="text-button" data-edit-product="${item.id}" data-edit-model-id="${model?.id || ""}">Edit</button>`,
+      remove: `<button class="text-button button-danger" data-delete-product="${item.id}">Delete</button>`,
+    }));
   }).join("");
   const modelRows = state.models.map((item) => `<tr data-edit-model="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.product_names?.join(", ") || "Unassigned")}</td><td><button class="text-button" data-edit-model="${item.id}">Edit</button><button class="text-button button-danger" data-delete-model="${item.id}">Delete</button></td></tr>`).join("");
   const materialRows = state.materials.map((item) => `<tr data-edit-material="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.category)}</td><td>${esc(item.uom)}</td><td>${number(item.stock_on_hand)}</td><td>${number(item.buffer_days, 0)} days</td><td>${state.user.can_view_prices || state.user.role === "Admin" ? money(item.unit_cost, item.currency) : "Restricted"}</td><td><button class="text-button" data-edit-material="${item.id}">Edit</button></td><td><button class="text-button button-danger" data-delete-material="${item.id}">Delete</button></td></tr>`).join("");
@@ -484,7 +492,7 @@ async function renderMaster() {
     <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab)}</button>`).join("")}</div>
     ${state.bomTab === "Product Master" ? `<section class="panel table-panel">${panelHeader("Product Master")}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${tableExportLinks("products")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
-      <div id="productMasterTable">${table(["", "Product code", "Product name", "Model code", "Model name", "Edit", "Delete"], productRows, "No products yet.")}</div></section>`
+      <div id="productMasterTable">${table(treeHeaders("Product Master"), productRows, "No products yet.")}</div></section>`
     : state.bomTab === "Material Master" ? `<section class="panel table-panel">${panelHeader("Material Master", "Define each material code once. The unit selected here is used throughout its BOM and supply chain records.")}
       <div class="master-summaries"><article class="mini-stat"><span>Materials</span><strong>${state.materials.length}</strong></article><article class="mini-stat"><span>Models</span><strong>${state.models.length}</strong></article><article class="mini-stat"><span>Products</span><strong>${state.products.length}</strong></article></div>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search material code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/own-stock.xlsx">Stock template</a>${tableExportLinks("materials")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
@@ -506,8 +514,8 @@ async function renderMaster() {
       </div>
       ${state.bomTab === "Model BOM Level 1" ? "" : '<div id="newBomEditor"></div>'}
       <div id="masterTable">${state.bomTab === "Model BOM Level 1"
-        ? table(["", "Model code", "Model name", "Level", "Part code", "Part name", "Quantity in model", "Unit", "Part price", "Edit", "Delete"], "", "Select one or more models to view their BOM.")
-        : table(["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"], "", "Select a parent part to view this BOM level.")}</div>
+        ? table(treeHeaders("Model BOM Level 1"), "", "Select one or more models to view their BOM.")
+        : table(treeHeaders(state.bomTab), "", "Select a parent part to view this BOM level.")}</div>
     </section>`}
     `;
   if (state.bomTab === "Product Master") {
@@ -599,75 +607,114 @@ async function applyParentSelection() {
 }
 
 async function loadPartBomTab() {
-  const headers = ["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"];
+  const headers = treeHeaders(state.bomTab);
   if (!state.bomParentOptions.length) {
     $("#masterTable").innerHTML = table(headers, "", `No ${esc(state.bomTab)} yet. Use New BOM to create one.`);
     return;
   }
   const selected = state.selectedBomParentIds.length ? new Set(state.selectedBomParentIds.map(String)) : null;
   const parents = state.bomParentOptions.filter((item) => !selected || selected.has(String(item.id)));
-  const depth = state.bomTab === "Level 2 Part BOM" ? 1 : 2;
-  const rows = parents.map((item) => `<tr class="clickable-row" data-tree-group data-tree-depth="${depth}" tabindex="0"><td><button type="button" class="tree-toggle" aria-label="Expand ${esc(item.code)} BOM" data-tree-expand="part" data-tree-parent-id="${item.id}" data-tree-level="${esc(state.bomTab)}" aria-expanded="false">+</button></td><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>`).join("");
+  const parentLevel = state.bomTab === "Level 2 Part BOM" ? "l1" : "l2";
+  const rows = parents.map((item) => treeRowHtml(state.bomTab, {
+    depth: 0, className: "clickable-row", attributes: "data-tree-group",
+    cells: { [parentLevel]: [item.code, item.name] },
+    toggle: treeToggle(item.code, `data-tree-expand="part" data-tree-parent-id="${item.id}" data-tree-level="${esc(state.bomTab)}"`),
+  })).join("");
   $("#masterTable").innerHTML = `${table(headers, rows, `No ${esc(state.bomTab)} lines found.`)}<div class="table-toolbar pagination-toolbar"><span>${parents.length.toLocaleString()} parent part${parents.length === 1 ? "" : "s"} with BOM</span></div>`;
 }
 
-function treeBomTable(items, tab, modelId = null, parent = null) {
-  const level1 = tab === "Model BOM Level 1";
-  const headers = level1
-    ? ["", "Model code", "Model name", "Level", "Part code", "Part name", "Quantity in model", "Unit", "Part price", "Edit", "Delete"]
-    : ["", "Parent part code", "Parent part name", "Part code", "Part name", "Quantity per parent", "Unit", "Part price", "Edit", "Delete"];
-  const rows = items.map((item) => {
-    if (level1) {
-      return `<tr class="clickable-row" data-bom-level1-row data-has-bom="${item.has_bom}" data-tree-depth="1" data-model-id="${modelId}" data-material-id="${item.material_id}" data-edit-bom-row="${item.root_bom_id || ""}" data-quantity="${item.edit_quantity}" data-uom="${esc(item.uom)}" tabindex="0"><td>${item.has_bom ? `<button type="button" class="tree-toggle" aria-label="Expand level 2 BOM for ${esc(item.code)}" data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 2 Part BOM" aria-expanded="false">+</button>` : ""}</td><td>${esc(item.model_code)}</td><td>${esc(item.model_name)}</td><td>${esc(item.level)}</td><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${number(item.quantity)}</td><td>${esc(item.uom)}</td><td>${item.unit_price === undefined ? "Restricted" : money(item.unit_price, item.currency)}</td><td><button class="text-button" data-edit-bom-row="${item.root_bom_id || ""}" data-model-id="${modelId}" data-material-id="${item.material_id}" data-quantity="${item.edit_quantity}" data-uom="${esc(item.uom)}">Edit</button></td><td><button class="text-button button-danger" data-delete-bom-row="${item.root_bom_id || ""}" data-model-id="${modelId}">Delete</button></td></tr>`;
-    }
-    const depth = tab === "Level 2 Part BOM" ? 2 : 3;
-    return `<tr class="clickable-row" data-bom-level2-row data-has-bom="${tab === "Level 2 Part BOM" && item.has_bom}" data-tree-depth="${depth}" data-material-id="${item.material_id}" data-edit-component-row="${item.component_id}" data-parent-item="${parent.id}" data-quantity="${item.quantity}" data-uom="${esc(item.uom)}" tabindex="0"><td>${tab === "Level 2 Part BOM" && item.has_bom ? `<button type="button" class="tree-toggle" aria-label="Expand level 3 BOM for ${esc(item.code)}" data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 3 Part BOM" aria-expanded="false">+</button>` : ""}</td><td>${esc(parent.code)}</td><td>${esc(parent.name)}</td><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${number(item.quantity)}</td><td>${esc(item.uom)}</td><td>${item.unit_price === undefined ? "Restricted" : money(item.unit_price, item.currency)}</td><td><button class="text-button" data-edit-component-row="${item.component_id}" data-parent-item="${parent.id}" data-material-id="${item.material_id}" data-quantity="${item.quantity}" data-uom="${esc(item.uom)}">Edit</button></td><td><button class="text-button button-danger" data-delete-component-row="${item.component_id}" data-parent-item="${parent.id}">Delete</button></td></tr>`;
-  }).join("");
-  return table(headers, rows, `No ${tab} lines found.`);
+// One-table BOM tree: every level has its own code + name columns, so items of the
+// same level line up in one column; a child row leaves its parents' columns blank.
+const TREE_LEVELS = {
+  "Product Master": ["product", "model", "l1", "l2", "l3"],
+  "Model BOM Level 1": ["model", "l1", "l2", "l3"],
+  "Level 2 Part BOM": ["l1", "l2", "l3"],
+  "Level 3 Part BOM": ["l2", "l3"],
+};
+const TREE_LEVEL_LABELS = {
+  product: ["Product code", "Product name"], model: ["Model code", "Model name"],
+  l1: ["L1 part code", "L1 part name"], l2: ["L2 part code", "L2 part name"], l3: ["L3 part code", "L3 part name"],
+};
+
+function treeHeaders(tab) {
+  return ["", ...TREE_LEVELS[tab].flatMap((level) => TREE_LEVEL_LABELS[level]), "Quantity", "Unit", "Part price", "Edit", "Delete"];
+}
+
+function treeToggle(label, attributes) {
+  return `<button type="button" class="tree-toggle" aria-label="Expand ${esc(label)} BOM" ${attributes} aria-expanded="false">+</button>`;
+}
+
+function treeRowHtml(tab, row) {
+  const levelCells = TREE_LEVELS[tab].map((level) => row.cells[level]
+    ? `<td>${esc(row.cells[level][0])}</td><td>${esc(row.cells[level][1])}</td>`
+    : "<td></td><td></td>").join("");
+  return `<tr class="${row.className || ""}" ${row.attributes || ""} data-tree-depth="${row.depth}" tabindex="0"><td class="tree-toggle-cell">${row.toggle || ""}</td>${levelCells}<td>${row.quantity ?? ""}</td><td>${esc(row.uom || "")}</td><td>${row.price ?? ""}</td><td>${row.edit || ""}</td><td>${row.remove || ""}</td></tr>`;
+}
+
+function treePrice(item) {
+  return item.unit_price === undefined ? "Restricted" : money(item.unit_price, item.currency);
+}
+
+function level1RowHtml(tab, item, modelId, depth, showModel) {
+  const data = `data-model-id="${modelId}" data-material-id="${item.material_id}" data-quantity="${item.edit_quantity}" data-uom="${esc(item.uom)}"`;
+  return treeRowHtml(tab, {
+    depth, className: "clickable-row",
+    attributes: `data-bom-level1-row data-has-bom="${item.has_bom}" data-edit-bom-row="${item.root_bom_id || ""}" ${data}`,
+    cells: { ...(showModel ? { model: [item.model_code, item.model_name] } : {}), l1: [item.code, item.name] },
+    toggle: item.has_bom ? treeToggle(item.code, `data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 2 Part BOM"`) : "",
+    quantity: number(item.quantity), uom: item.uom, price: treePrice(item),
+    edit: `<button class="text-button" data-edit-bom-row="${item.root_bom_id || ""}" ${data}>Edit</button>`,
+    remove: `<button class="text-button button-danger" data-delete-bom-row="${item.root_bom_id || ""}" data-model-id="${modelId}">Delete</button>`,
+  });
+}
+
+function partRowHtml(tab, item, parent, lineLevel, depth) {
+  const level = lineLevel === "Level 2 Part BOM" ? "l2" : "l3";
+  const expandable = level === "l2" && item.has_bom;
+  const data = `data-parent-item="${parent.id}" data-material-id="${item.material_id}" data-quantity="${item.quantity}" data-uom="${esc(item.uom)}"`;
+  return treeRowHtml(tab, {
+    depth, className: "clickable-row",
+    attributes: `data-bom-level2-row data-has-bom="${expandable}" data-edit-component-row="${item.component_id}" ${data}`,
+    cells: { [level]: [item.code, item.name] },
+    toggle: expandable ? treeToggle(item.code, `data-tree-expand="part" data-tree-parent-id="${item.material_id}" data-tree-level="Level 3 Part BOM"`) : "",
+    quantity: number(item.quantity), uom: item.uom, price: treePrice(item),
+    edit: `<button class="text-button" data-edit-component-row="${item.component_id}" ${data}>Edit</button>`,
+    remove: `<button class="text-button button-danger" data-delete-component-row="${item.component_id}" data-parent-item="${parent.id}">Delete</button>`,
+  });
 }
 
 async function expandBomTree(button) {
   const row = button.closest("tr");
-  const current = row.nextElementSibling;
-  if (current?.classList.contains("bom-tree-row")) {
-    current.remove();
+  const depth = Number(row.dataset.treeDepth || 0);
+  if (button.getAttribute("aria-expanded") === "true") {
+    while (row.nextElementSibling && Number(row.nextElementSibling.dataset.treeDepth) > depth) row.nextElementSibling.remove();
     button.textContent = "+";
     button.setAttribute("aria-expanded", "false");
     return;
   }
-  const treeRow = document.createElement("tr");
-  treeRow.className = "bom-tree-row";
-  treeRow.dataset.treeDepth = String(Number(row.dataset.treeDepth || 0) + 1);
-  treeRow.innerHTML = `<td colspan="${row.cells.length}"><div class="tree-loading">Loading BOM…</div></td>`;
-  row.after(treeRow);
-  button.textContent = "−";
-  button.setAttribute("aria-expanded", "true");
+  button.disabled = true;
   try {
+    let rows;
     if (button.dataset.treeExpand === "model") {
       const modelId = Number(button.dataset.treeModelId);
       const query = new URLSearchParams({ tab: "Model BOM Level 1", offset: "0", limit: "500" });
       const result = await api(`/api/planning/model-bom/${modelId}?${query}`);
-      if (!result.items.length) {
-        treeRow.remove();
-        button.remove();
-        return;
-      }
-      const items = result.items.map((item) => ({ ...item, model_id: modelId, model_code: result.model_code, model_name: result.model_name }));
-      treeRow.firstElementChild.innerHTML = treeBomTable(items, "Model BOM Level 1", modelId);
+      rows = result.items.map((item) => level1RowHtml(state.bomTab, item, modelId, depth + 1, false));
     } else {
-      const parentId = Number(button.dataset.treeParentId);
-      const tab = button.dataset.treeLevel;
-      const query = new URLSearchParams({ tab, offset: "0", limit: "500" });
-      const result = await api(`/api/planning/part-bom/${parentId}?${query}`);
-      if (!result.items.length) {
-        treeRow.remove();
-        button.remove();
-        return;
-      }
-      treeRow.firstElementChild.innerHTML = treeBomTable(result.items, tab, null, result.parent);
+      const level = button.dataset.treeLevel;
+      const query = new URLSearchParams({ tab: level, offset: "0", limit: "500" });
+      const result = await api(`/api/planning/part-bom/${Number(button.dataset.treeParentId)}?${query}`);
+      rows = result.items.map((item) => partRowHtml(state.bomTab, item, result.parent, level, depth + 1));
     }
-  } catch (error) {
-    treeRow.firstElementChild.innerHTML = `<div class="tree-loading tree-error">${esc(error.message)}</div>`;
+    if (!rows.length) {
+      button.remove();
+      return;
+    }
+    row.insertAdjacentHTML("afterend", rows.join(""));
+    button.textContent = "−";
+    button.setAttribute("aria-expanded", "true");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -764,7 +811,7 @@ async function applyModelSelection() {
 async function loadBomTab() {
   const modelIds = state.selectedModelIds.length ? state.selectedModelIds : state.models.map((model) => model.id);
   if (!modelIds.length) {
-    $("#masterTable").innerHTML = table(["", "Model code", "Model name", "Level", "Part code", "Part name", "Quantity in model", "Unit", "Part price", "Edit", "Delete"], "", "Select one or more models to view their BOM.");
+    $("#masterTable").innerHTML = table(treeHeaders("Model BOM Level 1"), "", "Select one or more models to view their BOM.");
     return;
   }
   const results = await Promise.all(modelIds.map(async (modelId) => {
@@ -780,8 +827,7 @@ async function loadBomTab() {
     return items.map((row) => ({ ...row, model_id: modelId, model_code: metadata.model_code, model_name: metadata.model_name }));
   }));
   const items = results.flat();
-  $("#masterTable").innerHTML = treeBomTable(items, "Model BOM Level 1");
-  setupTableFilters("#masterTable", "#masterFilters", null, [{ title: "Level", index: 2 }, { title: "Unit", index: 6 }]);
+  $("#masterTable").innerHTML = table(treeHeaders("Model BOM Level 1"), items.map((item) => level1RowHtml("Model BOM Level 1", item, item.model_id, 0, true)).join(""), "No Model BOM Level 1 lines found.");
 }
 
 function renderSupplierPartsTable(result) {
