@@ -916,6 +916,91 @@ class SupplierHubApiTests(unittest.TestCase):
         row = next(r for r in response.json()["items"] if r["material_id"] == part)
         self.assertEqual((row["unit_price"], row["price_source"]), (90, "Material Master"))
 
+    def test_purchased_parts_rule_and_supplier_relationship_upload(self):
+        def material(code, name, uom="kg", category="Raw material"):
+            response = self.client.post("/api/planning/materials", json={"code": code, "name": name, "uom": uom, "category": category})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        motor, steel, scrap, pcb = material("PP-MOTOR", "Motor", "PCS"), material("PP-STEEL", "Steel"), material("PP-SCRAP", "Steel scrap"), material("PP-PCB", "PCB", "PCS", "Electrical components")
+        model = self.client.post("/api/planning/models", json={"code": "PP-12000", "name": "Eva"}).json()["id"]
+        for part in (motor, pcb):
+            self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": part, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [
+            {"child_item_id": steel, "quantity": 2}, {"child_item_id": scrap, "quantity": -0.3}]}).status_code, 201)
+
+        # Purchased list: steel + pcb yes; motor (own BOM) and scrap (negative qty) no
+        listed = {row["code"] for row in self.client.get("/api/planning/materials", params={"purchased": "true", "search": "PP-", "limit": 500}).json()["items"]}
+        self.assertEqual(listed, {"PP-STEEL", "PP-PCB"})
+        everything = {row["code"] for row in self.client.get("/api/planning/materials", params={"search": "PP-", "limit": 500}).json()["items"]}
+        self.assertEqual(everything, {"PP-MOTOR", "PP-STEEL", "PP-SCRAP", "PP-PCB"})
+
+        supplier = next(row["id"] for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved")
+        def link(material_id):
+            return self.client.post("/api/planning/supplier-parts", json={"material_id": material_id, "supplier_id": supplier, "sob_percent": 50, "unit_price": 1, "currency": "INR"})
+        made = link(motor)
+        self.assertEqual(made.status_code, 422)
+        self.assertIn("made in-house", made.json()["detail"])
+        generated = link(scrap)
+        self.assertEqual(generated.status_code, 422)
+        self.assertIn("generated in your factory", generated.json()["detail"])
+        self.assertEqual(link(steel).status_code, 201)
+
+        # Template
+        template = load_workbook(io.BytesIO(self.client.get("/api/planning/templates/supplier-parts.xlsx").content)).active
+        self.assertEqual([c.value for c in template[1]][:7], ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency"])
+
+        def upload(rows, headers=("material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency", "lead_time_days", "moq", "buffer_days")):
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(list(headers))
+            for row in rows:
+                sheet.append(list(row))
+            content = io.BytesIO()
+            workbook.save(content)
+            return self.client.post("/api/planning/supplier-parts/upload", content=content.getvalue(),
+                                    headers={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+
+        def links_of(material_id):
+            return {(row["supplier_name"], row["tier"]): row for row in self.client.get("/api/planning/supplier-parts", params={"limit": 1000}).json()["items"] if row["material_id"] == material_id}
+
+        before_suppliers = len(self.client.get("/api/suppliers").json())
+        # Rejected files change nothing (all rows or none)
+        for rows, expected in [
+            ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-MOTOR", "Iljin Noida", "", "", 40, 1, "INR", 0, 0, 0)], "made in-house"),
+            ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-NOPE", "Iljin Noida", "", "", 40, 1, "INR", 0, 0, 0)], "not in Material Master"),
+            ([("PP-PCB", "Iljin Noida", "", "", 70, 1800, "INR", 90, 0, 0), ("PP-PCB", "LG Pune", "", "", 40, 1900, "INR", 60, 0, 0)], "more than 100%"),
+            ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-PCB", "Iljin Noida", "", "", 40, 1800, "INR", 90, 0, 0)], "repeated"),
+            ([("PP-PCB", "Chip Co", "T2", "", 100, 5, "INR", 0, 0, 0)], "parent_supplier_name"),
+        ]:
+            response = upload(rows)
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn(expected, response.json()["detail"])
+        self.assertEqual(len(self.client.get("/api/suppliers").json()), before_suppliers)
+        self.assertEqual(links_of(pcb), {})
+
+        # Good file: 2 new suppliers + a Tier-2 sub-supplier, 3 links
+        response = upload([
+            ("PP-PCB", "Iljin Noida", "", "", 60, 1800, "inr", 90, 500, 10),
+            ("pp-pcb", "LG Pune", "Direct", "", 40, 1900, "INR", 60, 0, 5),
+            ("PP-PCB", "Chip Co", "T2", "Iljin Noida", 100, 0, "INR", 30, 0, 0),
+        ])
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"rows": 3, "added": 3, "updated": 0, "suppliers_created": 3})
+        found = links_of(pcb)
+        self.assertEqual(found[("Iljin Noida", "Direct")]["sob_percent"], 60)
+        self.assertEqual(found[("Iljin Noida", "Direct")]["unit_price"], 1800)
+        self.assertEqual(found[("Iljin Noida", "Direct")]["currency"], "INR")
+        self.assertEqual((found[("Iljin Noida", "Direct")]["lead_time_days"], found[("Iljin Noida", "Direct")]["moq"]), (90, 500))
+        self.assertEqual(found[("Chip Co", "T2")]["parent_supplier_name"], "Iljin Noida")
+        # BOM price picks it up: (1800 x 60 + 1900 x 40) / 100 = 1840
+        row = next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == pcb)
+        self.assertAlmostEqual(row["unit_price"], 1840)
+        # Re-upload updates the same links (by name, case-insensitive), no duplicates
+        response = upload([("PP-PCB", "iljin noida", "", "", 50, 1750, "INR", 80, 0, 0), ("PP-PCB", "LG PUNE", "", "", 50, 1900, "INR", 60, 0, 0)])
+        self.assertEqual(response.json(), {"rows": 2, "added": 0, "updated": 2, "suppliers_created": 0})
+        self.assertEqual(found.keys(), links_of(pcb).keys())
+        self.assertEqual(links_of(pcb)[("Iljin Noida", "Direct")]["unit_price"], 1750)
+
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
         suppliers = [row for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]

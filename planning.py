@@ -1354,12 +1354,14 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return Response(status_code=204)
 
     @app.get("/api/planning/materials")
-    def materials(request: Request, offset: int = 0, limit: int = 100, search: str = ""):
+    def materials(request: Request, offset: int = 0, limit: int = 100, search: str = "", purchased: bool = False):
         current_user(request)
         if limit < 1 or limit > 500 or offset < 0:
             raise HTTPException(status_code=422, detail="Use limit 1–500 and a non-negative offset")
         with open_db() as db:
             statement = select(Item).order_by(Item.code)
+            if purchased:
+                statement = purchased_filter(statement)
             if search.strip():
                 like = f"%{search.strip()}%"
                 statement = statement.where((Item.code.ilike(like)) | (Item.name.ilike(like)))
@@ -1564,6 +1566,20 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.delete(entry)
             db.commit()
             return Response(status_code=204)
+
+    def not_purchased_reason(db: Session, material_id: int) -> str | None:
+        """Parts you do not buy: made in-house (own BOM in Product Master) or generated in
+        your factory (used with a negative quantity in any BOM). Supplier BOMs do not count."""
+        if db.scalar(select(BOMComponent.id).where(BOMComponent.parent_item_id == material_id).limit(1)):
+            return "is made in-house (it has its own BOM)"
+        if db.scalar(select(BOMComponent.id).where(BOMComponent.child_item_id == material_id, BOMComponent.quantity < 0).limit(1)):
+            return "is generated in your factory (negative BOM quantity)"
+        return None
+
+    def purchased_filter(statement):
+        made = select(BOMComponent.parent_item_id)
+        generated = select(BOMComponent.child_item_id).where(BOMComponent.quantity < 0)
+        return statement.where(Item.id.not_in(made), Item.id.not_in(generated))
 
     def bom_price_lookup(db: Session):
         """BOM part price = SOB-weighted price of the code's Direct suppliers:
@@ -1941,8 +1957,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         if payload.tier != "Direct" and payload.parent_supplier_id is None:
             raise HTTPException(status_code=422, detail="T1/T2 supplier links must identify the customer supplier they serve")
         with open_db() as db:
-            if not db.get(Item, payload.material_id) or not db.get(Supplier, payload.supplier_id):
+            material = db.get(Item, payload.material_id)
+            if not material or not db.get(Supplier, payload.supplier_id):
                 raise HTTPException(status_code=404, detail="Material or supplier not found")
+            reason = not_purchased_reason(db, material.id)
+            if reason:
+                raise HTTPException(status_code=422, detail=f"{material.code} {reason}, so it cannot have a supplier")
             share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(
                 SupplierPart.material_id == payload.material_id,
                 SupplierPart.tier == payload.tier,
@@ -1965,6 +1985,123 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             db.refresh(link)
             return {"id": link.id, "material_id": link.material_id, "supplier_id": link.supplier_id, "tier": link.tier, "sob_percent": link.sob_percent}
+
+    @app.post("/api/planning/supplier-parts/upload", status_code=201)
+    async def upload_supplier_parts(request: Request):
+        """Supplier/material relationships from Excel, all rows or none. One row per
+        material + supplier (+ tier / parent supplier). Unknown supplier names are added to
+        the Supplier register (Approved); an existing relationship is updated."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = _read_xlsx(await request.body())
+        _required_columns(rows, {"material_code", "supplier_name", "sob_percent"})
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
+            suppliers = {supplier.name.strip().casefold(): supplier for supplier in db.scalars(select(Supplier)).all()}
+            suppliers.update({supplier.code.casefold(): supplier for supplier in suppliers.values()})
+            existing = {(link.material_id, link.supplier_id, link.tier, link.parent_supplier_id): link
+                        for link in db.scalars(select(SupplierPart)).all()}
+            next_number = int(db.scalar(select(func.count(Supplier.id))) or 0) + 1001
+            used_codes = set(db.scalars(select(Supplier.code)).all())
+            reasons: dict[int, str | None] = {}
+            seen: set[tuple] = set()
+            created = updated = added = 0
+
+            def text(row: dict, key: str) -> str:
+                value = row.get(key)
+                return "" if value is None else str(value).strip()
+
+            def number(row: dict, key: str, default: float, row_number: int) -> float:
+                value = row.get(key)
+                if value is None or str(value).strip() == "":
+                    return default
+                try:
+                    result = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {key} must be a number") from exc
+                if not math.isfinite(result) or result < 0:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {key} must be zero or more")
+                return result
+
+            def supplier_for(name: str, category: str) -> Supplier:
+                nonlocal next_number, created
+                found = suppliers.get(name.casefold())
+                if found:
+                    return found
+                while f"SUP-{next_number:04d}" in used_codes:
+                    next_number += 1
+                supplier = Supplier(code=f"SUP-{next_number:04d}", name=name, category=category or "General", country="-",
+                                    status="Approved", risk="Medium")
+                used_codes.add(supplier.code)
+                db.add(supplier)
+                db.flush()
+                suppliers[name.casefold()] = supplier
+                created += 1
+                return supplier
+
+            for row_number, row in enumerate(rows, start=2):
+                code, name = text(row, "material_code"), text(row, "supplier_name")
+                if not code or not name:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code and supplier_name are required")
+                material = items.get(code.casefold())
+                if not material:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code {code!r} is not in Material Master")
+                if material.id not in reasons:
+                    reasons[material.id] = not_purchased_reason(db, material.id)
+                if reasons[material.id]:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {material.code} {reasons[material.id]}, so it cannot have a supplier")
+                tier = text(row, "tier") or "Direct"
+                parent_name = text(row, "parent_supplier_name")
+                if tier != "Direct" and not parent_name:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: tier {tier} needs parent_supplier_name (the supplier it supplies)")
+                sob = number(row, "sob_percent", 100, row_number)
+                if sob > 100:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: sob_percent cannot exceed 100")
+                price = number(row, "unit_price", 0, row_number)
+                if price and not can_price:
+                    raise HTTPException(status_code=403, detail="Price access is required to upload part prices")
+                currency = (text(row, "currency") or "INR").upper()
+                if not re.fullmatch(r"[A-Z]{3}", currency):
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: currency must be a 3-letter code such as INR")
+                price_mode = text(row, "price_mode") or "spot"
+                if price_mode not in {"spot", "fixed_monthly", "every_n_months"}:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: price_mode must be spot, fixed_monthly or every_n_months")
+                supplier = supplier_for(name, material.category)
+                parent = supplier_for(parent_name, material.category) if parent_name else None
+                key = (material.id, supplier.id, tier, parent.id if parent else None)
+                if key in seen:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {material.code} / {supplier.name} / {tier} is repeated in the file")
+                seen.add(key)
+                values = {
+                    "sob_percent": sob, "unit_price": price, "currency": currency,
+                    "lead_time_days": int(number(row, "lead_time_days", 0, row_number)), "moq": number(row, "moq", 0, row_number),
+                    "buffer_days": int(number(row, "buffer_days", 0, row_number)), "price_mode": price_mode,
+                    "price_interval_months": max(1, int(number(row, "price_interval_months", 1, row_number))),
+                }
+                link = existing.get(key)
+                if link:
+                    for field_name, value in values.items():
+                        setattr(link, field_name, value)
+                    updated += 1
+                else:
+                    link = SupplierPart(material_id=material.id, supplier_id=supplier.id, tier=tier, parent_supplier_id=key[3], **values)
+                    db.add(link)
+                    existing[key] = link
+                    added += 1
+            # SOB within a material + tier + parent-supplier route cannot exceed 100 %
+            db.flush()
+            totals: dict[tuple, float] = {}
+            for link in existing.values():
+                route = (link.material_id, link.tier, link.parent_supplier_id)
+                totals[route] = totals.get(route, 0) + link.sob_percent
+            over = [route for route, total in totals.items() if total > 100.0001]
+            if over:
+                material = db.get(Item, over[0][0])
+                db.rollback()
+                raise HTTPException(status_code=422, detail=f"SOB for {material.code} ({over[0][1]}) adds up to more than 100% after this upload")
+            db.commit()
+            return {"rows": len(rows), "added": added, "updated": updated, "suppliers_created": created}
 
     @app.patch("/api/planning/supplier-parts/{link_id}")
     def update_supplier_part(link_id: int, payload: dict, request: Request):
@@ -2319,6 +2456,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             "actuals": ["model_code", "actual_quantity", "oem_stock"],
             "own-stock": ["material_code", "quantity"],
             "supplier-stock": ["supplier_code", "material_code", "tier", "parent_supplier_code", "quantity", "available_quantity", "arrival_month"],
+            "supplier-parts": ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency",
+                               "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months"],
         }
         bom_templates = {
             "bom-oem": ["model_code", "material_code", "quantity", "uom"],
