@@ -256,6 +256,52 @@ class PlanningPO(Base):
     change_note: Mapped[str] = mapped_column(Text, default="")
 
 
+class SupplierMaterial(Base):
+    """A supplier's own material code (e.g. Iljin's solder wire), used only in that
+    supplier's BOMs for cost breakdown."""
+    __tablename__ = "supplier_materials"
+    __table_args__ = (UniqueConstraint("supplier_id", "code"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id", ondelete="CASCADE"), index=True)
+    code: Mapped[str] = mapped_column(String(48), index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    uom: Mapped[str] = mapped_column(String(24), default="ea")
+    unit_price: Mapped[float] = mapped_column(Float, default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="INR")
+
+
+class SupplierBOMLine(Base):
+    """One line of a supplier's BOM for a part you buy from them (cost breakdown only).
+    parent_line_id empty = L1 line under the bought part; L2 / L3 lines hang below."""
+    __tablename__ = "supplier_bom_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id", ondelete="CASCADE"), index=True)
+    product_material_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
+    parent_line_id: Mapped[int | None] = mapped_column(ForeignKey("supplier_bom_lines.id", ondelete="CASCADE"), nullable=True, index=True)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id"), nullable=True)
+    supplier_material_id: Mapped[int | None] = mapped_column(ForeignKey("supplier_materials.id"), nullable=True)
+    quantity: Mapped[float] = mapped_column(Float)
+    unit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+
+
+class SupplierBOMLineSource(Base):
+    """Who supplies a supplier BOM line to the supplier (a sub-supplier from the Supplier
+    register) and under which code (same code or an alternate), at what price and SOB."""
+    __tablename__ = "supplier_bom_line_sources"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    line_id: Mapped[int] = mapped_column(ForeignKey("supplier_bom_lines.id", ondelete="CASCADE"), index=True)
+    sub_supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id"), nullable=True)
+    supplier_material_id: Mapped[int | None] = mapped_column(ForeignKey("supplier_materials.id"), nullable=True)
+    unit_price: Mapped[float] = mapped_column(Float, default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="INR")
+    sob_percent: Mapped[float] = mapped_column(Float, default=100)
+
+
 class MaterialTransfer(Base):
     __tablename__ = "material_transfers"
 
@@ -316,6 +362,41 @@ class ModelBOMInput(BaseModel):
     material_id: int
     quantity: float = Field(gt=0, le=1_000_000_000)
     uom: str = Field(default="ea", min_length=1, max_length=24)
+
+
+class SupplierMaterialInput(BaseModel):
+    supplier_id: int
+    code: str = Field(min_length=1, max_length=48)
+    name: str = Field(min_length=1, max_length=180)
+    uom: str = Field(default="ea", min_length=1, max_length=24)
+    unit_price: float = Field(default=0, ge=0, allow_inf_nan=False)
+    currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
+
+
+class SupplierBOMLineInput(BaseModel):
+    supplier_id: int
+    material_id: int
+    parent_line_id: int | None = None
+    item_id: int | None = None
+    supplier_material_id: int | None = None
+    quantity: float = Field(ge=-1_000_000_000, le=1_000_000_000, allow_inf_nan=False)
+    unit_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+
+class SupplierBOMLineUpdate(BaseModel):
+    quantity: float = Field(ge=-1_000_000_000, le=1_000_000_000, allow_inf_nan=False)
+    unit_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+
+class SupplierBOMSourceInput(BaseModel):
+    sub_supplier_id: int | None = None
+    item_id: int | None = None
+    supplier_material_id: int | None = None
+    unit_price: float = Field(default=0, ge=0, allow_inf_nan=False)
+    currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
+    sob_percent: float = Field(gt=0, le=100, allow_inf_nan=False)
 
 
 class NewPartBOMLine(BaseModel):
@@ -461,7 +542,24 @@ SUPPLIER_PART_COLUMN_ALIASES = {
 }
 
 
-def _read_supplier_part_sheet(raw: bytes) -> list[dict[str, Any]]:
+SUPPLIER_MATERIAL_COLUMN_ALIASES = {
+    "code": "code", "material_code": "code", "part_code": "code", "item_code": "code",
+    "name": "name", "material_name": "name", "part_name": "name", "description": "name",
+    "unit": "uom", "uom": "uom", "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price", "currency": "currency",
+}
+SUPPLIER_BOM_COLUMN_ALIASES = {
+    "parent_code": "parent_code", "parent": "parent_code", "parent_part_code": "parent_code",
+    "code": "code", "part_code": "code", "material_code": "code", "component_code": "code",
+    "quantity": "quantity", "qty": "quantity", "quantity_per_parent": "quantity",
+    "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price", "source": "source",
+}
+
+
+def _read_flexible_sheet(raw: bytes, aliases: dict[str, str], required: set[str]) -> list[dict[str, Any]]:
+    return _read_supplier_part_sheet(raw, aliases, required)
+
+
+def _read_supplier_part_sheet(raw: bytes, aliases: dict[str, str] | None = None, required: set[str] | None = None) -> list[dict[str, Any]]:
     """Relationship sheet as the user keeps it: heading row anywhere in the first 30 rows
     (title rows above are skipped), column names like "Material code" / "Supplier Name" /
     "Unit cost" accepted, other columns (Material name, Category, On hand ...) ignored."""
@@ -477,12 +575,15 @@ def _read_supplier_part_sheet(raw: bytes) -> list[dict[str, Any]]:
     def key(value: Any) -> str:
         return re.sub(r"\s+", "_", str(value or "").strip().lower())
 
+    aliases = aliases or SUPPLIER_PART_COLUMN_ALIASES
+    required = required or {"material_code", "supplier_name"}
     for header_index, line in enumerate(lines[:30]):
-        columns = {index: SUPPLIER_PART_COLUMN_ALIASES[key(value)] for index, value in enumerate(line) if key(value) in SUPPLIER_PART_COLUMN_ALIASES}
-        if {"material_code", "supplier_name"} <= set(columns.values()):
+        columns = {index: aliases[key(value)] for index, value in enumerate(line) if key(value) in aliases}
+        if required <= set(columns.values()):
             break
     else:
-        raise HTTPException(status_code=422, detail="Could not find the heading row: the sheet needs a 'Material code' and a 'Supplier name' column")
+        names = " and ".join(f"'{name.replace('_', ' ').capitalize()}'" for name in sorted(required))
+        raise HTTPException(status_code=422, detail=f"Could not find the heading row: the sheet needs {names} columns")
     if len(set(columns.values())) != len(columns):
         raise HTTPException(status_code=422, detail="The Excel sheet has the same column twice (e.g. 'Unit cost' and 'Unit price')")
     rows = []
@@ -1525,42 +1626,49 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             model = db.get(ProductModel, model_id)
             if not model:
                 raise HTTPException(status_code=404, detail="Model not found")
-            items, _ = _item_map(db)
-            roots = db.scalars(select(ModelBOM).where(ModelBOM.model_id == model_id).order_by(ModelBOM.id)).all()
-            root_material_ids = [root.material_id for root in roots]
-            parents_with_bom = set(db.scalars(
-                select(BOMComponent.parent_item_id)
-                .where(BOMComponent.parent_item_id.in_(root_material_ids))
-                .distinct()
-            ).all()) if root_material_ids else set()
-            rows = []
-            for root in roots:
-                item = items.get(root.material_id)
-                if not item:
-                    continue
-                rows.append({
-                    "level": 1,
-                    "material_id": item.id,
-                    "code": item.code,
-                    "name": item.name,
-                    "quantity": root.quantity,
-                    "uom": item.uom,
-                    "root_bom_id": root.id,
-                    "component_id": None,
-                    "parent_item_id": None,
-                    "edit_quantity": root.quantity,
-                    "has_bom": item.id in parents_with_bom,
-                })
-
+            rows = model_bom_rows(db, [model_id], _check_price_access(request))[model_id]
             if search.strip():
                 needle = search.strip().lower()
                 rows = [r for r in rows if needle in r["code"].lower() or needle in r["name"].lower()]
-            can_price = _check_price_access(request)
-            if can_price:
-                price = bom_price_lookup(db)
-                for row in rows:
-                    row.update(price(items[row["material_id"]]))
             return {"model_id": model_id, "model_code": model.code, "model_name": model.name, "tab": tab, "total": len(rows), "offset": offset, "limit": limit, "items": rows[offset:offset + limit]}
+
+    @app.get("/api/planning/model-boms")
+    def get_model_boms(request: Request, model_id: list[int] = Query(default=[])):
+        """Level 1 lines of many models in one request (the Level 1 tab shows 50 models a page)."""
+        current_user(request)
+        if len(model_id) > 200:
+            raise HTTPException(status_code=422, detail="Ask for at most 200 models at a time")
+        with open_db() as db:
+            models = {model.id: model for model in db.scalars(select(ProductModel).where(ProductModel.id.in_(model_id))).all()} if model_id else {}
+            rows = model_bom_rows(db, list(models), _check_price_access(request))
+            return {"models": [{"model_id": mid, "model_code": models[mid].code, "model_name": models[mid].name, "items": rows[mid]}
+                               for mid in model_id if mid in models]}
+
+    def model_bom_rows(db: Session, model_ids: list[int], can_price: bool) -> dict[int, list[dict]]:
+        result: dict[int, list[dict]] = {mid: [] for mid in model_ids}
+        if not model_ids:
+            return result
+        roots = db.scalars(select(ModelBOM).where(ModelBOM.model_id.in_(model_ids)).order_by(ModelBOM.id)).all()
+        material_ids = {root.material_id for root in roots}
+        items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(material_ids))).all()} if material_ids else {}
+        parents_with_bom = set(db.scalars(
+            select(BOMComponent.parent_item_id).where(BOMComponent.parent_item_id.in_(material_ids)).distinct()
+        ).all()) if material_ids else set()
+        price = bom_price_lookup(db, material_ids) if can_price else None
+        for root in roots:
+            item = items.get(root.material_id)
+            if not item:
+                continue
+            row = {
+                "level": 1, "material_id": item.id, "code": item.code, "name": item.name,
+                "quantity": root.quantity, "uom": item.uom, "root_bom_id": root.id,
+                "component_id": None, "parent_item_id": None, "edit_quantity": root.quantity,
+                "has_bom": item.id in parents_with_bom,
+            }
+            if price:
+                row.update(price(item))
+            result[root.model_id].append(row)
+        return result
 
     @app.post("/api/planning/model-bom/{model_id}", status_code=201)
     def add_model_bom(model_id: int, payload: ModelBOMInput, request: Request):
@@ -1628,15 +1736,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         generated = select(BOMComponent.child_item_id).where(BOMComponent.quantity < 0)
         return statement.where(Item.id.not_in(made), Item.id.not_in(generated))
 
-    def bom_price_lookup(db: Session):
+    def bom_price_lookup(db: Session, material_ids: Iterable[int] | None = None):
         """BOM part price = SOB-weighted price of the code's Direct suppliers:
         sum(price x SOB) / sum(SOB). Falls back to the Material Master price when no Direct
         supplier has a price, or when the suppliers quote in different currencies."""
         links: dict[int, list[SupplierPart]] = {}
-        for link in db.scalars(select(SupplierPart).where(
+        statement = select(SupplierPart).where(
             SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None),
             SupplierPart.sob_percent > 0, SupplierPart.unit_price > 0,
-        )).all():
+        )
+        if material_ids is not None:
+            statement = statement.where(SupplierPart.material_id.in_(list(material_ids)))
+        for link in db.scalars(statement).all():
             links.setdefault(link.material_id, []).append(link)
 
         def price(item: Item) -> dict:
@@ -1704,8 +1815,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if not parent:
                 raise HTTPException(status_code=404, detail="Parent part not found")
             links = db.scalars(select(BOMComponent).where(BOMComponent.parent_item_id == parent_material_id).order_by(BOMComponent.id)).all()
-            items_by_id = {item.id: item for item in db.scalars(select(Item)).all()}
             child_ids = [link.child_item_id for link in links]
+            items_by_id = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(child_ids))).all()} if child_ids else {}
             parents_with_bom = set(db.scalars(
                 select(BOMComponent.parent_item_id)
                 .where(BOMComponent.parent_item_id.in_(child_ids))
@@ -1728,7 +1839,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 rows = [row for row in rows if name_needle in row["name"].casefold()]
             can_price = _check_price_access(request)
             if can_price:
-                price = bom_price_lookup(db)
+                price = bom_price_lookup(db, child_ids)
                 for row in rows:
                     row.update(price(items_by_id[row["material_id"]]))
             return {
@@ -1766,7 +1877,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 .distinct()
             ).all()) if child_ids else set()
             can_price = _check_price_access(request)
-            price = bom_price_lookup(db)
+            price = bom_price_lookup(db, child_ids)
             rows = []
             for link, parent_code, parent_name in links:
                 child = children_by_id.get(link.child_item_id)
@@ -2149,6 +2260,470 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=422, detail=f"SOB for {material.code} ({over[0][1]}) adds up to more than 100% after this upload")
             db.commit()
             return {"rows": len(rows), "added": added, "updated": updated, "suppliers_created": created}
+
+    # ------------------------------------------------------------------ supplier materials
+    def supplier_material_json(material: SupplierMaterial, can_price: bool) -> dict:
+        data = {"id": material.id, "supplier_id": material.supplier_id, "code": material.code, "name": material.name, "uom": material.uom}
+        if can_price:
+            data.update(unit_price=material.unit_price, currency=material.currency)
+        return data
+
+    @app.get("/api/planning/supplier-materials")
+    def list_supplier_materials(request: Request, supplier_id: int, search: str = "", offset: int = 0, limit: int = 100):
+        current_user(request)
+        if limit < 1 or limit > 1000 or offset < 0:
+            raise HTTPException(status_code=422, detail="Use limit 1–1000 and a non-negative offset")
+        with open_db() as db:
+            statement = select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id).order_by(SupplierMaterial.code)
+            if search.strip():
+                like = f"%{search.strip()}%"
+                statement = statement.where(SupplierMaterial.code.ilike(like) | SupplierMaterial.name.ilike(like))
+            total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+            can_price = _check_price_access(request)
+            return {"total": total, "offset": offset, "limit": limit,
+                    "items": [supplier_material_json(m, can_price) for m in db.scalars(statement.offset(offset).limit(limit)).all()]}
+
+    def check_supplier_material(db: Session, payload: SupplierMaterialInput, request: Request, current_id: int | None = None) -> str:
+        if not db.get(Supplier, payload.supplier_id):
+            raise HTTPException(status_code=404, detail="Supplier not found")
+        if payload.unit_price and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a price")
+        code = payload.code.strip()
+        clash = db.scalar(select(SupplierMaterial.id).where(
+            SupplierMaterial.supplier_id == payload.supplier_id, func.lower(SupplierMaterial.code) == code.lower()))
+        if clash and clash != current_id:
+            raise HTTPException(status_code=409, detail=f"{code} already exists in this supplier's material list")
+        return code
+
+    @app.post("/api/planning/supplier-materials", status_code=201)
+    def add_supplier_material(payload: SupplierMaterialInput, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            code = check_supplier_material(db, payload, request)
+            material = SupplierMaterial(supplier_id=payload.supplier_id, code=code, name=payload.name.strip(), uom=payload.uom.strip(),
+                                        unit_price=payload.unit_price, currency=payload.currency)
+            db.add(material)
+            db.commit()
+            return supplier_material_json(material, True)
+
+    @app.patch("/api/planning/supplier-materials/{material_id}")
+    def update_supplier_material(material_id: int, payload: SupplierMaterialInput, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            material = db.get(SupplierMaterial, material_id)
+            if not material or material.supplier_id != payload.supplier_id:
+                raise HTTPException(status_code=404, detail="Supplier material not found")
+            material.code = check_supplier_material(db, payload, request, material.id)
+            material.name, material.uom = payload.name.strip(), payload.uom.strip()
+            if _check_price_access(request):
+                material.unit_price, material.currency = payload.unit_price, payload.currency
+            db.commit()
+            return supplier_material_json(material, True)
+
+    @app.delete("/api/planning/supplier-materials/{material_id}", status_code=204)
+    def delete_supplier_material(material_id: int, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            material = db.get(SupplierMaterial, material_id)
+            if not material:
+                raise HTTPException(status_code=404, detail="Supplier material not found")
+            used = db.scalar(select(SupplierBOMLine.id).where(SupplierBOMLine.supplier_material_id == material_id).limit(1)) or \
+                db.scalar(select(SupplierBOMLineSource.id).where(SupplierBOMLineSource.supplier_material_id == material_id).limit(1))
+            if used:
+                raise HTTPException(status_code=409, detail=f"{material.code} is used in a supplier BOM; remove it there first")
+            db.delete(material)
+            db.commit()
+            return Response(status_code=204)
+
+    @app.post("/api/planning/supplier-materials/upload", status_code=201)
+    async def upload_supplier_materials(request: Request, supplier_id: int):
+        """A supplier's own material list from Excel (heading row found automatically):
+        Code, Name, Unit, Unit price / Unit cost, Currency. Existing codes are updated."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = _read_flexible_sheet(await request.body(), SUPPLIER_MATERIAL_COLUMN_ALIASES, {"code", "name"})
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            if not db.get(Supplier, supplier_id):
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            existing = {m.code.lower(): m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id)).all()}
+            seen: set[str] = set()
+            added = updated = 0
+            for row in rows:
+                number_text = row["_excel_row"]
+                code = str(row.get("code") or "").strip()
+                name = str(row.get("name") or "").strip()
+                if not code or not name:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: code and name are required")
+                if code.lower() in seen:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: {code} is repeated in the file")
+                seen.add(code.lower())
+                try:
+                    price = float(row.get("unit_price") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be a number") from exc
+                if price < 0 or not math.isfinite(price):
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be zero or more")
+                if price and not can_price:
+                    raise HTTPException(status_code=403, detail="Price access is required to upload prices")
+                currency = str(row.get("currency") or "INR").strip().upper()
+                if not re.fullmatch(r"[A-Z]{3}", currency):
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: currency must be a 3-letter code such as INR")
+                uom = str(row.get("uom") or "ea").strip() or "ea"
+                material = existing.get(code.lower())
+                if material:
+                    material.name, material.uom = name, uom
+                    if can_price:
+                        material.unit_price, material.currency = price, currency
+                    updated += 1
+                else:
+                    db.add(SupplierMaterial(supplier_id=supplier_id, code=code, name=name, uom=uom, unit_price=price, currency=currency))
+                    added += 1
+            db.commit()
+            return {"rows": len(rows), "added": added, "updated": updated}
+
+    # ------------------------------------------------------------------ supplier BOM (cost breakdown)
+    def supplier_bom_view(db: Session, supplier_id: int, material_id: int, can_price: bool) -> dict:
+        supplier, product = db.get(Supplier, supplier_id), db.get(Item, material_id)
+        if not supplier or not product:
+            raise HTTPException(status_code=404, detail="Supplier or part not found")
+        quote = db.scalar(select(SupplierPart).where(
+            SupplierPart.material_id == material_id, SupplierPart.supplier_id == supplier_id,
+            SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None)))
+        lines = db.scalars(select(SupplierBOMLine).where(
+            SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLine.product_material_id == material_id).order_by(SupplierBOMLine.id)).all()
+        line_ids = [line.id for line in lines]
+        sources: dict[int, list[SupplierBOMLineSource]] = {}
+        if line_ids:
+            for source in db.scalars(select(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id.in_(line_ids)).order_by(SupplierBOMLineSource.id)).all():
+                sources.setdefault(source.line_id, []).append(source)
+        item_ids = {line.item_id for line in lines if line.item_id} | {src.item_id for group in sources.values() for src in group if src.item_id}
+        own_ids = {line.supplier_material_id for line in lines if line.supplier_material_id} | {src.supplier_material_id for group in sources.values() for src in group if src.supplier_material_id}
+        sub_ids = {src.sub_supplier_id for group in sources.values() for src in group if src.sub_supplier_id}
+        items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(item_ids))).all()} if item_ids else {}
+        owns = {m.id: m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.id.in_(own_ids))).all()} if own_ids else {}
+        subs = {sub.id: sub for sub in db.scalars(select(Supplier).where(Supplier.id.in_(sub_ids))).all()} if sub_ids else {}
+        children: dict[int | None, list[SupplierBOMLine]] = {}
+        for line in lines:
+            children.setdefault(line.parent_line_id, []).append(line)
+        base_currency = quote.currency if quote else (product.currency or "INR")
+
+        def describe(item_id: int | None, own_id: int | None) -> dict:
+            if item_id and item_id in items:
+                item = items[item_id]
+                return {"kind": "our", "id": item.id, "code": item.code, "name": item.name, "uom": item.uom, "price": item.unit_cost, "currency": item.currency}
+            own = owns.get(own_id)
+            return {"kind": "supplier", "id": own.id if own else None, "code": own.code if own else "?", "name": own.name if own else "?",
+                    "uom": own.uom if own else "", "price": own.unit_price if own else 0, "currency": own.currency if own else base_currency}
+
+        rows: list[dict] = []
+
+        def unit_cost(line: SupplierBOMLine, depth: int) -> tuple[float, str, str, bool]:
+            """(unit cost, currency, price source, currency mismatch) of one unit of this line."""
+            component = describe(line.item_id, line.supplier_material_id)
+            row = {"id": line.id, "parent_line_id": line.parent_line_id, "depth": depth, "level": f"L{depth}",
+                   "component": {key: component[key] for key in ("kind", "id", "code", "name", "uom")}, "quantity": line.quantity,
+                   "entered_price": line.unit_price, "entered_currency": line.currency,
+                   "sources": [{"id": src.id, "sub_supplier_id": src.sub_supplier_id, "sub_supplier": subs[src.sub_supplier_id].name if src.sub_supplier_id in subs else "",
+                                "alternate": (lambda c: None if not (src.item_id or src.supplier_material_id) else {key: c[key] for key in ("kind", "id", "code", "name")})(describe(src.item_id, src.supplier_material_id)),
+                                "unit_price": src.unit_price, "currency": src.currency, "sob_percent": src.sob_percent} for src in sources.get(line.id, [])]}
+            rows.append(row)
+            kids = children.get(line.id, [])
+            if kids:
+                total, skipped = 0.0, []
+                for kid in kids:
+                    cost, currency, _, _ = unit_cost(kid, depth + 1)
+                    if currency == base_currency:
+                        total += kid.quantity * cost
+                    else:
+                        skipped.append(kid.id)
+                price, currency, source = total, base_currency, "Sum of lines below"
+            elif sources.get(line.id) and len({src.currency for src in sources[line.id]}) == 1:
+                group = sources[line.id]
+                share = sum(src.sob_percent for src in group)
+                price = sum(src.unit_price * src.sob_percent for src in group) / share
+                currency, source = group[0].currency, f"SOB-weighted ({len(group)} source{'s' if len(group) > 1 else ''})"
+            elif line.unit_price is not None:
+                price, currency, source = line.unit_price, line.currency or component["currency"], "Entered on line"
+            else:
+                price, currency = component["price"], component["currency"]
+                source = "Our Material Master" if component["kind"] == "our" else "Supplier material list"
+                if sources.get(line.id):
+                    source += " (sources in different currencies)"
+            row.update(has_children=bool(kids), unit_price=price, currency=currency, price_source=source,
+                       line_cost=line.quantity * price, currency_mismatch=currency != base_currency)
+            return price, currency, source, currency != base_currency
+
+        should_cost = 0.0
+        for line in children.get(None, []):
+            cost, currency, _, _ = unit_cost(line, 1)
+            if currency == base_currency:
+                should_cost += line.quantity * cost
+        result = {
+            "supplier": {"id": supplier.id, "code": supplier.code, "name": supplier.name},
+            "product": {"id": product.id, "code": product.code, "name": product.name, "uom": product.uom},
+            "lines": rows, "currency": base_currency,
+            "excluded_lines": [row["id"] for row in rows if row["currency_mismatch"]],
+        }
+        if can_price:
+            result.update(should_cost=should_cost,
+                          quoted_price=quote.unit_price if quote else None,
+                          gap=(quote.unit_price - should_cost) if quote else None)
+        else:
+            for row in rows:
+                for key in ("unit_price", "line_cost", "entered_price"):
+                    row.pop(key, None)
+                for src in row["sources"]:
+                    src.pop("unit_price", None)
+        return result
+
+    @app.get("/api/planning/supplier-bom/products")
+    def supplier_bom_products(request: Request, supplier_id: int):
+        """Parts you buy from this supplier (Direct relationships), with BOM flag."""
+        current_user(request)
+        with open_db() as db:
+            links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == "Direct",
+                                                          SupplierPart.parent_supplier_id.is_(None))).all()
+            ids = sorted({link.material_id for link in links})
+            items = db.scalars(select(Item).where(Item.id.in_(ids)).order_by(Item.code)).all() if ids else []
+            with_bom = set(db.scalars(select(SupplierBOMLine.product_material_id).where(
+                SupplierBOMLine.supplier_id == supplier_id).distinct()).all())
+            return {"items": [{"id": item.id, "code": item.code, "name": item.name, "uom": item.uom, "has_bom": item.id in with_bom} for item in items]}
+
+    @app.get("/api/planning/supplier-bom")
+    def get_supplier_bom(request: Request, supplier_id: int, material_id: int):
+        current_user(request)
+        with open_db() as db:
+            return supplier_bom_view(db, supplier_id, material_id, _check_price_access(request))
+
+    def check_component(db: Session, supplier_id: int, item_id: int | None, own_id: int | None, label: str) -> None:
+        if bool(item_id) == bool(own_id):
+            raise HTTPException(status_code=422, detail=f"{label}: choose one part, from your Material Master or from the supplier's list")
+        if item_id and not db.get(Item, item_id):
+            raise HTTPException(status_code=422, detail=f"{label}: part is not in your Material Master")
+        if own_id:
+            own = db.get(SupplierMaterial, own_id)
+            if not own or own.supplier_id != supplier_id:
+                raise HTTPException(status_code=422, detail=f"{label}: part is not in this supplier's material list")
+
+    def line_depth(db: Session, line: SupplierBOMLine | None) -> int:
+        depth = 0
+        while line is not None:
+            depth += 1
+            line = db.get(SupplierBOMLine, line.parent_line_id) if line.parent_line_id else None
+        return depth
+
+    @app.post("/api/planning/supplier-bom/lines", status_code=201)
+    def add_supplier_bom_line(payload: SupplierBOMLineInput, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        if payload.quantity == 0:
+            raise HTTPException(status_code=422, detail="Quantity cannot be zero")
+        if payload.unit_price is not None and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a price")
+        with open_db() as db:
+            if not db.get(Supplier, payload.supplier_id) or not db.get(Item, payload.material_id):
+                raise HTTPException(status_code=404, detail="Supplier or part not found")
+            reason = not_purchased_reason(db, payload.material_id)
+            if reason:
+                raise HTTPException(status_code=422, detail=f"{db.get(Item, payload.material_id).code} {reason}; supplier BOMs are only for parts you buy")
+            parent = None
+            if payload.parent_line_id is not None:
+                parent = db.get(SupplierBOMLine, payload.parent_line_id)
+                if not parent or parent.supplier_id != payload.supplier_id or parent.product_material_id != payload.material_id:
+                    raise HTTPException(status_code=404, detail="Parent line not found in this supplier BOM")
+                if line_depth(db, parent) >= 3:
+                    raise HTTPException(status_code=422, detail="Supplier BOMs go down to L3; an L3 line cannot have lines below it")
+            check_component(db, payload.supplier_id, payload.item_id, payload.supplier_material_id, "Line")
+            line = SupplierBOMLine(supplier_id=payload.supplier_id, product_material_id=payload.material_id, parent_line_id=payload.parent_line_id,
+                                   item_id=payload.item_id, supplier_material_id=payload.supplier_material_id, quantity=payload.quantity,
+                                   unit_price=payload.unit_price, currency=payload.currency)
+            db.add(line)
+            db.commit()
+            return {"id": line.id}
+
+    @app.patch("/api/planning/supplier-bom/lines/{line_id}")
+    def update_supplier_bom_line(line_id: int, payload: SupplierBOMLineUpdate, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        if payload.quantity == 0:
+            raise HTTPException(status_code=422, detail="Quantity cannot be zero")
+        with open_db() as db:
+            line = db.get(SupplierBOMLine, line_id)
+            if not line:
+                raise HTTPException(status_code=404, detail="Supplier BOM line not found")
+            line.quantity = payload.quantity
+            if _check_price_access(request):
+                line.unit_price, line.currency = payload.unit_price, payload.currency
+            db.commit()
+            return {"id": line.id}
+
+    @app.delete("/api/planning/supplier-bom/lines/{line_id}", status_code=204)
+    def delete_supplier_bom_line(line_id: int, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            line = db.get(SupplierBOMLine, line_id)
+            if not line:
+                raise HTTPException(status_code=404, detail="Supplier BOM line not found")
+            pending, doomed = [line.id], []
+            while pending:  # the line and every line below it
+                current = pending.pop()
+                doomed.append(current)
+                pending.extend(db.scalars(select(SupplierBOMLine.id).where(SupplierBOMLine.parent_line_id == current)).all())
+            db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id.in_(doomed)))
+            for current in reversed(doomed):
+                db.execute(delete(SupplierBOMLine).where(SupplierBOMLine.id == current))
+            db.commit()
+            return Response(status_code=204)
+
+    @app.put("/api/planning/supplier-bom/lines/{line_id}/sources")
+    def set_supplier_bom_sources(line_id: int, payload: list[SupplierBOMSourceInput], request: Request):
+        """Replace the sub-suppliers / alternate codes of a line. SOB in total at most 100%."""
+        current_user(request)
+        _check_supply_role(request)
+        if any(src.unit_price for src in payload) and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a price")
+        if sum(src.sob_percent for src in payload) > 100.0001:
+            raise HTTPException(status_code=422, detail="SOB of the sources adds up to more than 100%")
+        with open_db() as db:
+            line = db.get(SupplierBOMLine, line_id)
+            if not line:
+                raise HTTPException(status_code=404, detail="Supplier BOM line not found")
+            if db.scalar(select(SupplierBOMLine.id).where(SupplierBOMLine.parent_line_id == line_id).limit(1)):
+                raise HTTPException(status_code=422, detail="This line has lines below it; its price is their sum, so it takes no sources")
+            for number, src in enumerate(payload, start=1):
+                if src.sub_supplier_id is not None and not db.get(Supplier, src.sub_supplier_id):
+                    raise HTTPException(status_code=422, detail=f"Source {number}: sub-supplier not found in the Supplier register")
+                if src.item_id or src.supplier_material_id:
+                    check_component(db, line.supplier_id, src.item_id, src.supplier_material_id, f"Source {number} alternate")
+            db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id == line_id))
+            for src in payload:
+                db.add(SupplierBOMLineSource(line_id=line_id, **src.model_dump()))
+            db.commit()
+            return {"line_id": line_id, "sources": len(payload)}
+
+    @app.post("/api/planning/supplier-bom/upload", status_code=201)
+    async def upload_supplier_bom(request: Request, supplier_id: int, material_id: int):
+        """Replace a supplier BOM from Excel: Parent code (blank = L1), Code, Quantity,
+        Unit price (optional), Source (optional: our / supplier). A code is looked up in the
+        supplier's own list first, then in your Material Master."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = _read_flexible_sheet(await request.body(), SUPPLIER_BOM_COLUMN_ALIASES, {"code", "quantity"})
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            if not db.get(Supplier, supplier_id) or not db.get(Item, material_id):
+                raise HTTPException(status_code=404, detail="Supplier or part not found")
+            reason = not_purchased_reason(db, material_id)
+            if reason:
+                raise HTTPException(status_code=422, detail=f"{db.get(Item, material_id).code} {reason}; supplier BOMs are only for parts you buy")
+            own = {m.code.lower(): m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id)).all()}
+            ours = {item.code.lower(): item for item in db.scalars(select(Item)).all()}
+            parsed: list[dict] = []
+            by_code: dict[str, list[int]] = {}
+            for row in rows:
+                number_text = row["_excel_row"]
+                code = str(row.get("code") or "").strip()
+                parent_code = str(row.get("parent_code") or "").strip()
+                source = str(row.get("source") or "").strip().lower()
+                if not code:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: code is required")
+                if source in {"supplier", "supplier material", "their"}:
+                    target = ("supplier", own.get(code.lower()))
+                elif source in {"our", "ours", "material master", "oem"}:
+                    target = ("our", ours.get(code.lower()))
+                elif source:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: source must be 'our' or 'supplier'")
+                else:
+                    target = ("supplier", own[code.lower()]) if code.lower() in own else ("our", ours.get(code.lower()))
+                if target[1] is None:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: {code} is not in the supplier's material list or your Material Master")
+                try:
+                    quantity = float(row.get("quantity"))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: quantity must be a non-zero number") from exc
+                if quantity == 0 or not math.isfinite(quantity):
+                    raise HTTPException(status_code=422, detail=f"Row {number_text}: quantity must be a non-zero number")
+                price = row.get("unit_price")
+                if price is not None and str(price).strip() != "":
+                    try:
+                        price = float(price)
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be a number") from exc
+                    if price < 0:
+                        raise HTTPException(status_code=422, detail=f"Row {number_text}: unit price must be zero or more")
+                    if not can_price:
+                        raise HTTPException(status_code=403, detail="Price access is required to upload prices")
+                else:
+                    price = None
+                parent_index, depth = None, 1
+                if parent_code:
+                    matches = by_code.get(parent_code.lower(), [])
+                    if not matches:
+                        raise HTTPException(status_code=422, detail=f"Row {number_text}: parent code {parent_code} must appear on an earlier row")
+                    if len(matches) > 1:
+                        raise HTTPException(status_code=422, detail=f"Row {number_text}: parent code {parent_code} appears more than once above; it is ambiguous")
+                    parent_index = matches[0]
+                    depth = parsed[parent_index]["depth"] + 1
+                    if depth > 3:
+                        raise HTTPException(status_code=422, detail=f"Row {number_text}: supplier BOMs go down to L3")
+                by_code.setdefault(code.lower(), []).append(len(parsed))
+                parsed.append({"kind": target[0], "target": target[1], "quantity": quantity, "price": price, "parent": parent_index, "depth": depth})
+            old = db.scalars(select(SupplierBOMLine.id).where(SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLine.product_material_id == material_id)).all()
+            if old:
+                db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id.in_(old)))
+                db.execute(delete(SupplierBOMLine).where(SupplierBOMLine.id.in_(old)))
+            created: list[SupplierBOMLine] = []
+            for entry in parsed:
+                target = entry["target"]
+                line = SupplierBOMLine(supplier_id=supplier_id, product_material_id=material_id,
+                                       parent_line_id=created[entry["parent"]].id if entry["parent"] is not None else None,
+                                       item_id=target.id if entry["kind"] == "our" else None,
+                                       supplier_material_id=target.id if entry["kind"] == "supplier" else None,
+                                       quantity=entry["quantity"], unit_price=entry["price"],
+                                       currency=(target.currency if entry["price"] is not None else None))
+                db.add(line)
+                db.flush()
+                created.append(line)
+            db.commit()
+            return {"rows": len(parsed)}
+
+    @app.get("/api/planning/supplier-bom/{file_format}")
+    def export_supplier_bom(file_format: str, request: Request, supplier_id: int, material_id: int):
+        current_user(request)
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export format not supported")
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            view = supplier_bom_view(db, supplier_id, material_id, can_price)
+        headers = ["Level", "L1 code", "L1 name", "L2 code", "L2 name", "L3 code", "L3 name", "Source", "Quantity", "Unit"]
+        if can_price:
+            headers += ["Unit price", "Currency", "Line cost", "Price from"]
+        path: dict[int, list[str]] = {}
+        rows = []
+        for line in view["lines"]:
+            parent_path = path.get(line["parent_line_id"], [])
+            mine = parent_path + [line["component"]["code"], line["component"]["name"]]
+            path[line["id"]] = mine
+            values = [line["level"], *(mine + [""] * 6)[:6], "Supplier list" if line["component"]["kind"] == "supplier" else "Our Material Master",
+                      line["quantity"], line["component"]["uom"]]
+            if can_price:
+                values += [line["unit_price"], line["currency"], line["line_cost"], line["price_source"]]
+            rows.append({"depth": line["depth"] - 1, "has_children": line["has_children"], "values": values})
+        title = f"Supplier BOM {view['supplier']['name']} - {view['product']['code']}"
+        if can_price:
+            gap = "" if view["quoted_price"] is None else f" | quoted {view['quoted_price']:,.2f} | gap {view['gap']:,.2f}"
+            title += f" (should-cost {view['should_cost']:,.2f} {view['currency']}{gap})"
+        if file_format == "xlsx":
+            output, media_type = _bom_tree_workbook(title, headers, rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            output, media_type = _bom_tree_pdf(title, headers, rows), "application/pdf"
+        filename = f"supplier-bom-{view['supplier']['code']}-{view['product']['code']}.{file_format}".replace(" ", "-")
+        return StreamingResponse(output, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.patch("/api/planning/supplier-parts/{link_id}")
     def update_supplier_part(link_id: int, payload: dict, request: Request):
@@ -2807,8 +3382,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     if deeper:
                         part_lines(child.id, "l3", depth + 1, child_path)
 
+            roots_by_model: dict[int, list[ModelBOM]] = {}
+            for root in db.scalars(select(ModelBOM).order_by(ModelBOM.id)).all():
+                roots_by_model.setdefault(root.model_id, []).append(root)
+
             def model_lines(model: ProductModel, depth: int, path: dict) -> None:
-                for root in db.scalars(select(ModelBOM).where(ModelBOM.model_id == model.id).order_by(ModelBOM.id)).all():
+                for root in roots_by_model.get(model.id, []):
                     item = items.get(root.material_id)
                     if not item:
                         continue
@@ -2831,8 +3410,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         emit(0, "product", {"product": (product.code, product.name)}, False)
                     for model in product_models:
                         path = {"product": (product.code, product.name), "model": (model.code, model.name)}
-                        has_lines = db.scalar(select(ModelBOM.id).where(ModelBOM.model_id == model.id).limit(1)) is not None
-                        emit(0, "model", path, has_lines)
+                        emit(0, "model", path, bool(roots_by_model.get(model.id)))
                         model_lines(model, 1, path)
             elif tab == "Model BOM Level 1":
                 statement = select(ProductModel).order_by(ProductModel.code)

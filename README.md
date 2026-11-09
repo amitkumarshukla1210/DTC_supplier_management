@@ -36,6 +36,15 @@ If port 8000 is already occupied when using `start_app.bat`, the launcher starts
 
 Planning workbooks can be downloaded from the relevant page. API documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
+## Supplier materials and supplier BOM (cost breakdown)
+
+- **Supplier materials** tab: each supplier's own material codes (code, name, unit, price), by form or Excel upload (your own headings are fine).
+- **Supplier BOM** tab: for a part you buy from a supplier, the supplier's BOM down to L3. Lines use your Material Master codes or that supplier's own codes. Line cost = quantity × unit price; a line with lines below costs their sum. A line's unit price is the SOB-weighted price of its sources (sub-suppliers from the Supplier register, optionally under an alternate code), else the price entered on the line, else the material list price. The top shows should-cost, the supplier's quoted price and the gap. Lines priced in another currency are listed and not added. Excel upload (Parent code, Code, Quantity, Unit price, Source) and Excel/PDF download. Cost view only; planning is not affected.
+
+## Scale
+
+Tested with 1,000 suppliers, 10,000 materials, 1,000 models (20,000 Model BOM lines) and 9,400 supplier links: every screen opens in about a second. Model BOM Level 1 shows 50 models a page (one request), Material Master shows 500 materials a page with server search, and material pickers search the server. The load-test kit is in `tests/load/`.
+
 ## Access and deployment
 
 Admin users manage accounts and have full access. HOD, Sourcing, and Supply Chain roles can manage supplier controls and planning reports. Users can be individually granted part-price visibility; report exports also enforce that permission.

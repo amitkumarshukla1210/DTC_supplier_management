@@ -36,7 +36,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-page="suppliers"]');
   await page.waitForSelector("[data-supplier-tab]");
   const tabNames = await page.locator("[data-supplier-tab]").allTextContents();
-  check("Six Supplier tabs in the requested order", JSON.stringify(tabNames) === JSON.stringify(["Supplier/material relationship", "Upload supplier stock", "Supplier/material coverage", "Supplier register", "Supplier-to-supplier material transfer", "Transfer schedule"]), JSON.stringify(tabNames));
+  check("The six requested Supplier tabs in order, then Supplier materials and Supplier BOM", JSON.stringify(tabNames) === JSON.stringify(["Supplier/material relationship", "Upload supplier stock", "Supplier/material coverage", "Supplier register", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"]), JSON.stringify(tabNames));
   check("Only the open tab's section is shown", (await page.locator("#supplierPartForm").count()) === 1 && (await page.locator("#supplierStockForm").count()) === 0 && (await page.locator("#transferForm").count()) === 0);
 
   // Material picker: purchased parts only

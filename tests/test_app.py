@@ -1054,6 +1054,146 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIn("heading row", response.json()["detail"])
 
+    def test_supplier_materials_and_supplier_bom_cost_breakdown(self):
+        post = self.client.post
+        def material(code, name, uom="PCS", cost=0):
+            response = post("/api/planning/materials", json={"code": code, "name": name, "uom": uom, "unit_cost": cost, "currency": "INR"})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        pcb, chip, chip_neo, motor = material("SB-PCB", "PCB1"), material("SB-CHIP", "MicroChip", cost=500), material("SB-CHIPNEO", "MicroChipNeo"), material("SB-MOTOR", "Motor")
+        steel = material("SB-STEEL", "Steel", "kg")
+        model = post("/api/planning/models", json={"code": "SB-12000", "name": "Eva"}).json()["id"]
+        post(f"/api/planning/model-bom/{model}", json={"material_id": motor, "quantity": 1, "uom": "PCS"})
+        post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": steel, "quantity": 1}]})
+        def supplier(name):
+            response = post("/api/suppliers", json={"name": name, "category": "Electrical", "country": "India"})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        iljin, sub_a, sub_b, other = supplier("Iljin Noida"), supplier("Chip Maker A"), supplier("Chip Maker B"), supplier("Other PCB Co")
+        self.assertEqual(post("/api/planning/supplier-parts", json={"material_id": pcb, "supplier_id": iljin, "sob_percent": 100, "unit_price": 1800, "currency": "INR"}).status_code, 201)
+
+        # --- supplier materials: own list per supplier
+        def own(code, name, uom, price, supplier=iljin):
+            response = post("/api/planning/supplier-materials", json={"supplier_id": supplier, "code": code, "name": name, "uom": uom, "unit_price": price, "currency": "INR"})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["id"]
+        board, icset, solder, paste, flux = own("BRD", "Bare board", "PCS", 415), own("ICSET", "IC set", "SET", 0), own("SOLDER", "Solder wire", "kg", 900), own("PASTE", "Solder paste", "kg", 0), own("FLUX", "Flux", "kg", 20)
+        other_own = own("BRD", "Other's board", "PCS", 1, supplier=other)  # same code at another supplier is fine
+        self.assertEqual(post("/api/planning/supplier-materials", json={"supplier_id": iljin, "code": "brd", "name": "dup", "uom": "PCS"}).status_code, 409)
+        listed = self.client.get("/api/planning/supplier-materials", params={"supplier_id": iljin}).json()
+        self.assertEqual([m["code"] for m in listed["items"]], ["BRD", "FLUX", "ICSET", "PASTE", "SOLDER"])
+
+        # --- supplier BOM lines
+        def line(component, quantity, parent=None, price=None, our=False, supplier=iljin, product=pcb):
+            body = {"supplier_id": supplier, "material_id": product, "parent_line_id": parent, "quantity": quantity, "unit_price": price,
+                    ("item_id" if our else "supplier_material_id"): component}
+            return post("/api/planning/supplier-bom/lines", json=body)
+        l_board = line(board, 1).json()["id"]
+        l_icset = line(icset, 1).json()["id"]
+        l_chip = line(chip, 2, parent=l_icset, our=True).json()["id"]
+        l_solder = line(solder, 0.01, parent=l_icset).json()["id"]
+        l_paste = line(paste, 1, parent=l_icset).json()["id"]
+        l_flux = line(flux, 0.5, parent=l_paste).json()["id"]
+        # rules
+        self.assertEqual(line(flux, 1, parent=l_flux).status_code, 422, "no L4")
+        self.assertEqual(line(other_own, 1).status_code, 422, "other supplier's code")
+        self.assertEqual(line(board, 0).status_code, 422, "zero quantity")
+        self.assertEqual(line(board, 1, product=motor).status_code, 422, "in-house part cannot have a supplier BOM")
+        both = post("/api/planning/supplier-bom/lines", json={"supplier_id": iljin, "material_id": pcb, "quantity": 1, "item_id": chip, "supplier_material_id": board})
+        self.assertEqual(both.status_code, 422)
+
+        # sources on the MicroChip line: A 480 @ 60 %, B (alternate code) 520 @ 40 % -> 288 + 208 = 496
+        put = self.client.put
+        self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_chip}/sources", json=[
+            {"sub_supplier_id": sub_a, "unit_price": 480, "currency": "INR", "sob_percent": 60},
+            {"sub_supplier_id": sub_b, "item_id": chip_neo, "unit_price": 520, "currency": "INR", "sob_percent": 50}]).status_code, 422, "SOB > 100")
+        self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_icset}/sources", json=[
+            {"sub_supplier_id": sub_a, "unit_price": 1, "currency": "INR", "sob_percent": 100}]).status_code, 422, "parent line takes no sources")
+        self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_chip}/sources", json=[
+            {"sub_supplier_id": sub_a, "unit_price": 480, "currency": "INR", "sob_percent": 60},
+            {"sub_supplier_id": sub_b, "item_id": chip_neo, "unit_price": 520, "currency": "INR", "sob_percent": 40}]).status_code, 200)
+
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        rows = {row["id"]: row for row in view["lines"]}
+        self.assertEqual([row["component"]["code"] for row in view["lines"]], ["BRD", "ICSET", "SB-CHIP", "SOLDER", "PASTE", "FLUX"], "tree order")
+        self.assertEqual([rows[i]["level"] for i in (l_board, l_icset, l_chip, l_solder, l_paste, l_flux)], ["L1", "L1", "L2", "L2", "L2", "L3"])
+        self.assertAlmostEqual(rows[l_board]["line_cost"], 415)
+        self.assertAlmostEqual(rows[l_chip]["unit_price"], 496)
+        self.assertEqual(rows[l_chip]["price_source"], "SOB-weighted (2 sources)")
+        self.assertEqual(rows[l_chip]["sources"][1]["alternate"]["code"], "SB-CHIPNEO")
+        self.assertAlmostEqual(rows[l_chip]["line_cost"], 992)
+        self.assertAlmostEqual(rows[l_solder]["line_cost"], 9)
+        self.assertAlmostEqual(rows[l_paste]["line_cost"], 10)
+        self.assertEqual(rows[l_paste]["price_source"], "Sum of lines below")
+        self.assertAlmostEqual(rows[l_icset]["line_cost"], 1011)
+        self.assertAlmostEqual(view["should_cost"], 1426)
+        self.assertEqual(view["quoted_price"], 1800)
+        self.assertAlmostEqual(view["gap"], 374)
+
+        # entered price on a line overrides the list price; edit quantity
+        self.assertEqual(self.client.patch(f"/api/planning/supplier-bom/lines/{l_board}", json={"quantity": 2, "unit_price": 400, "currency": "INR"}).status_code, 200)
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        self.assertAlmostEqual(view["should_cost"], 800 + 1011)
+        # a line in another currency is not summed and is listed
+        self.assertEqual(self.client.patch(f"/api/planning/supplier-bom/lines/{l_solder}", json={"quantity": 0.01, "unit_price": 10, "currency": "USD"}).status_code, 200)
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        self.assertEqual(view["excluded_lines"], [l_solder])
+        self.assertAlmostEqual(view["should_cost"], 800 + 992 + 10)
+
+        # supplier material used in a BOM cannot be deleted; deleting a line removes the lines below it
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-materials/{flux}").status_code, 409)
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-bom/lines/{l_icset}").status_code, 204)
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        self.assertEqual([row["component"]["code"] for row in view["lines"]], ["BRD"])
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-materials/{flux}").status_code, 204)
+        products = self.client.get("/api/planning/supplier-bom/products", params={"supplier_id": iljin}).json()["items"]
+        self.assertEqual([(p["code"], p["has_bom"]) for p in products], [("SB-PCB", True)])
+
+        # --- Excel: supplier materials (own headings) and supplier BOM upload (replaces), export
+        def xlsx(header, rows, blank_rows=0):
+            workbook = Workbook(); sheet = workbook.active
+            for _ in range(blank_rows):
+                sheet.append([])
+            sheet.append(list(header))
+            for row in rows:
+                sheet.append(list(row))
+            content = io.BytesIO(); workbook.save(content)
+            return content.getvalue()
+        xl = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        response = post(f"/api/planning/supplier-materials/upload?supplier_id={iljin}", headers=xl,
+                        content=xlsx(("Material code", "Material name", "Unit", "Unit cost", "Currency"), [("TERM", "Terminal", "PCS", 2, "INR"), ("SOLDER", "Solder wire 0.8", "kg", 950, "INR")], blank_rows=2))
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"rows": 2, "added": 1, "updated": 1})
+        response = post(f"/api/planning/supplier-bom/upload?supplier_id={iljin}&material_id={pcb}", headers=xl, content=xlsx(
+            ("Parent code", "Code", "Qty", "Unit price", "Source"),
+            [("", "BRD", 1, "", ""), ("", "ICSET", 1, "", ""), ("ICSET", "SB-CHIP", 2, 500, "our"), ("ICSET", "SOLDER", 0.01, "", ""), ("SOLDER", "TERM", 3, "", "")]))
+        self.assertEqual(response.status_code, 201, response.text)
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        self.assertEqual([(r["level"], r["component"]["code"]) for r in view["lines"]], [("L1", "BRD"), ("L1", "ICSET"), ("L2", "SB-CHIP"), ("L2", "SOLDER"), ("L3", "TERM")])
+        # BRD 415 + ICSET (2 x 500 + 0.01 x (3 x 2)) = 415 + 1000.06
+        self.assertAlmostEqual(view["should_cost"], 1415.06)
+        plain = TestClient(self.client.app, raise_server_exceptions=False)
+        plain.cookies = self.client.cookies
+        bad = plain.post(f"/api/planning/supplier-bom/upload?supplier_id={iljin}&material_id={pcb}", headers=xl, content=xlsx(
+            ("Parent code", "Code", "Qty"), [("", "BRD", 1), ("NOPE", "TERM", 1)]))
+        self.assertEqual(bad.status_code, 422)
+        self.assertIn("earlier row", bad.json()["detail"])
+        self.assertEqual(len(self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()["lines"]), 5, "bad file changes nothing")
+        export = self.client.get("/api/planning/supplier-bom/xlsx", params={"supplier_id": iljin, "material_id": pcb})
+        self.assertEqual(export.status_code, 200)
+        sheet = load_workbook(io.BytesIO(export.content)).active
+        self.assertEqual([c.value for c in sheet[4]][:8], ["Level", "L1 code", "L1 name", "L2 code", "L2 name", "L3 code", "L3 name", "Source"])
+        self.assertEqual([sheet.cell(r, 6).value for r in range(5, 10)], [None, None, None, None, "TERM"])
+
+        # users without price permission see no prices
+        self.assertEqual(post("/api/users", json={"username": "sbview", "full_name": "Viewer", "password": "Viewer-pass-2026!", "role": "User"}).status_code, 201)
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "sbview", "password": "Viewer-pass-2026!"})
+        view = self.client.get("/api/planning/supplier-bom", params={"supplier_id": iljin, "material_id": pcb}).json()
+        self.assertNotIn("should_cost", view)
+        self.assertNotIn("line_cost", view["lines"][0])
+        self.assertEqual(line(board, 1).status_code, 403, "view-only users cannot edit")
+
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
         suppliers = [row for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]
