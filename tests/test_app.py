@@ -1001,6 +1001,59 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(found.keys(), links_of(pcb).keys())
         self.assertEqual(links_of(pcb)[("Iljin Noida", "Direct")]["unit_price"], 1750)
 
+    def test_supplier_relationship_upload_accepts_users_sheet_as_is(self):
+        # The user's sheet: rows 1-3 empty, heading on row 4, columns as in their screenshot
+        data = [
+            ("FL001ADC12", "ADC12", "GTR Bangalore", "Raw material", "kg", 20000, 15, 350, "INR"),
+            ("FL001CUWIRE06", "CUWire06", "GKN Wire Bangalore", "Raw material", "kg", 10000, 60, 1200, "INR"),
+            ("FL001LM6", "LM6", "GTR Bangalore", "Raw material", "kg", 15000, 15, 320, "INR"),
+            ("FL001PCB1", "PCB1", "Iljin Noida", "Electrical components", "PCS", 60000, 90, 1800, "INR"),
+            ("FL001PCB2", "PCB2", "Iljin Noida", "Electrical components", "PCS", 50000, 90, 2000, "INR"),
+            ("FL001PPB200", "PPB200", "Reliance Goa", "Raw material", "kg", 20000, 60, 150, "INR"),
+            ("FL001STEEL0.7", "STEEL0.7", "JGI Goa", "Raw material", "kg", 10000, 5, 100, "INR"),
+            ("FL001STEEL0.8", "STEEL0.8", "JGI Goa", "Raw material", "kg", 12000, 5, 105, "INR"),
+        ]
+        for code, name, _, category, uom, *_ in data:
+            self.assertEqual(self.client.post("/api/planning/materials", json={"code": code, "name": name, "category": category, "uom": uom}).status_code, 201)
+
+        def sheet_bytes(rows, header=("Material code", "Material name", "Supplier Name", "Category", "Unit", "On hand", "Buffer days", "Unit cost", "Currency")):
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([]); sheet.append([]); sheet.append([])
+            sheet.append(list(header))
+            for row in rows:
+                sheet.append(list(row))
+            content = io.BytesIO()
+            workbook.save(content)
+            return content.getvalue()
+
+        def upload(content):
+            return self.client.post("/api/planning/supplier-parts/upload", content=content,
+                                    headers={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+
+        response = upload(sheet_bytes(data))
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"rows": 8, "added": 8, "updated": 0, "suppliers_created": 5})
+        links = {row["material_code"]: row for row in self.client.get("/api/planning/supplier-parts", params={"limit": 1000}).json()["items"] if row["material_code"].startswith("FL001")}
+        self.assertEqual(len(links), 8)
+        steel = links["FL001STEEL0.8"]
+        self.assertEqual((steel["supplier_name"], steel["tier"], steel["sob_percent"], steel["unit_price"], steel["currency"], steel["buffer_days"]),
+                         ("JGI Goa", "Direct", 100, 105, "INR", 5))
+        self.assertEqual((links["FL001PCB1"]["supplier_name"], links["FL001PCB1"]["unit_price"], links["FL001PCB1"]["buffer_days"]), ("Iljin Noida", 1800, 90))
+        # "On hand" is not a supplier field: Material Master stock is unchanged
+        material = next(m for m in self.client.get("/api/planning/materials", params={"search": "FL001STEEL0.8"}).json()["items"] if m["code"] == "FL001STEEL0.8")
+        self.assertEqual(material["stock_on_hand"], 0)
+
+        # Errors name the real Excel row (row 4 = heading, so the 2nd data row is row 6)
+        bad = list(data[:1]) + [("FL001NOPE", "x", "JGI Goa", "Raw material", "kg", 0, 0, 1, "INR")]
+        response = upload(sheet_bytes(bad))
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Row 6", response.json()["detail"])
+        # A sheet without the key columns is refused with a clear message
+        response = upload(sheet_bytes(data[:1], header=("Code", "Name", "Vendor X")))
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("heading row", response.json()["detail"])
+
     def test_supplier_stock_upload_requires_tier_when_relationship_is_ambiguous(self):
         material = next(row for row in self.client.get("/api/planning/materials?limit=500").json()["items"] if row["code"] == "MAT-104")
         suppliers = [row for row in self.client.get("/api/suppliers").json() if row["status"] == "Approved"]

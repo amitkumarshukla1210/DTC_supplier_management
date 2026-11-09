@@ -448,6 +448,53 @@ def _read_xlsx(raw: bytes) -> list[dict[str, Any]]:
         raise HTTPException(status_code=422, detail="Could not read the Excel workbook; use a valid .xlsx file") from exc
 
 
+SUPPLIER_PART_COLUMN_ALIASES = {
+    "material_code": "material_code", "part_code": "material_code", "item_code": "material_code",
+    "supplier_name": "supplier_name", "supplier": "supplier_name", "vendor": "supplier_name", "vendor_name": "supplier_name",
+    "tier": "tier", "parent_supplier_name": "parent_supplier_name", "parent_supplier": "parent_supplier_name",
+    "sob_percent": "sob_percent", "sob": "sob_percent", "sob_%": "sob_percent", "sob_(%)": "sob_percent",
+    "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price",
+    "currency": "currency",
+    "lead_time_days": "lead_time_days", "lead_time": "lead_time_days", "lead_time_(days)": "lead_time_days",
+    "moq": "moq", "buffer_days": "buffer_days", "buffer": "buffer_days",
+    "price_mode": "price_mode", "price_interval_months": "price_interval_months",
+}
+
+
+def _read_supplier_part_sheet(raw: bytes) -> list[dict[str, Any]]:
+    """Relationship sheet as the user keeps it: heading row anywhere in the first 30 rows
+    (title rows above are skipped), column names like "Material code" / "Supplier Name" /
+    "Unit cost" accepted, other columns (Material name, Category, On hand ...) ignored."""
+    if not raw or len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413 if len(raw) > MAX_UPLOAD_BYTES else 422, detail="Upload must be a non-empty Excel file smaller than 20 MB")
+    try:
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        lines = list(workbook.active.iter_rows(values_only=True))
+        workbook.close()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Could not read the Excel workbook; use a valid .xlsx file") from exc
+
+    def key(value: Any) -> str:
+        return re.sub(r"\s+", "_", str(value or "").strip().lower())
+
+    for header_index, line in enumerate(lines[:30]):
+        columns = {index: SUPPLIER_PART_COLUMN_ALIASES[key(value)] for index, value in enumerate(line) if key(value) in SUPPLIER_PART_COLUMN_ALIASES}
+        if {"material_code", "supplier_name"} <= set(columns.values()):
+            break
+    else:
+        raise HTTPException(status_code=422, detail="Could not find the heading row: the sheet needs a 'Material code' and a 'Supplier name' column")
+    if len(set(columns.values())) != len(columns):
+        raise HTTPException(status_code=422, detail="The Excel sheet has the same column twice (e.g. 'Unit cost' and 'Unit price')")
+    rows = []
+    for offset, line in enumerate(lines[header_index + 1:]):
+        row = {name: (line[index] if index < len(line) else None) for index, name in columns.items()}
+        if any(value is not None and str(value).strip() != "" for value in row.values()):
+            rows.append({**row, "_excel_row": header_index + 2 + offset})
+    if not rows:
+        raise HTTPException(status_code=422, detail="The Excel sheet has no data rows")
+    return rows
+
+
 def _required_columns(rows: list[dict[str, Any]], required: set[str]) -> None:
     missing = required - set(rows[0])
     if missing:
@@ -1993,8 +2040,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         the Supplier register (Approved); an existing relationship is updated."""
         current_user(request)
         _check_supply_role(request)
-        rows = _read_xlsx(await request.body())
-        _required_columns(rows, {"material_code", "supplier_name", "sob_percent"})
+        rows = _read_supplier_part_sheet(await request.body())
         can_price = _check_price_access(request)
         with open_db() as db:
             items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
@@ -2040,7 +2086,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 created += 1
                 return supplier
 
-            for row_number, row in enumerate(rows, start=2):
+            for row in rows:
+                row_number = row["_excel_row"]
                 code, name = text(row, "material_code"), text(row, "supplier_name")
                 if not code or not name:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code and supplier_name are required")

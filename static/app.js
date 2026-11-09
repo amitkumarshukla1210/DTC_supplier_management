@@ -928,7 +928,7 @@ async function renderSupplierControl() {
         <button class="button button-primary" type="submit">Save supplier/material</button>
       </form>
     </section>
-    <section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "One row per material and supplier: material_code, supplier_name, tier (blank = Direct), parent_supplier_name (for T1/T2), sob_percent, unit_price, currency, lead_time_days, moq, buffer_days, price_mode, price_interval_months. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
+    <section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template. One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
       <form id="supplierPartUploadForm" class="panel-body inline-upload">
         <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
         <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
