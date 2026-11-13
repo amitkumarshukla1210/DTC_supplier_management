@@ -502,8 +502,9 @@ async function renderMaster() {
     }));
   }).join("");
   const modelRows = state.models.map((item) => `<tr data-edit-model="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.product_names?.join(", ") || "Unassigned")}</td><td><button class="text-button" data-edit-model="${item.id}">Edit</button><button class="text-button button-danger" data-delete-model="${item.id}">Delete</button></td></tr>`).join("");
-  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master", "Alternate codes"];
+  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master", "Alternate codes", "SOB change log"];
   const altTab = state.bomTab === "Alternate codes";
+  const logTab = state.bomTab === "SOB change log";
   const tierTab = TIER_TABS[state.bomTab];
   const bomTemplateKind = {
     "Model BOM Level 1": "bom-oem", "Level 2 Part BOM": "bom-level-2", "Level 3 Part BOM": "bom-level-3",
@@ -513,7 +514,10 @@ async function renderMaster() {
     : state.bomTab === "Material Master"
       ? '<button class="button" data-action="new-model">Add model</button><button class="button button-primary" data-action="new-material">Add material</button>'
       : tierTab ? `<button class="button button-primary" data-action="new-tier-material">Add ${tierTab} material</button>` : "";
-  const altSection = `<section class="panel table-panel">${panelHeader("Alternate codes", "Which code is an alternate of which (e.g. FL101STEEL0.8 for FL001STEEL0.8). Both codes come from T1 Material Master, are bought parts and use the same unit. The SOB is set on each BOM line: click the main code's row in Model BOM Level 1, Level 2 or Level 3 Part BOM. It is 0% (main code 100%) until you set it.")}
+  const logSection = `<section class="panel table-panel">${panelHeader("SOB change log", "Every alternate SOB change: when, who, which code, where it is used (L1 / L2 / L3), from which month and the split. Set or remove SOB in Alternate codes → Manage SOB.")}
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code, use, split or user" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/sob-change-log.xlsx" id="sobLogExcel">Download Excel</a><a class="button button-small" href="/api/planning/sob-change-log.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div id="sobLogTable"></div></section>`;
+  const altSection = `<section class="panel table-panel">${panelHeader("Alternate codes", "Which code is an alternate of which (e.g. FL101STEEL0.8 for FL001STEEL0.8). Both codes come from T1 Material Master, are bought parts and use the same unit. Set the SOB here with Manage SOB: it lists every use of the main code (L1 direct per model, Level 2 and Level 3 part BOMs) and updates all ticked uses at once, from a month. 0% (main code 100%) until set.")}
       <form id="altAddForm" class="panel-body form-grid">
         <label class="field"><span>Search main code</span><input class="form-control" id="altMainSearch" type="search" placeholder="Type a code or name" /></label>
         <label class="field"><span>Main code (purchased parts)</span><select class="form-control" id="altMainSelect" required><option value="">Loading…</option></select></label>
@@ -521,7 +525,7 @@ async function renderMaster() {
         <label class="field"><span>Alternate code (purchased parts)</span><select class="form-control" id="altAltSelect" required><option value="">Loading…</option></select></label>
         <div class="field"><span>&nbsp;</span><button class="button button-primary" type="submit">Add alternate code</button></div>
       </form>
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search main or alternate code / name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/alternate-codes.xlsx">Template</a><a class="button button-small" href="/api/planning/alternate-codes.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/alternate-codes.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search main or alternate code / name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/alternate-codes.xlsx">Template</a><a class="button button-small" href="/api/planning/alternate-codes.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/alternate-codes.pdf">Download PDF</a><a class="button button-small" href="/api/planning/sob-change-log.xlsx">Download SOB history</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="altUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload alternate codes (Main code, Alternate code; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
       <div id="altTable"></div></section>`;
   content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", actions)}
@@ -537,6 +541,7 @@ async function renderMaster() {
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="modelMasterSearch" type="search" placeholder="Search model code or name" /></label><button class="button button-small" type="button" data-execute-model-search>Execute</button><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="modelMasterTable">${table(["Model code", "Model name", "Assigned products", "Action"], modelRows, "No models yet.")}</div></section>`
     : altTab ? altSection
+    : logTab ? logSection
     : tierTab ? `<section class="panel table-panel">${panelHeader(`${tierTab} Material Master`, `Codes used further down the supply chain (${tierTab === "T2" ? "by your T1 suppliers' suppliers" : "by your T2 suppliers' suppliers"}). Not part of your planning; suppliers pick them into their own material master. A code can be in only one of T1, T2 or T3.`)}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="tierUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload ${tierTab} Material Master (Code, Name, Category, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
@@ -565,6 +570,8 @@ async function renderMaster() {
     $("#modelMasterSearch").dataset.tableFilterRoot = "#modelMasterTable";
   } else if (altTab) {
     initAlternateCodesTab();
+  } else if (logTab) {
+    loadSobLog(0);
   } else if (tierTab) {
     await loadTierMaterialPage(0);
     $("#tierUploadForm").addEventListener("submit", async (event) => {
@@ -948,8 +955,9 @@ function initAlternateCodesTab() {
     const body = { main_item_id: Number($("#altMainSelect").value), alternate_item_id: Number($("#altAltSelect").value) };
     try {
       const saved = await api("/api/planning/alternate-codes", { method: "POST", body: JSON.stringify(body) });
-      toast(`${saved.alternate_code} added as alternate of ${saved.main_code}. Set its SOB on each BOM line.`);
-      loadAlternateCodes(0);
+      toast(`${saved.alternate_code} added as alternate of ${saved.main_code}. Set its SOB on each use below.`);
+      await loadAlternateCodes(0);
+      openManageSob(saved.main_item_id);
     } catch (error) { toast(error.message, true); }
   });
   $("#altUploadForm").addEventListener("submit", async (event) => {
@@ -972,8 +980,66 @@ async function loadAlternateCodes(offset = 0) {
   const result = await api(`/api/planning/alternate-codes?${new URLSearchParams({ offset: String(offset), limit: "500", search })}`);
   state.altItems = result.items;
   const priced = canSeePrices();
-  const rows = result.items.map((a) => `<tr><td>${esc(a.main_code)}</td><td>${esc(a.main_name)}</td><td>${esc(a.alternate_code)}</td><td>${esc(a.alternate_name)}</td><td>${esc(a.uom)}</td><td>${priced && a.main_unit_price !== undefined ? money(a.main_unit_price, a.main_currency) : "Restricted"}</td><td>${priced && a.unit_price !== undefined ? money(a.unit_price, a.currency) : "Restricted"}</td><td><button class="text-button button-danger" data-alt-delete="${a.id}">Delete</button></td></tr>`).join("");
-  target.innerHTML = `${table(["Main code", "Main name", "Alternate code", "Alternate name", "Unit", "Main price", "Alternate price", "Delete"], rows, search ? "No alternate codes match this search." : "No alternate codes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No alternate codes"}</span><div><button class="button button-small" data-alt-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-alt-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+  const rows = result.items.map((a) => `<tr><td>${esc(a.main_code)}</td><td>${esc(a.main_name)}</td><td>${esc(a.alternate_code)}</td><td>${esc(a.alternate_name)}</td><td>${esc(a.uom)}</td><td>${esc(["L1", "L2", "L3"].filter((level) => a.uses?.[level]).map((level) => `${level} × ${a.uses[level]}`).join(" · ") || "Not used in a BOM")}</td><td>${priced && a.main_unit_price !== undefined ? money(a.main_unit_price, a.main_currency) : "Restricted"}</td><td>${priced && a.unit_price !== undefined ? money(a.unit_price, a.currency) : "Restricted"}</td><td><button class="text-button" data-alt-manage="${a.main_item_id}">Manage SOB</button></td><td><button class="text-button button-danger" data-alt-delete="${a.id}">Delete</button></td></tr>`).join("");
+  target.innerHTML = `${table(["Main code", "Main name", "Alternate code", "Alternate name", "Unit", "Main code used in", "Main price", "Alternate price", "SOB", "Delete"], rows, search ? "No alternate codes match this search." : "No alternate codes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No alternate codes"}</span><div><button class="button button-small" data-alt-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-alt-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+}
+
+const SOB_LEVELS = [["L1", "direct use in Model BOM Level 1"], ["L2", "Level 2 part BOMs"], ["L3", "Level 3 part BOMs"]];
+
+// Manage SOB (Alternate codes): every use of the main code with its SOB; one change, from a
+// month, goes on all ticked uses at once and is written to the SOB change log.
+async function openManageSob(mainId) {
+  let view;
+  try { view = await api(`/api/planning/alternate-codes/uses?${new URLSearchParams({ main_item_id: String(mainId) })}`); }
+  catch (error) { return toast(error.message, true); }
+  const { main, alternates, uses } = view;
+  const sobCells = (sob, mainShare) => `${alternates.map((alt) => `${number(sob[alt.id] || 0, 2)}%`).join(" / ")} / ${number(mainShare, 2)}%`;
+  const historyText = (use) => use.history.map((change) => `${change.from_month ? monthLabel(change.from_month) : "Start"}: ${alternates.map((alt) => `${number(change.alternates.find((a) => a.alternate_item_id === alt.id)?.sob_percent || 0, 2)}%`).join(" / ")} / ${number(change.main_sob_percent, 2)}%`).join(" · ") || "Not set (main 100%)";
+  const anyHistory = uses.some((use) => use.history.length);
+  $("#modalTitle").textContent = `Manage SOB · ${main.code} · ${main.name}`;
+  $("#modalBody").innerHTML = `<form id="sobForm" class="form-grid">
+    <div class="field full subtle">${uses.length} use${uses.length === 1 ? "" : "s"} of ${esc(main.code)}. The split is shown as ${alternates.map((alt) => esc(alt.code)).join(" / ")} / main.</div>
+    ${alternates.map((alt) => `<label class="field"><span>${esc(alt.code)} · ${esc(alt.name)} (%)</span><input class="form-control" type="number" min="0" max="100" step="any" data-sob-alt="${alt.id}" value="0" /></label>`).join("")}
+    <label class="field"><span>Main code ${esc(main.code)} SOB (%)</span><input class="form-control" id="sobMain" readonly /></label>
+    <label class="field"><span>SOB valid from month (empty = all months)</span><input class="form-control" type="month" id="sobFrom" value="${anyHistory ? monthNow() : ""}" /></label>
+    ${SOB_LEVELS.map(([level, label]) => { const rows = uses.filter((use) => use.level === level); return `<section class="field full sob-level-panel" data-sob-level="${level}"><h4><label><input type="checkbox" data-sob-level-all="${level}" ${rows.length ? "checked" : "disabled"} /> ${level} · ${label} <span class="subtle">(${rows.length} use${rows.length === 1 ? "" : "s"})</span></label></h4>${rows.length ? `<div class="table-wrap"><table class="sob-uses"><thead><tr><th></th><th>Used in</th><th>BOM qty</th><th>SOB this month</th><th>Next change</th><th>History</th></tr></thead><tbody>${rows.map((use) => `<tr data-sob-use="${use.key}"><td><input type="checkbox" data-sob-line data-level="${level}" checked data-model-bom-id="${use.model_bom_id || ""}" data-component-id="${use.component_id || ""}" aria-label="Tick ${esc(use.used_in)}" /></td><td>${esc(use.used_in)}</td><td>${number(use.quantity, 4)} ${esc(main.uom)}</td><td>${sobCells(use.sob, use.main_sob_percent)}</td><td>${use.next_change ? `${esc(monthLabel(use.next_change.from_month))}: main ${number(use.next_change.main_sob_percent, 2)}%` : "—"}</td><td class="sob-history-cell">${esc(historyText(use))}</td></tr>`).join("")}</tbody></table></div>` : `<p class="subtle">${esc(main.code)} is not used at ${level}.</p>`}</section>`; }).join("")}
+    <div class="modal-footer field full"><button type="button" class="button" id="sobRemove">Remove this month's change from ticked uses</button><button class="button button-primary" type="submit">Save SOB for ticked uses</button></div></form>`;
+  modalLayer.hidden = false;
+  const form = $("#sobForm");
+  const syncMain = () => { $("#sobMain").value = number(100 - [...form.querySelectorAll("[data-sob-alt]")].reduce((sum, input) => sum + Number(input.value || 0), 0), 2); };
+  syncMain();
+  form.addEventListener("input", (event) => { if (event.target.matches("[data-sob-alt]")) syncMain(); });
+  form.querySelectorAll("[data-sob-level-all]").forEach((all) => all.addEventListener("change", () => {
+    form.querySelectorAll(`[data-sob-line][data-level="${all.dataset.sobLevelAll}"]`).forEach((box) => { box.checked = all.checked; });
+  }));
+  const ticked = () => [...form.querySelectorAll("[data-sob-line]:checked")].map((box) => ({ model_bom_id: Number(box.dataset.modelBomId) || null, component_id: Number(box.dataset.componentId) || null }));
+  const send = async (action) => {
+    const body = { main_item_id: main.id, from_month: $("#sobFrom").value, action, lines: ticked(),
+      alternates: [...form.querySelectorAll("[data-sob-alt]")].map((input) => ({ alternate_item_id: Number(input.dataset.sobAlt), sob_percent: Number(input.value || 0) })) };
+    try {
+      const result = await api("/api/planning/alternate-sob", { method: "POST", body: JSON.stringify(body) });
+      const when = result.from_month ? `from ${monthLabel(result.from_month)}` : "for all months";
+      toast(action === "set" ? `SOB saved ${when} on ${result.lines} use${result.lines === 1 ? "" : "s"} of ${main.code}` : `SOB change ${when} removed from ${result.lines} use${result.lines === 1 ? "" : "s"}`);
+      openManageSob(main.id);
+      loadAlternateCodes(0);
+    } catch (error) { toast(error.message, true); }
+  };
+  form.addEventListener("submit", (event) => { event.preventDefault(); send("set"); });
+  $("#sobRemove").addEventListener("click", () => {
+    const when = $("#sobFrom").value ? monthLabel($("#sobFrom").value) : "the start";
+    if (window.confirm(`Remove the SOB change from ${when} on the ticked uses?`)) send("remove");
+  });
+}
+
+async function loadSobLog(offset = 0) {
+  const target = $("#sobLogTable");
+  if (!target) return;
+  const search = $("#masterSearch")?.value.trim() || "";
+  const result = await api(`/api/planning/sob-change-log?${new URLSearchParams({ offset: String(offset), limit: "500", search })}`);
+  const excel = $("#sobLogExcel");
+  if (excel) excel.href = `/api/planning/sob-change-log.xlsx?${new URLSearchParams({ search })}`;
+  const rows = result.items.map((r) => `<tr><td>${esc(r.changed_at)}</td><td>${esc(r.changed_by)}</td><td>${esc(r.action)}</td><td>${esc(r.main_code)}</td><td>${esc(r.level)}</td><td>${esc(r.used_in)}</td><td>${r.from_month ? esc(monthLabel(r.from_month)) : "Start (all months)"}</td><td>${esc(r.sob_text || "—")}</td></tr>`).join("");
+  target.innerHTML = `${table(["Changed on", "Changed by", "Action", "Main code", "Level", "Used in", "SOB from month", "SOB split"], rows, search ? "No SOB changes match this search." : "No SOB changes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No changes"}</span><div><button class="button button-small" data-sob-log-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-sob-log-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
 }
 
 // Material Master: 500 a page from the server; search covers all codes
@@ -1865,45 +1931,21 @@ function openModal(type, record = {}) {
     title = "Add supplier";
     form = `<form id="modalForm" class="form-grid">${field("Supplier name", "name", "text", { required: true })}${field("Category", "category", "text", { required: true })}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
   }
-  // Alternate code SOB on this BOM line (0% = not used here); the main code keeps the rest
+  // Alternate code SOB on this BOM line: shown here, changed only in Alternate codes → Manage SOB
   const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
   if (lineAlternates.length) {
-    form = form.replace('<div class="modal-footer field full">', `<fieldset class="field full line-alternates"><legend>Alternate code SOB on this BOM line</legend>${lineAlternates.map((alt) => `<label class="field"><span>${esc(alt.code)} · ${esc(alt.name)} (%)</span><input class="form-control" type="number" min="0" max="100" step="any" data-line-alt="${alt.id}" value="${alt.sob}" /></label>`).join("")}<label class="field"><span>Main code SOB (%)</span><input class="form-control" id="lineMainSob" readonly /></label><label class="field"><span>SOB valid from month (empty = all months)</span><input class="form-control" type="month" id="lineSobFrom" /></label><label class="field line-everywhere"><span>Apply to</span><span class="check-row"><input type="checkbox" id="lineSobEverywhere" /> every BOM line using this code (all models, L1 direct and part BOMs)</span></label><p class="subtle field full">0% = alternate not used. Earlier months keep the SOB valid then; a code replacement = 100% on the new code from the month.</p><div class="field full" id="lineSobHistory"><span class="subtle">Loading SOB history…</span></div></fieldset><div class="modal-footer field full">`);
+    form = form.replace('<div class="modal-footer field full">', `<fieldset class="field full line-alternates"><legend>Alternate code SOB on this BOM line (this month)</legend><div class="field full">${lineAlternates.map((alt) => `<strong>${esc(alt.code)}</strong> ${number(alt.sob, 2)}%`).join(" · ")} · <strong>main</strong> ${number(100 - lineAlternates.reduce((sum, alt) => sum + Number(alt.sob || 0), 0), 2)}%</div><p class="subtle field full">To change the SOB, use Product Master → Alternate codes → Manage SOB: it updates every use of this code at once and keeps the SOB change log.</p><div class="field full" id="lineSobHistory"><span class="subtle">Loading SOB history…</span></div><button type="button" class="button button-small" data-alt-manage="${record.material_id}">Open Manage SOB</button></fieldset><div class="modal-footer field full">`);
   }
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = form;
   modalLayer.hidden = false;
   if (lineAlternates.length) {
-    const syncMain = () => {
-      const used = [...$("#modalForm").querySelectorAll("[data-line-alt]")].reduce((sum, input) => sum + Number(input.value || 0), 0);
-      $("#lineMainSob").value = `${number(100 - used, 2)}`;
-    };
-    $("#modalForm").addEventListener("input", (event) => { if (event.target.matches("[data-line-alt]")) syncMain(); });
-    syncMain();
-    const lineQuery = () => new URLSearchParams(record.root_bom_id ? { model_bom_id: record.root_bom_id } : { component_id: record.component_id });
-    const showHistory = async (setDefault = false) => {
+    const lineQuery = new URLSearchParams(record.root_bom_id ? { model_bom_id: record.root_bom_id } : { component_id: record.component_id });
+    api(`/api/planning/bom-line-alternates?${lineQuery}`).then(({ history }) => {
       const holder = $("#lineSobHistory");
       if (!holder) return;
-      try {
-        const { history } = await api(`/api/planning/bom-line-alternates?${lineQuery()}`);
-        // first SOB on a line: all months; a later change: from this month by default
-        if (setDefault) $("#lineSobFrom").value = history.length ? monthNow() : "";
-        holder.innerHTML = history.length ? `<table class="sob-history"><thead><tr><th>From</th>${lineAlternates.map((alt) => `<th>${esc(alt.code)}</th>`).join("")}<th>Main</th><th></th></tr></thead><tbody>${history.map((change) => `<tr data-sob-change="${esc(change.from_month)}"><td>${change.from_month ? esc(monthLabel(change.from_month)) : "Start"}</td>${lineAlternates.map((alt) => `<td>${number(change.alternates.find((a) => a.alternate_item_id === alt.id)?.sob_percent || 0, 2)}%</td>`).join("")}<td>${number(change.main_sob_percent, 2)}%</td><td><button type="button" class="text-button button-danger" data-sob-change-delete="${esc(change.from_month)}">Remove</button></td></tr>`).join("")}</tbody></table>` : '<span class="subtle">No SOB set on this line yet (main code 100%).</span>';
-      } catch (error) { holder.textContent = error.message; }
-    };
-    $("#lineSobHistory").addEventListener("click", async (event) => {
-      const remove = event.target.closest("[data-sob-change-delete]");
-      if (!remove) return;
-      const query = lineQuery();
-      query.set("from_month", remove.dataset.sobChangeDelete);
-      try {
-        await api(`/api/planning/bom-line-alternates?${query}`, { method: "DELETE" });
-        toast("SOB change removed");
-        await showHistory();
-        renderPage();
-      } catch (error) { toast(error.message, true); }
-    });
-    showHistory(true);
+      holder.innerHTML = history.length ? `<table class="sob-history"><thead><tr><th>From</th>${lineAlternates.map((alt) => `<th>${esc(alt.code)}</th>`).join("")}<th>Main</th></tr></thead><tbody>${history.map((change) => `<tr><td>${change.from_month ? esc(monthLabel(change.from_month)) : "Start"}</td>${lineAlternates.map((alt) => `<td>${number(change.alternates.find((a) => a.alternate_item_id === alt.id)?.sob_percent || 0, 2)}%</td>`).join("")}<td>${number(change.main_sob_percent, 2)}%</td></tr>`).join("")}</tbody></table>` : '<span class="subtle">No SOB set on this line yet (main code 100%).</span>';
+    }).catch((error) => { const holder = $("#lineSobHistory"); if (holder) holder.textContent = error.message; });
   }
   if (type === "material") {
     const choice = $("#categorySelect");
@@ -1953,20 +1995,9 @@ function openModal(type, record = {}) {
   $("#modalForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const formEl = event.currentTarget;  // event.currentTarget is empty after the first await
-    const altInputs = [...formEl.querySelectorAll("[data-line-alt]")];
     const values = Object.fromEntries(new FormData(formEl).entries());
     try {
       let result;
-      // Save this line's alternate SOB first (refused as a whole if it adds up to more than 100%);
-      // skipped if the line's part code is being changed.
-      const sameCode = type !== "component" || Number(values.child_item_id) === Number(record.material_id);
-      if (altInputs.length && sameCode) {
-        await api("/api/planning/bom-line-alternates", { method: "PUT", body: JSON.stringify({
-          model_bom_id: record.root_bom_id || null, component_id: record.root_bom_id ? null : record.component_id,
-          from_month: formEl.querySelector("#lineSobFrom")?.value || "", apply_everywhere: !!formEl.querySelector("#lineSobEverywhere")?.checked,
-          alternates: altInputs.map((input) => ({ alternate_item_id: Number(input.dataset.lineAlt), sob_percent: Number(input.value || 0) })),
-        }) });
-      }
       if (type === "product") {
         values.model_ids = [...new FormData(formEl).getAll("model_ids")].map(Number);
         result = await api(record.id ? `/api/planning/products/${record.id}` : "/api/planning/products", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
@@ -2127,6 +2158,7 @@ document.addEventListener("click", async (event) => {
     if (state.bomTab === "Material Master") return loadMaterialMasterPage(0);  // server search over all codes
     if (TIER_TABS[state.bomTab]) return loadTierMaterialPage(0);
     if (state.bomTab === "Alternate codes") return loadAlternateCodes(0);
+    if (state.bomTab === "SOB change log") return loadSobLog(0);
     return applyTableSearch({ target: $("#masterSearch") });
   }
   if (event.target.closest('[data-action="new-tier-material"]')) return openTierMaterial();
@@ -2144,6 +2176,10 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/planning/alternate-codes/${altDelete.dataset.altDelete}`, { method: "DELETE" }); toast("Alternate code deleted"); return loadAlternateCodes(0); }
     catch (error) { toast(error.message, true); return; }
   }
+  const altManage = event.target.closest("[data-alt-manage]");
+  if (altManage) return openManageSob(Number(altManage.dataset.altManage));
+  const sobLogPage = event.target.closest("[data-sob-log-page]");
+  if (sobLogPage) return loadSobLog(Number(sobLogPage.dataset.sobLogPage));
   const altPage = event.target.closest("[data-alt-page]");
   if (altPage) return loadAlternateCodes(Number(altPage.dataset.altPage));
   const tierPage = event.target.closest("[data-tier-page]");

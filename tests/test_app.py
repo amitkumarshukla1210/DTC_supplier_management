@@ -1540,6 +1540,78 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual([(h["from_month"], h["alternates"][0]["sob_percent"]) for h in history], [("", 30), ("2027-01", 100)])
         self.assertEqual(report()[("2026-11", "SH-CHIP")][0], 440)
 
+    def test_manage_sob_from_alternate_codes_on_all_uses_and_change_log(self):
+        # STEEL is used in 3 places: L1 direct in two models and in the Motor (L2) BOM.
+        # Manage SOB sets ALT 30% from the start on all 3 uses, then 80% from 2026-11 on the Motor use only.
+        def material(code, name):
+            return self.client.post("/api/planning/materials", json={"code": code, "name": name, "uom": "kg", "unit_cost": 100, "currency": "INR"}).json()["id"]
+        steel, alt, alt2 = material("MS-STEEL", "Steel 0.8"), material("MS-ALT", "Import steel"), material("MS-ALT2", "Import steel new")
+        motor = self.client.post("/api/planning/materials", json={"code": "MS-MOTOR", "name": "Motor", "uom": "PCS"}).json()["id"]
+        stator = self.client.post("/api/planning/materials", json={"code": "MS-STATOR", "name": "Stator", "uom": "PCS"}).json()["id"]
+        models = [self.client.post("/api/planning/models", json={"code": f"MS-M{i}", "name": f"Model {i}"}).json()["id"] for i in (1, 2)]
+        roots = [self.client.post(f"/api/planning/model-bom/{m}", json={"material_id": steel, "quantity": 6, "uom": "kg"}).json()["id"] for m in models]
+        self.assertEqual(self.client.post(f"/api/planning/model-bom/{models[0]}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": steel, "quantity": 2}, {"child_item_id": stator, "quantity": 1}]}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{stator}/new", json={"tab": "Level 3 Part BOM", "lines": [{"child_item_id": steel, "quantity": 4}]}).status_code, 201)
+        for code_id in (alt, alt2):
+            self.assertEqual(self.client.post("/api/planning/alternate-codes", json={"main_item_id": steel, "alternate_item_id": code_id}).status_code, 201)
+        listed = self.client.get("/api/planning/alternate-codes").json()["items"]
+        self.assertEqual(listed[0]["uses"], {"L1": 2, "L2": 1, "L3": 1})
+
+        view = self.client.get("/api/planning/alternate-codes/uses", params={"main_item_id": steel, "month": "2026-10"}).json()
+        self.assertEqual([a["code"] for a in view["alternates"]], ["MS-ALT", "MS-ALT2"])
+        uses = view["uses"]
+        self.assertEqual([(u["level"], u["used_in"], u["quantity"], u["main_sob_percent"]) for u in uses], [
+            ("L1", "Model MS-M1 · Model 1", 6, 100), ("L1", "Model MS-M2 · Model 2", 6, 100),
+            ("L2", "MS-MOTOR · Motor BOM", 2, 100), ("L3", "MS-STATOR · Stator BOM", 4, 100)])
+        lines = [{"model_bom_id": u["model_bom_id"], "component_id": u["component_id"]} for u in uses]
+
+        def post(body):
+            return self.client.post("/api/planning/alternate-sob", json={"main_item_id": steel, **body})
+        self.assertIn("Tick at least one", post({"alternates": [], "lines": []}).json()["detail"])
+        self.assertIn("adds up to 110%", post({"alternates": [{"alternate_item_id": alt, "sob_percent": 60}, {"alternate_item_id": alt2, "sob_percent": 50}], "lines": lines}).json()["detail"])
+        other = self.client.post(f"/api/planning/model-bom/{models[1]}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).json()["id"]
+        self.assertIn("does not use MS-STEEL", post({"alternates": [], "lines": [{"model_bom_id": other}]}).json()["detail"])
+        saved = post({"alternates": [{"alternate_item_id": alt, "sob_percent": 30}, {"alternate_item_id": alt2, "sob_percent": 30}], "lines": lines})
+        self.assertEqual((saved.status_code, saved.json()["lines"], saved.json()["main_sob_percent"]), (200, 4, 40))
+        motor_line = [{"model_bom_id": None, "component_id": uses[2]["component_id"]}]
+        self.assertEqual(post({"from_month": "Nov-2026", "alternates": [{"alternate_item_id": alt, "sob_percent": 80}], "lines": motor_line}).json()["lines"], 1)
+
+        after = {u["used_in"]: u for u in self.client.get("/api/planning/alternate-codes/uses", params={"main_item_id": steel, "month": "2026-10"}).json()["uses"]}
+        motor_use = after["MS-MOTOR · Motor BOM"]
+        self.assertEqual((motor_use["sob"][str(alt)], motor_use["sob"][str(alt2)], motor_use["main_sob_percent"]), (30, 30, 40))
+        self.assertEqual((motor_use["next_change"]["from_month"], motor_use["next_change"]["main_sob_percent"]), ("2026-11", 20))
+        self.assertEqual([h["from_month"] for h in motor_use["history"]], ["", "2026-11"])
+        self.assertIsNone(after["Model MS-M1 · Model 1"]["next_change"])
+        november = {u["used_in"]: u["main_sob_percent"] for u in self.client.get("/api/planning/alternate-codes/uses", params={"main_item_id": steel, "month": "2026-11"}).json()["uses"]}
+        self.assertEqual(november, {"Model MS-M1 · Model 1": 40, "Model MS-M2 · Model 2": 40, "MS-MOTOR · Motor BOM": 20, "MS-STATOR · Stator BOM": 40})
+        # the BOM tree uses the same SOB
+        l3 = self.client.get(f"/api/planning/part-bom/{stator}", params={"tab": "Level 3 Part BOM"}).json()["items"][0]
+        self.assertEqual(l3["main_sob_percent"], 40)
+        self.assertAlmostEqual(l3["main_quantity"], 1.6)
+
+        # remove the Nov change from the Motor use; removing a month nobody has is refused
+        self.assertEqual(post({"from_month": "2026-11", "action": "remove", "lines": motor_line}).json()["lines"], 1)
+        self.assertEqual(post({"from_month": "2026-12", "action": "remove", "lines": lines}).status_code, 404)
+        self.assertEqual(post({"action": "undo", "lines": lines}).status_code, 422)
+
+        # change log: who, when, where, from month, split (newest first); Excel download
+        log = self.client.get("/api/planning/sob-change-log").json()
+        self.assertEqual(log["total"], 6)  # 4 uses set + Motor Nov set + Motor Nov removed
+        newest = log["items"][0]
+        self.assertEqual((newest["action"], newest["main_code"], newest["level"], newest["used_in"], newest["from_month"], newest["changed_by"]),
+                         ("Removed", "MS-STEEL", "L2", "MS-MOTOR · Motor BOM", "2026-11", "Test Admin"))
+        self.assertEqual(log["items"][1]["sob_text"], "MS-ALT 80%, MS-ALT2 0%, main 20%")
+        self.assertEqual(log["items"][-1]["sob_text"], "MS-ALT 30%, MS-ALT2 30%, main 40%")
+        self.assertEqual(self.client.get("/api/planning/sob-change-log", params={"search": "stator"}).json()["total"], 1)
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/sob-change-log.xlsx").content)).active
+        rows = [r for r in sheet.iter_rows(values_only=True) if r and r[0] and str(r[0])[:2] == "20"]
+        header = next(r for r in sheet.iter_rows(values_only=True) if r and r[0] == "Changed on")
+        self.assertEqual(list(header[:8]), ["Changed on", "Changed by", "Action", "Main code", "Level", "Used in", "SOB from month", "SOB split"])
+        self.assertEqual(len(rows), 6)
+        self.assertIn("Start (all months)", [r[6] for r in rows])
+        self.assertEqual(self.client.get("/api/planning/sob-change-log.pdf").status_code, 200)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns

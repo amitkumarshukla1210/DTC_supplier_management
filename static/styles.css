@@ -490,3 +490,10 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 .sob-history th { color: #7a5a12; font-weight: 700; }
 small.sob-down { display: block; color: #b42318; }
 small.sob-up { display: block; color: #067647; }
+.sob-level-panel { border: 1px solid #dce4ea; border-radius: 10px; padding: 8px 12px; background: #f8fbfc; }
+.sob-level-panel h4 { margin: 4px 0 8px; font-size: 14px; color: #12263a; }
+.sob-level-panel h4 label { display: flex; align-items: center; gap: 8px; }
+.sob-uses { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
+.sob-uses th, .sob-uses td { padding: 6px 8px; border-bottom: 1px solid #e4ebf0; text-align: left; vertical-align: top; }
+.sob-history-cell { color: #6a7f92; font-size: 12px; }
+.modal:has(#sobForm) { width: min(1100px, 100%); max-height: 92vh; }

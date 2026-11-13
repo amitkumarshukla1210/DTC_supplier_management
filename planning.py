@@ -355,6 +355,23 @@ class BOMLineAlternate(Base):
     from_month: Mapped[str] = mapped_column(String(7), default="")
 
 
+class SOBChangeLog(Base):
+    """Every alternate SOB change (set or removed), one row per BOM line: who, when, which
+    code, where it is used, from which month and the SOB split."""
+    __tablename__ = "sob_change_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    changed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    changed_by: Mapped[str] = mapped_column(String(120))
+    action: Mapped[str] = mapped_column(String(12))  # "Set" or "Removed"
+    main_item_id: Mapped[int] = mapped_column(Integer, index=True)
+    main_code: Mapped[str] = mapped_column(String(48))
+    level: Mapped[str] = mapped_column(String(4))
+    used_in: Mapped[str] = mapped_column(String(300))
+    from_month: Mapped[str] = mapped_column(String(7), default="")
+    sob_text: Mapped[str] = mapped_column(String(600), default="")
+
+
 class MaterialTransfer(Base):
     __tablename__ = "material_transfers"
 
@@ -459,6 +476,20 @@ class AlternateCodeInput(BaseModel):
 class LineAlternateSOB(BaseModel):
     alternate_item_id: int
     sob_percent: float = Field(ge=0, le=100)
+
+
+class SOBLine(BaseModel):
+    model_bom_id: int | None = None
+    component_id: int | None = None
+
+
+class AlternateSOBInput(BaseModel):
+    """SOB for a main code's alternates from a month, on the ticked uses (BOM lines)."""
+    main_item_id: int
+    from_month: str = ""
+    alternates: list[LineAlternateSOB] = []
+    lines: list[SOBLine]
+    action: str = "set"  # "set" or "remove" (remove the change of from_month)
 
 
 class LineAlternatesInput(BaseModel):
@@ -2795,6 +2826,17 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         ids = {entry.main_item_id for entry in entries} | {entry.alternate_item_id for entry in entries}
         items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(ids))).all()} if ids else {}
         price = bom_price_lookup(db, {entry.main_item_id for entry in entries}) if can_price else None
+        mains = list({entry.main_item_id for entry in entries})
+        use_counts: dict[int, dict[str, int]] = {}
+        if mains:
+            level1 = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
+            for material_id in db.scalars(select(ModelBOM.material_id).where(ModelBOM.material_id.in_(mains))).all():
+                use_counts.setdefault(material_id, {}).setdefault("L1", 0)
+                use_counts[material_id]["L1"] += 1
+            for child_id, parent_id in db.execute(select(BOMComponent.child_item_id, BOMComponent.parent_item_id).where(BOMComponent.child_item_id.in_(mains))).all():
+                level = "L2" if parent_id in level1 else "L3"
+                use_counts.setdefault(child_id, {}).setdefault(level, 0)
+                use_counts[child_id][level] += 1
         rows = []
         for entry in entries:
             main, alternate = items.get(entry.main_item_id), items.get(entry.alternate_item_id)
@@ -2802,7 +2844,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 continue
             row = {"id": entry.id, "main_item_id": main.id, "main_code": main.code, "main_name": main.name,
                    "alternate_item_id": alternate.id, "alternate_code": alternate.code,
-                   "alternate_name": alternate.name, "uom": main.uom}
+                   "alternate_name": alternate.name, "uom": main.uom, "uses": use_counts.get(main.id, {})}
             if price:
                 main_price, alternate_price = price.own(main), price.own(alternate)
                 row.update(main_unit_price=main_price["unit_price"], main_currency=main_price["currency"],
@@ -2842,45 +2884,144 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             _, main = bom_line(db, model_bom_id, component_id)
             return {"main_code": main.code, "history": line_history_rows(db, model_bom_id, component_id, main)}
 
-    @app.put("/api/planning/bom-line-alternates")
-    def save_line_alternates(payload: LineAlternatesInput, request: Request):
-        """Alternate code SOB on a BOM line from a month ("" = from the start), kept as history.
-        Codes not listed get 0% from that month; the main code keeps 100 - sum. With
-        apply_everywhere the same change goes on every BOM line using the main code."""
-        current_user(request)
-        _check_supply_role(request)
-        from_month = payload.from_month.strip()
-        if from_month:
-            from_month = _month_text(_month(from_month))
-        with open_db() as db:
-            _, main = bom_line(db, payload.model_bom_id, payload.component_id)
-            allowed = {a.alternate_item_id for a in alternate_groups(db, [main.id]).get(main.id, [])}
-            seen: set[int] = set()
-            for entry in payload.alternates:
-                if entry.alternate_item_id not in allowed:
-                    other = db.get(Item, entry.alternate_item_id)
-                    raise HTTPException(status_code=422, detail=f"{other.code if other else 'This code'} is not an alternate of {main.code}; add it in Product Master → Alternate codes first")
-                if entry.alternate_item_id in seen:
-                    raise HTTPException(status_code=422, detail="An alternate code is listed twice")
-                seen.add(entry.alternate_item_id)
-            total = sum(entry.sob_percent for entry in payload.alternates)
-            if total > 100 + 1e-9:
-                raise HTTPException(status_code=422, detail=f"Alternate SOB on this line adds up to {total:g}%; the total cannot be more than 100%")
-            values = {alternate_id: 0.0 for alternate_id in allowed}
-            values.update({entry.alternate_item_id: entry.sob_percent for entry in payload.alternates})
-            if payload.apply_everywhere:
-                lines = [("root", line_id) for line_id in db.scalars(select(ModelBOM.id).where(ModelBOM.material_id == main.id)).all()]
-                lines += [("component", line_id) for line_id in db.scalars(select(BOMComponent.id).where(BOMComponent.child_item_id == main.id)).all()]
-            else:
-                lines = [("root", payload.model_bom_id) if payload.model_bom_id is not None else ("component", payload.component_id)]
-            for kind, line_id in lines:
-                column = BOMLineAlternate.model_bom_id if kind == "root" else BOMLineAlternate.component_id
-                db.execute(delete(BOMLineAlternate).where(column == line_id, BOMLineAlternate.from_month == from_month))
+    def code_uses(db: Session, main: Item) -> list[dict]:
+        """Every BOM line using a code: L1 direct lines (per model) and Level 2 / Level 3 part BOM lines."""
+        uses = []
+        for root, model in db.execute(select(ModelBOM, ProductModel).join(ProductModel, ProductModel.id == ModelBOM.model_id)
+                                      .where(ModelBOM.material_id == main.id).order_by(ProductModel.code)).all():
+            uses.append({"key": f"root-{root.id}", "model_bom_id": root.id, "component_id": None, "level": "L1",
+                         "used_in": f"Model {model.code} · {model.name}", "quantity": root.quantity})
+        level1 = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
+        for link, parent in db.execute(select(BOMComponent, Item).join(Item, Item.id == BOMComponent.parent_item_id)
+                                       .where(BOMComponent.child_item_id == main.id).order_by(Item.code)).all():
+            level = "L2" if parent.id in level1 else "L3"
+            uses.append({"key": f"component-{link.id}", "model_bom_id": None, "component_id": link.id, "level": level,
+                         "used_in": f"{parent.code} · {parent.name} BOM", "quantity": link.quantity})
+        uses.sort(key=lambda use: (use["level"], use["used_in"]))
+        return uses
+
+    def sob_text(values: dict[int, float], codes: dict[int, str]) -> str:
+        parts = [f"{codes.get(alternate_id, alternate_id)} {sob:g}%" for alternate_id, sob in values.items()]
+        return ", ".join(parts + [f"main {100 - sum(values.values()):g}%"])
+
+    def write_sob_change(db: Session, request: Request, main: Item, line_keys: list[tuple[str, int]], values: dict[int, float],
+                         from_month: str, action: str) -> int:
+        """Set (or remove) the SOB change of from_month on BOM lines of the main code, and log it."""
+        uses = {(("root", use["model_bom_id"]) if use["model_bom_id"] else ("component", use["component_id"])): use for use in code_uses(db, main)}
+        for key in line_keys:
+            if key not in uses:
+                raise HTTPException(status_code=422, detail=f"A selected BOM line does not use {main.code}; refresh and try again")
+        codes = dict(db.execute(select(Item.id, Item.code).where(Item.id.in_(list(values) or [-1]))).all())
+        user = request.state.user
+        changed = 0
+        for kind, line_id in line_keys:
+            column = BOMLineAlternate.model_bom_id if kind == "root" else BOMLineAlternate.component_id
+            removed = db.execute(delete(BOMLineAlternate).where(column == line_id, BOMLineAlternate.from_month == from_month)).rowcount
+            if action == "set":
                 for alternate_id, sob in values.items():
                     db.add(BOMLineAlternate(model_bom_id=line_id if kind == "root" else None, component_id=line_id if kind == "component" else None,
                                             main_item_id=main.id, alternate_item_id=alternate_id, sob_percent=sob, from_month=from_month))
+            elif not removed:
+                continue
+            use = uses[(kind, line_id)]
+            db.add(SOBChangeLog(changed_at=datetime.now(), changed_by=user.get("full_name") or user["username"],
+                                action="Set" if action == "set" else "Removed", main_item_id=main.id, main_code=main.code,
+                                level=use["level"], used_in=use["used_in"], from_month=from_month,
+                                sob_text=sob_text(values, codes) if action == "set" else ""))
+            changed += 1
+        return changed
+
+    def checked_values(db: Session, main: Item, alternates: list[LineAlternateSOB]) -> dict[int, float]:
+        allowed = [a.alternate_item_id for a in alternate_groups(db, [main.id]).get(main.id, [])]
+        seen: set[int] = set()
+        for entry in alternates:
+            if entry.alternate_item_id not in allowed:
+                other = db.get(Item, entry.alternate_item_id)
+                raise HTTPException(status_code=422, detail=f"{other.code if other else 'This code'} is not an alternate of {main.code}; add it in Product Master → Alternate codes first")
+            if entry.alternate_item_id in seen:
+                raise HTTPException(status_code=422, detail="An alternate code is listed twice")
+            seen.add(entry.alternate_item_id)
+        total = sum(entry.sob_percent for entry in alternates)
+        if total > 100 + 1e-9:
+            raise HTTPException(status_code=422, detail=f"Alternate SOB adds up to {total:g}%; the total cannot be more than 100%")
+        values = {alternate_id: 0.0 for alternate_id in allowed}
+        values.update({entry.alternate_item_id: entry.sob_percent for entry in alternates})
+        return values
+
+    def clean_month(value: str) -> str:
+        value = (value or "").strip()
+        return _month_text(_month(value)) if value else ""
+
+    @app.get("/api/planning/alternate-codes/uses")
+    def alternate_code_uses(request: Request, main_item_id: int, month: str | None = None):
+        """Where a main code is used (L1 / L2 / L3 BOM lines), with each line's SOB this month,
+        the next change and the full history: the Manage SOB view of Alternate codes."""
+        current_user(request)
+        month = clean_month(month) if month else _month_text(date.today())
+        with open_db() as db:
+            main = db.get(Item, main_item_id)
+            if not main:
+                raise HTTPException(status_code=404, detail="Main code not found")
+            price = bom_price_lookup(db, [main.id])
+            alternates = price.alternates(main.id)
+            if not alternates:
+                raise HTTPException(status_code=404, detail=f"{main.code} has no alternate codes")
+            uses = code_uses(db, main)
+            saved = line_sobs(db, [u["model_bom_id"] for u in uses if u["model_bom_id"]], [u["component_id"] for u in uses if u["component_id"]])
+            for use in uses:
+                key = ("root", use["model_bom_id"]) if use["model_bom_id"] else ("component", use["component_id"])
+                listed, main_share, next_change = line_alternates(price, main, saved.get(key, []), use["quantity"], month)
+                use["sob"] = {a["material_id"]: a["sob_percent"] for a in listed}
+                use["main_sob_percent"] = main_share
+                use["next_change"] = next_change
+                use["history"] = line_history_rows(db, use["model_bom_id"], use["component_id"], main)
+            return {"main": {"id": main.id, "code": main.code, "name": main.name, "uom": main.uom}, "month": month,
+                    "alternates": [{"id": a["material_id"], "code": a["code"], "name": a["name"]} for a in alternates], "uses": uses}
+
+    @app.post("/api/planning/alternate-sob")
+    def save_alternate_sob(payload: AlternateSOBInput, request: Request):
+        """Set the alternates' SOB from a month on the ticked uses of the main code (or remove
+        that month's change from them). Logged in the SOB change log."""
+        current_user(request)
+        _check_supply_role(request)
+        if payload.action not in {"set", "remove"}:
+            raise HTTPException(status_code=422, detail="action must be set or remove")
+        if not payload.lines:
+            raise HTTPException(status_code=422, detail="Tick at least one use (BOM line)")
+        from_month = clean_month(payload.from_month)
+        with open_db() as db:
+            main = db.get(Item, payload.main_item_id)
+            if not main:
+                raise HTTPException(status_code=404, detail="Main code not found")
+            values = checked_values(db, main, payload.alternates) if payload.action == "set" else {}
+            keys = []
+            for line in payload.lines:
+                if (line.model_bom_id is None) == (line.component_id is None):
+                    raise HTTPException(status_code=422, detail="Each line needs either model_bom_id or component_id")
+                keys.append(("root", line.model_bom_id) if line.model_bom_id is not None else ("component", line.component_id))
+            changed = write_sob_change(db, request, main, keys, values, from_month, payload.action)
+            if payload.action == "remove" and not changed:
+                raise HTTPException(status_code=404, detail=f"None of the ticked uses has an SOB change from {from_month or 'the start'}")
             db.commit()
-            return {"main_code": main.code, "main_sob_percent": 100 - total, "from_month": from_month, "lines": len(lines),
+            return {"main_code": main.code, "from_month": from_month, "lines": changed,
+                    "main_sob_percent": 100 - sum(values.values()) if values else None}
+
+    @app.put("/api/planning/bom-line-alternates")
+    def save_line_alternates(payload: LineAlternatesInput, request: Request):
+        """One BOM line's SOB from a month (or every line using the code); same as Manage SOB."""
+        current_user(request)
+        _check_supply_role(request)
+        from_month = clean_month(payload.from_month)
+        with open_db() as db:
+            _, main = bom_line(db, payload.model_bom_id, payload.component_id)
+            values = checked_values(db, main, payload.alternates)
+            if payload.apply_everywhere:
+                keys = [("root", u["model_bom_id"]) if u["model_bom_id"] else ("component", u["component_id"]) for u in code_uses(db, main)]
+            else:
+                keys = [("root", payload.model_bom_id) if payload.model_bom_id is not None else ("component", payload.component_id)]
+            changed = write_sob_change(db, request, main, keys, values, from_month, "set")
+            db.commit()
+            return {"main_code": main.code, "main_sob_percent": 100 - sum(values.values()), "from_month": from_month, "lines": changed,
                     "history": line_history_rows(db, payload.model_bom_id, payload.component_id, main)}
 
     @app.delete("/api/planning/bom-line-alternates", status_code=204)
@@ -2889,14 +3030,50 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         current_user(request)
         _check_supply_role(request)
         with open_db() as db:
-            bom_line(db, model_bom_id, component_id)
-            column = BOMLineAlternate.model_bom_id if model_bom_id is not None else BOMLineAlternate.component_id
-            removed = db.execute(delete(BOMLineAlternate).where(column == (model_bom_id if model_bom_id is not None else component_id),
-                                                                 BOMLineAlternate.from_month == from_month)).rowcount
-            if not removed:
+            _, main = bom_line(db, model_bom_id, component_id)
+            key = ("root", model_bom_id) if model_bom_id is not None else ("component", component_id)
+            if not write_sob_change(db, request, main, [key], {}, from_month, "remove"):
                 raise HTTPException(status_code=404, detail="No SOB change from this month on this line")
             db.commit()
             return Response(status_code=204)
+
+    def sob_log_rows(db: Session, search: str = "") -> Any:
+        statement = select(SOBChangeLog)
+        if search.strip():
+            needle = f"%{search.strip().lower()}%"
+            statement = statement.where(or_(func.lower(SOBChangeLog.main_code).like(needle), func.lower(SOBChangeLog.used_in).like(needle),
+                                            func.lower(SOBChangeLog.sob_text).like(needle), func.lower(SOBChangeLog.changed_by).like(needle)))
+        return statement
+
+    def sob_log_json(entry: SOBChangeLog) -> dict:
+        return {"id": entry.id, "changed_at": entry.changed_at.strftime("%Y-%m-%d %H:%M"), "changed_by": entry.changed_by,
+                "action": entry.action, "main_code": entry.main_code, "level": entry.level, "used_in": entry.used_in,
+                "from_month": entry.from_month, "sob_text": entry.sob_text}
+
+    @app.get("/api/planning/sob-change-log")
+    def sob_change_log(request: Request, search: str = "", offset: int = 0, limit: int = 500):
+        current_user(request)
+        if limit < 1 or limit > 1000 or offset < 0:
+            raise HTTPException(status_code=422, detail="Use limit 1–1000 and a non-negative offset")
+        with open_db() as db:
+            statement = sob_log_rows(db, search)
+            total = db.scalar(select(func.count()).select_from(statement.subquery()))
+            entries = db.scalars(statement.order_by(SOBChangeLog.id.desc()).offset(offset).limit(limit)).all()
+            return {"total": total, "offset": offset, "limit": limit, "items": [sob_log_json(e) for e in entries]}
+
+    @app.get("/api/planning/sob-change-log.{file_format}")
+    def export_sob_change_log(file_format: str, request: Request, search: str = ""):
+        current_user(request)
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        with open_db() as db:
+            rows = [sob_log_json(e) for e in db.scalars(sob_log_rows(db, search).order_by(SOBChangeLog.id.desc())).all()]
+        headers = ["Changed on", "Changed by", "Action", "Main code", "Level", "Used in", "SOB from month", "SOB split"]
+        values = [[r["changed_at"], r["changed_by"], r["action"], r["main_code"], r["level"], r["used_in"],
+                   r["from_month"] or "Start (all months)", r["sob_text"]] for r in rows]
+        output = _generic_workbook("SOB change log", headers, values) if file_format == "xlsx" else _generic_pdf("SOB change log", headers, values)
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if file_format == "xlsx" else "application/pdf"
+        return StreamingResponse(output, media_type=media, headers={"Content-Disposition": f'attachment; filename="sob-change-log.{file_format}"'})
 
     @app.get("/api/planning/alternate-codes")
     def list_alternate_codes(request: Request, search: str = "", offset: int = 0, limit: int = 500):
