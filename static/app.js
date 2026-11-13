@@ -502,7 +502,8 @@ async function renderMaster() {
     }));
   }).join("");
   const modelRows = state.models.map((item) => `<tr data-edit-model="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.product_names?.join(", ") || "Unassigned")}</td><td><button class="text-button" data-edit-model="${item.id}">Edit</button><button class="text-button button-danger" data-delete-model="${item.id}">Delete</button></td></tr>`).join("");
-  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master"];
+  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master", "Alternate codes"];
+  const altTab = state.bomTab === "Alternate codes";
   const tierTab = TIER_TABS[state.bomTab];
   const bomTemplateKind = {
     "Model BOM Level 1": "bom-oem", "Level 2 Part BOM": "bom-level-2", "Level 3 Part BOM": "bom-level-3",
@@ -512,6 +513,18 @@ async function renderMaster() {
     : state.bomTab === "Material Master"
       ? '<button class="button" data-action="new-model">Add model</button><button class="button button-primary" data-action="new-material">Add material</button>'
       : tierTab ? `<button class="button button-primary" data-action="new-tier-material">Add ${tierTab} material</button>` : "";
+  const altSection = `<section class="panel table-panel">${panelHeader("Alternate codes", "Your own alternate code for a part code you buy (e.g. FL001MICROCHIPNEO for FL001MICROCHIP). It applies everywhere the main code is used: the alternate takes its SOB % of the main code's demand (Shortage & excess, PO plan) and BOM cost; the main code keeps the rest. Both codes come from T1 Material Master, are bought parts and use the same unit.")}
+      <form id="altAddForm" class="panel-body form-grid">
+        <label class="field"><span>Search main code</span><input class="form-control" id="altMainSearch" type="search" placeholder="Type a code or name" /></label>
+        <label class="field"><span>Main code (purchased parts)</span><select class="form-control" id="altMainSelect" required><option value="">Loading…</option></select></label>
+        <label class="field"><span>Search alternate code</span><input class="form-control" id="altAltSearch" type="search" placeholder="Type a code or name" /></label>
+        <label class="field"><span>Alternate code (purchased parts)</span><select class="form-control" id="altAltSelect" required><option value="">Loading…</option></select></label>
+        <label class="field"><span>Alternate SOB (%)</span><input class="form-control" type="number" name="sob_percent" min="0.01" max="100" step="any" required placeholder="e.g. 40" /></label>
+        <div class="field"><span>&nbsp;</span><button class="button button-primary" type="submit">Add alternate code</button></div>
+      </form>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search main or alternate code / name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/alternate-codes.xlsx">Template</a><a class="button button-small" href="/api/planning/alternate-codes.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/alternate-codes.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <form id="altUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload alternate codes (Main code, Alternate code, SOB %; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
+      <div id="altTable"></div></section>`;
   content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", actions)}
     <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab === "Material Master" ? "T1 Material Master" : tab)}</button>`).join("")}</div>
     ${state.bomTab === "Product Master" ? `<section class="panel table-panel">${panelHeader("Product Master")}
@@ -524,6 +537,7 @@ async function renderMaster() {
       <h3 class="subtable-heading">Model Master <button class="button button-small button-primary" data-action="new-model">Add line</button>${tableExportLinks("models")}</h3>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="modelMasterSearch" type="search" placeholder="Search model code or name" /></label><button class="button button-small" type="button" data-execute-model-search>Execute</button><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="modelMasterTable">${table(["Model code", "Model name", "Assigned products", "Action"], modelRows, "No models yet.")}</div></section>`
+    : altTab ? altSection
     : tierTab ? `<section class="panel table-panel">${panelHeader(`${tierTab} Material Master`, `Codes used further down the supply chain (${tierTab === "T2" ? "by your T1 suppliers' suppliers" : "by your T2 suppliers' suppliers"}). Not part of your planning; suppliers pick them into their own material master. A code can be in only one of T1, T2 or T3.`)}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="tierUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload ${tierTab} Material Master (Code, Name, Category, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
@@ -550,6 +564,8 @@ async function renderMaster() {
   } else if (state.bomTab === "Material Master") {
     $("#masterSearch").dataset.tableFilterRoot = "#materialMasterTable";
     $("#modelMasterSearch").dataset.tableFilterRoot = "#modelMasterTable";
+  } else if (altTab) {
+    initAlternateCodesTab();
   } else if (tierTab) {
     await loadTierMaterialPage(0);
     $("#tierUploadForm").addEventListener("submit", async (event) => {
@@ -699,9 +715,22 @@ function treePrice(item) {
   return `<span title="${esc(item.price_source || "")}">${money(item.unit_price, item.currency)}</span>`;
 }
 
+// A main code's alternate codes follow its row: same level column, SOB share of the quantity,
+// the alternate's own price. Columns to the left repeat the main row's parents.
+function withAlternates(tab, row, item, level) {
+  if (!item.alternates?.length) return treeRowHtml(tab, row);
+  const main = { ...row, cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}%`] } };
+  const inherit = TREE_LEVELS[tab].flatMap((name, index) => row.cells[name] || [row.inherit?.[index * 2] || "", row.inherit?.[index * 2 + 1] || ""]);
+  return treeRowHtml(tab, main) + item.alternates.map((alt) => treeRowHtml(tab, {
+    depth: row.depth, inherit, className: "tree-alternate", attributes: `data-alternate-of="${item.material_id}"`,
+    cells: { [level]: [`↳ ${alt.code}`, `${alt.name} · alternate ${number(alt.sob_percent, 2)}%`] },
+    quantity: number(alt.quantity, 4), uom: alt.uom, price: treePrice(alt),
+  })).join("");
+}
+
 function level1RowHtml(tab, item, modelId, depth, showModel, inherit) {
   const data = `data-model-id="${modelId}" data-material-id="${item.material_id}" data-quantity="${item.edit_quantity}" data-uom="${esc(item.uom)}"`;
-  return treeRowHtml(tab, {
+  return withAlternates(tab, {
     depth, inherit, className: "clickable-row",
     attributes: `data-bom-level1-row data-has-bom="${item.has_bom}" data-edit-bom-row="${item.root_bom_id || ""}" ${data}`,
     cells: { ...(showModel ? { model: [item.model_code, item.model_name] } : {}), l1: [item.code, item.name] },
@@ -709,14 +738,14 @@ function level1RowHtml(tab, item, modelId, depth, showModel, inherit) {
     quantity: number(item.quantity), uom: item.uom, price: treePrice(item),
     edit: `<button class="text-button" data-edit-bom-row="${item.root_bom_id || ""}" ${data}>Edit</button>`,
     remove: `<button class="text-button button-danger" data-delete-bom-row="${item.root_bom_id || ""}" data-model-id="${modelId}">Delete</button>`,
-  });
+  }, item, "l1");
 }
 
 function partRowHtml(tab, item, parent, lineLevel, depth, inherit) {
   const level = lineLevel === "Level 2 Part BOM" ? "l2" : "l3";
   const expandable = level === "l2" && item.has_bom;
   const data = `data-parent-item="${parent.id}" data-material-id="${item.material_id}" data-quantity="${item.quantity}" data-uom="${esc(item.uom)}"`;
-  return treeRowHtml(tab, {
+  return withAlternates(tab, {
     depth, inherit, className: "clickable-row",
     attributes: `data-bom-level2-row data-has-bom="${expandable}" data-edit-component-row="${item.component_id}" ${data}`,
     cells: { [level]: [item.code, item.name] },
@@ -724,7 +753,7 @@ function partRowHtml(tab, item, parent, lineLevel, depth, inherit) {
     quantity: number(item.quantity), uom: item.uom, price: treePrice(item),
     edit: `<button class="text-button" data-edit-component-row="${item.component_id}" ${data}>Edit</button>`,
     remove: `<button class="text-button button-danger" data-delete-component-row="${item.component_id}" data-parent-item="${parent.id}">Delete</button>`,
-  });
+  }, item, level);
 }
 
 async function expandBomTree(button) {
@@ -902,6 +931,61 @@ function openTierMaterial(material = null) {
       modalLayer.hidden = true;
       toast(`${tier} material saved`);
       loadTierMaterialPage(0);
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
+// Alternate codes (Product Master tab): main code + alternate code + alternate SOB %
+function initAlternateCodesTab() {
+  bindMaterialSearch("altMainSearch", "altMainSelect", null, { purchased: true, loadNow: true });
+  bindMaterialSearch("altAltSearch", "altAltSelect", null, { purchased: true, loadNow: true });
+  $("#altAddForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const body = { main_item_id: Number($("#altMainSelect").value), alternate_item_id: Number($("#altAltSelect").value), sob_percent: Number(form.elements.sob_percent.value) };
+    try {
+      const saved = await api("/api/planning/alternate-codes", { method: "POST", body: JSON.stringify(body) });
+      toast(`${saved.alternate_code} added as alternate of ${saved.main_code} (${number(saved.sob_percent, 2)}%)`);
+      form.elements.sob_percent.value = "";
+      loadAlternateCodes(0);
+    } catch (error) { toast(error.message, true); }
+  });
+  $("#altUploadForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    try {
+      const result = await uploadExcel("/api/planning/alternate-codes/upload", new FormData(form).get("workbook"));
+      toast(`${result.rows} row(s): ${result.added} added, ${result.updated} updated`);
+      form.reset();
+      loadAlternateCodes(0);
+    } catch (error) { toast(error.message, true); }
+  });
+  loadAlternateCodes(0);
+}
+
+async function loadAlternateCodes(offset = 0) {
+  const target = $("#altTable");
+  if (!target) return;
+  const search = $("#masterSearch")?.value.trim() || "";
+  const result = await api(`/api/planning/alternate-codes?${new URLSearchParams({ offset: String(offset), limit: "500", search })}`);
+  state.altItems = result.items;
+  const priced = canSeePrices();
+  const rows = result.items.map((a) => `<tr><td>${esc(a.main_code)}</td><td>${esc(a.main_name)}</td><td>${number(a.main_sob_percent, 2)}%</td><td>${esc(a.alternate_code)}</td><td>${esc(a.alternate_name)}</td><td>${number(a.sob_percent, 2)}%</td><td>${esc(a.uom)}</td><td>${priced && a.main_unit_price !== undefined ? money(a.main_unit_price, a.main_currency) : "Restricted"}</td><td>${priced && a.unit_price !== undefined ? money(a.unit_price, a.currency) : "Restricted"}</td><td><button class="text-button" data-alt-edit="${a.id}">Edit</button></td><td><button class="text-button button-danger" data-alt-delete="${a.id}">Delete</button></td></tr>`).join("");
+  target.innerHTML = `${table(["Main code", "Main name", "Main SOB", "Alternate code", "Alternate name", "Alternate SOB", "Unit", "Main price", "Alternate price", "Edit", "Delete"], rows, search ? "No alternate codes match this search." : "No alternate codes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No alternate codes"}</span><div><button class="button button-small" data-alt-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-alt-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+}
+
+function openAlternateEdit(entry) {
+  if (!entry) return;
+  $("#modalTitle").textContent = `Alternate ${entry.alternate_code} of ${entry.main_code}`;
+  $("#modalBody").innerHTML = `<form id="altEditForm" class="form-grid">${field("Alternate SOB (%)", "sob_percent", "number", { required: true, min: 0.01, max: 100, step: "any", value: entry.sob_percent })}<p class="subtle field full">The main code ${esc(entry.main_code)} keeps 100% minus all its alternates' SOB.</p><div class="modal-footer field full"><button class="button button-primary">Save SOB</button></div></form>`;
+  modalLayer.hidden = false;
+  $("#altEditForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api(`/api/planning/alternate-codes/${entry.id}`, { method: "PATCH", body: JSON.stringify({ sob_percent: Number(event.currentTarget.elements.sob_percent.value) }) });
+      modalLayer.hidden = true;
+      toast("SOB saved");
+      loadAlternateCodes(0);
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -2006,6 +2090,7 @@ document.addEventListener("click", async (event) => {
   if (event.target.closest("[data-execute-master-search]")) {
     if (state.bomTab === "Material Master") return loadMaterialMasterPage(0);  // server search over all codes
     if (TIER_TABS[state.bomTab]) return loadTierMaterialPage(0);
+    if (state.bomTab === "Alternate codes") return loadAlternateCodes(0);
     return applyTableSearch({ target: $("#masterSearch") });
   }
   if (event.target.closest('[data-action="new-tier-material"]')) return openTierMaterial();
@@ -2017,6 +2102,16 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/planning/tier-materials/${tierDelete.dataset.tierDelete}`, { method: "DELETE" }); toast("Code deleted"); return loadTierMaterialPage(0); }
     catch (error) { toast(error.message, true); return; }
   }
+  const altEdit = event.target.closest("[data-alt-edit]");
+  if (altEdit) return openAlternateEdit((state.altItems || []).find((a) => String(a.id) === altEdit.dataset.altEdit));
+  const altDelete = event.target.closest("[data-alt-delete]");
+  if (altDelete) {
+    if (!window.confirm("Delete this alternate code? Its demand and cost go back to the main code.")) return;
+    try { await api(`/api/planning/alternate-codes/${altDelete.dataset.altDelete}`, { method: "DELETE" }); toast("Alternate code deleted"); return loadAlternateCodes(0); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const altPage = event.target.closest("[data-alt-page]");
+  if (altPage) return loadAlternateCodes(Number(altPage.dataset.altPage));
   const tierPage = event.target.closest("[data-tier-page]");
   if (tierPage) return loadTierMaterialPage(Number(tierPage.dataset.tierPage));
   const materialPage = event.target.closest("[data-material-page]");

@@ -42,6 +42,16 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 - **T2 / T3 Material Master** tabs: codes used further down the supply chain (by your suppliers' suppliers): code, name, category, unit, reference price. Form, edit/delete, search, Excel upload/download.
 - A code can be in only one of T1, T2 or T3 (checked on every save and upload, case-insensitive).
 
+## Alternate codes
+
+**Product Master → Alternate codes** holds your own alternate code for a part code you buy (e.g. `FL001MICROCHIPNEO` for `FL001MICROCHIP`), with the alternate's SOB %. It applies everywhere the main code is used:
+
+- **BOM price:** main share × main price + each alternate's SOB × its own price (each code's own price is its SOB-weighted Direct supplier price, or the Material Master price). If the codes are priced in different currencies, the main code's price is shown.
+- **BOM tree (screen, Excel, PDF):** each alternate follows its main code's row, with its SOB share of the line quantity and its own price; the main row shows "main N%".
+- **Planning:** Shortage & excess and the PO plan split the main code's demand: the alternate takes its SOB %, the main code keeps the rest (100 − all its alternates' SOB).
+
+Rules: both codes are in T1 Material Master, are bought parts (no in-house BOM, no negative BOM quantity) and use the same unit; an alternate belongs to one main code and has no alternates of its own; the alternates of a code add up to at most 100%. A code in Alternate codes cannot be deleted from T1 Material Master. Excel upload accepts your own headings (Main code / Part code, Alternate code, SOB %); all rows or none.
+
 ## Supplier materials and supplier BOM (cost breakdown)
 
 - **Supplier materials** tab: each supplier's material master. An entry is either picked from your T1, T2 or T3 Material Master (code and name follow your master) or the supplier's own code. Each entry carries the supplier's own price (may differ from yours), lead time and buffer stock. Excel upload links codes found in T1/T2/T3 automatically; other codes become the supplier's own. Supplier BOM lines and alternate codes use only codes from that supplier's material master.

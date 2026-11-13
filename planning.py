@@ -324,6 +324,19 @@ class SupplierBOMLineSource(Base):
     sob_percent: Mapped[float] = mapped_column(Float, default=100)
 
 
+class AlternateCode(Base):
+    """Your own alternate code for a part code (e.g. FL001MICROCHIPNEO for FL001MICROCHIP),
+    used everywhere the main code is used. The alternate takes sob_percent of the main
+    code's demand and cost; the main code keeps the rest (100 - sum of its alternates)."""
+    __tablename__ = "alternate_codes"
+    __table_args__ = (UniqueConstraint("main_item_id", "alternate_item_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    main_item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
+    alternate_item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), unique=True)
+    sob_percent: Mapped[float] = mapped_column(Float)
+
+
 class MaterialTransfer(Base):
     __tablename__ = "material_transfers"
 
@@ -418,6 +431,16 @@ class SupplierBOMLineInput(BaseModel):
     quantity: float = Field(ge=-1_000_000_000, le=1_000_000_000, allow_inf_nan=False)
     unit_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+
+class AlternateCodeInput(BaseModel):
+    main_item_id: int
+    alternate_item_id: int
+    sob_percent: float = Field(gt=0, le=100)
+
+
+class AlternateCodeUpdate(BaseModel):
+    sob_percent: float = Field(gt=0, le=100)
 
 
 class SupplierBOMLineUpdate(BaseModel):
@@ -600,6 +623,31 @@ TIER_MATERIAL_COLUMN_ALIASES = {
     "reference_price": "unit_price", "currency": "currency",
 }
 
+ALTERNATE_CODE_COLUMN_ALIASES = {
+    "main_code": "main_code", "main_part_code": "main_code", "part_code": "main_code", "material_code": "main_code",
+    "main_material_code": "main_code", "original_code": "main_code", "code": "main_code",
+    "alternate_code": "alternate_code", "alternate_part_code": "alternate_code", "alt_code": "alternate_code",
+    "alternate": "alternate_code", "alternative_code": "alternate_code", "new_code": "alternate_code",
+    "sob": "sob_percent", "sob_percent": "sob_percent", "sob_%": "sob_percent", "alternate_sob": "sob_percent",
+    "alternate_sob_percent": "sob_percent", "share": "sob_percent", "share_percent": "sob_percent",
+}
+
+
+def _split_alternate_usage(usage: dict[int, float], groups: dict[int, list[tuple[int, float]]]) -> dict[int, float]:
+    """Move each alternate's SOB share of a main code's quantity onto the alternate code:
+    main keeps (100 - sum of alternates' SOB)%, each alternate gets its SOB%."""
+    if not groups:
+        return usage
+    result = dict(usage)
+    for main_id, quantity in usage.items():
+        alternates = groups.get(main_id)
+        if not alternates:
+            continue
+        result[main_id] = result.get(main_id, 0) - quantity * sum(sob for _, sob in alternates) / 100
+        for alternate_id, sob in alternates:
+            result[alternate_id] = result.get(alternate_id, 0) + quantity * sob / 100
+    return result
+
 
 def _price_cells(row: dict, row_number: int, can_price: bool) -> tuple[float, str]:
     try:
@@ -775,8 +823,12 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
     if cycle_ids:
         for row in db.scalars(select(PlanLine).where(PlanLine.cycle_id.in_(cycle_ids))).all():
             plan_by_cycle_month.setdefault((row.cycle_id, row.target_month), {})[row.model_id] = row.quantity
+    alternate_groups: dict[int, list[tuple[int, float]]] = {}
+    for alternate in db.scalars(select(AlternateCode)).all():
+        alternate_groups.setdefault(alternate.main_item_id, []).append((alternate.alternate_item_id, alternate.sob_percent))
+    # Alternate codes take their SOB share of the main code's demand.
     material_usage_by_model = {
-        model_id: _rollup_model_bom(roots_by_model.get(model_id, []), children)
+        model_id: _split_alternate_usage(_rollup_model_bom(roots_by_model.get(model_id, []), children), alternate_groups)
         for model_id in models
     }
     actuals = db.scalars(select(ActualProduction).where(
@@ -1687,6 +1739,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             )
             if referenced:
                 raise HTTPException(status_code=409, detail="This material is used by a BOM, supplier, supplier material master, stock snapshot or transfer; remove those references first")
+            if db.scalar(select(AlternateCode.id).where(or_(AlternateCode.main_item_id == material_id, AlternateCode.alternate_item_id == material_id)).limit(1)):
+                raise HTTPException(status_code=409, detail="This material is a main or alternate code in Alternate codes; remove it there first")
             db.delete(item)
             db.commit()
             return Response(status_code=204)
@@ -1746,6 +1800,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if price:
                 row.update(price(item))
             result[root.model_id].append(row)
+        add_alternates(db, [row for rows in result.values() for row in rows], can_price)
         return result
 
     @app.post("/api/planning/model-bom/{model_id}", status_code=201)
@@ -1828,21 +1883,40 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         generated = select(BOMComponent.child_item_id).where(BOMComponent.quantity < 0)
         return statement.where(Item.id.not_in(made), Item.id.not_in(generated))
 
+    def alternate_groups(db: Session, main_ids: Iterable[int] | None = None) -> dict[int, list[AlternateCode]]:
+        statement = select(AlternateCode).order_by(AlternateCode.id)
+        if main_ids is not None:
+            main_ids = list(main_ids)
+            if not main_ids:
+                return {}
+            statement = statement.where(AlternateCode.main_item_id.in_(main_ids))
+        groups: dict[int, list[AlternateCode]] = {}
+        for alternate in db.scalars(statement).all():
+            groups.setdefault(alternate.main_item_id, []).append(alternate)
+        return groups
+
     def bom_price_lookup(db: Session, material_ids: Iterable[int] | None = None):
-        """BOM part price = SOB-weighted price of the code's Direct suppliers:
-        sum(price x SOB) / sum(SOB). Falls back to the Material Master price when no Direct
-        supplier has a price, or when the suppliers quote in different currencies."""
+        """BOM part price. Each code's own price = SOB-weighted price of its Direct suppliers:
+        sum(price x SOB) / sum(SOB); Material Master price when no Direct supplier has a price,
+        or when the suppliers quote in different currencies. A code with alternate codes is
+        priced main share x main price + each alternate's SOB x its own price.
+        price.alternates(item_id) lists the alternates with their SOB and own price."""
+        if material_ids is not None:
+            material_ids = set(material_ids)
+        groups = alternate_groups(db, material_ids)
+        alternate_ids = {alternate.alternate_item_id for group in groups.values() for alternate in group}
+        alternate_items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(alternate_ids))).all()} if alternate_ids else {}
         links: dict[int, list[SupplierPart]] = {}
         statement = select(SupplierPart).where(
             SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None),
             SupplierPart.sob_percent > 0, SupplierPart.unit_price > 0,
         )
         if material_ids is not None:
-            statement = statement.where(SupplierPart.material_id.in_(list(material_ids)))
+            statement = statement.where(SupplierPart.material_id.in_(list(material_ids | alternate_ids)))
         for link in db.scalars(statement).all():
             links.setdefault(link.material_id, []).append(link)
 
-        def price(item: Item) -> dict:
+        def own_price(item: Item) -> dict:
             quoted = links.get(item.id, [])
             if quoted and len({link.currency for link in quoted}) == 1:
                 share = sum(link.sob_percent for link in quoted)
@@ -1850,7 +1924,51 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         "currency": quoted[0].currency, "price_source": f"SOB-weighted ({len(quoted)} supplier{'s' if len(quoted) > 1 else ''})"}
             source = "Material Master (suppliers in different currencies)" if quoted else "Material Master"
             return {"unit_price": item.unit_cost, "currency": item.currency, "price_source": source}
+
+        def alternates(item_id: int) -> list[dict]:
+            rows = []
+            for alternate in groups.get(item_id, []):
+                item = alternate_items.get(alternate.alternate_item_id)
+                if item:
+                    rows.append({"id": alternate.id, "material_id": item.id, "code": item.code, "name": item.name,
+                                 "uom": item.uom, "sob_percent": alternate.sob_percent, **own_price(item)})
+            return rows
+
+        def price(item: Item) -> dict:
+            main = own_price(item)
+            others = alternates(item.id)
+            if not others:
+                return main
+            main_share = 100 - sum(alternate["sob_percent"] for alternate in others)
+            parts = ([(main_share, item.code, main)] if main_share > 0 else []) + [(a["sob_percent"], a["code"], a) for a in others]
+            if len({part["currency"] for _, _, part in parts}) != 1:
+                return {**main, "price_source": f"{main['price_source']}; main code only (alternate codes priced in another currency)"}
+            detail = " + ".join(f"{code} {share:g}% x {part['unit_price']:,.2f}" for share, code, part in parts)
+            return {"unit_price": sum(share * part["unit_price"] for share, _, part in parts) / 100,
+                    "currency": parts[0][2]["currency"], "price_source": f"SOB-weighted with alternate codes: {detail}"}
+
+        price.alternates = alternates
+        price.own = own_price
         return price
+
+    def add_alternates(db: Session, rows: list[dict], can_price: bool) -> None:
+        """Each BOM row whose code has alternate codes gets 'main_sob_percent' and 'alternates'
+        (code, name, SOB %, its share of the line quantity and, with price access, its own price)."""
+        groups = alternate_groups(db, {row["material_id"] for row in rows})
+        if not groups:
+            return
+        price = bom_price_lookup(db, groups)
+        for row in rows:
+            listed = price.alternates(row["material_id"])
+            if not listed:
+                continue
+            row["main_sob_percent"] = 100 - sum(alternate["sob_percent"] for alternate in listed)
+            for alternate in listed:
+                alternate["quantity"] = row["quantity"] * alternate["sob_percent"] / 100
+                if not can_price:
+                    for key in ("unit_price", "currency", "price_source"):
+                        alternate.pop(key, None)
+            row["alternates"] = listed
 
     def bom_parent_material_ids(db: Session, tab: str) -> set[int]:
         level1_ids = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
@@ -1934,6 +2052,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 price = bom_price_lookup(db, child_ids)
                 for row in rows:
                     row.update(price(items_by_id[row["material_id"]]))
+            add_alternates(db, rows, can_price)
             return {
                 "tab": tab, "parent": {"id": parent.id, "code": parent.code, "name": parent.name},
                 "total": len(rows), "offset": offset, "limit": limit, "items": rows[offset:offset + limit],
@@ -1985,6 +2104,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 if can_price:
                     row.update(price(child))
                 rows.append(row)
+            add_alternates(db, rows, can_price)
             return {
                 "tab": tab, "total": len(rows), "offset": offset, "limit": limit,
                 "items": rows[offset:offset + limit],
@@ -2353,7 +2473,6 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"rows": len(rows), "added": added, "updated": updated, "suppliers_created": created}
 
-    # ------------------------------------------------------------------ supplier materials
     # ------------------------------------------------------------------ T2 / T3 Material Master
     def tier_material_json(material: TierMaterial, can_price: bool) -> dict:
         data = {"id": material.id, "tier": material.tier, "code": material.code, "name": material.name, "category": material.category, "uom": material.uom}
@@ -2488,6 +2607,185 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         output = _generic_workbook(title, headers, values) if file_format == "xlsx" else _generic_pdf(title, headers, values)
         media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if file_format == "xlsx" else "application/pdf"
         return StreamingResponse(output, media_type=media, headers={"Content-Disposition": f'attachment; filename="{tier.lower()}-material-master.{file_format}"'})
+
+    # ------------------------------------------------------------------ alternate codes
+    def check_alternate(db: Session, main: Item | None, alternate: Item | None, existing_id: int | None = None) -> None:
+        """Rules for an alternate code: both in T1 Material Master, both bought parts, same unit,
+        one level only (an alternate has no alternates of its own) and one main code per alternate."""
+        if not main or not alternate:
+            raise HTTPException(status_code=404, detail="Main or alternate code not found in T1 Material Master")
+        if main.id == alternate.id:
+            raise HTTPException(status_code=422, detail=f"{main.code} cannot be its own alternate")
+        if main.uom != alternate.uom:
+            raise HTTPException(status_code=422, detail=f"{alternate.code} is in {alternate.uom} but {main.code} is in {main.uom}; an alternate must use the same unit")
+        for item in (main, alternate):
+            reason = not_purchased_reason(db, item.id)
+            if reason:
+                raise HTTPException(status_code=422, detail=f"{item.code} {reason}; alternate codes are only for parts you buy")
+        others = select(AlternateCode).where(AlternateCode.id != existing_id) if existing_id else select(AlternateCode)
+        taken = db.scalar(others.where(AlternateCode.alternate_item_id == alternate.id).limit(1))
+        if taken:
+            owner = db.get(Item, taken.main_item_id)
+            raise HTTPException(status_code=422, detail=f"{alternate.code} is already an alternate of {owner.code if owner else 'another code'}")
+        if db.scalar(others.where(AlternateCode.main_item_id == alternate.id).limit(1)):
+            raise HTTPException(status_code=422, detail=f"{alternate.code} has alternate codes of its own, so it cannot be an alternate")
+        if db.scalar(others.where(AlternateCode.alternate_item_id == main.id).limit(1)):
+            raise HTTPException(status_code=422, detail=f"{main.code} is itself an alternate code, so it cannot have alternates")
+
+    def check_alternate_share(db: Session, main_id: int) -> None:
+        total = db.scalar(select(func.sum(AlternateCode.sob_percent)).where(AlternateCode.main_item_id == main_id)) or 0
+        if total > 100 + 1e-9:
+            main = db.get(Item, main_id)
+            raise HTTPException(status_code=422, detail=f"Alternate codes of {main.code if main else 'this code'} add up to {total:g}% SOB; the total cannot be more than 100%")
+
+    def alternate_rows(db: Session, entries: list[AlternateCode], can_price: bool) -> list[dict]:
+        ids = {entry.main_item_id for entry in entries} | {entry.alternate_item_id for entry in entries}
+        items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(ids))).all()} if ids else {}
+        price = bom_price_lookup(db, {entry.main_item_id for entry in entries}) if can_price else None
+        totals: dict[int, float] = dict(db.execute(
+            select(AlternateCode.main_item_id, func.sum(AlternateCode.sob_percent))
+            .where(AlternateCode.main_item_id.in_({entry.main_item_id for entry in entries})).group_by(AlternateCode.main_item_id)
+        ).all()) if entries else {}
+        rows = []
+        for entry in entries:
+            main, alternate = items.get(entry.main_item_id), items.get(entry.alternate_item_id)
+            if not main or not alternate:
+                continue
+            row = {"id": entry.id, "main_item_id": main.id, "main_code": main.code, "main_name": main.name,
+                   "main_sob_percent": 100 - totals.get(main.id, 0), "alternate_item_id": alternate.id,
+                   "alternate_code": alternate.code, "alternate_name": alternate.name, "uom": main.uom,
+                   "sob_percent": entry.sob_percent}
+            if price:
+                main_price, alternate_price = price.own(main), price.own(alternate)
+                row.update(main_unit_price=main_price["unit_price"], main_currency=main_price["currency"],
+                           unit_price=alternate_price["unit_price"], currency=alternate_price["currency"])
+            rows.append(row)
+        return rows
+
+    @app.get("/api/planning/alternate-codes")
+    def list_alternate_codes(request: Request, search: str = "", offset: int = 0, limit: int = 500):
+        current_user(request)
+        if limit < 1 or limit > 1000 or offset < 0:
+            raise HTTPException(status_code=422, detail="Use limit 1–1000 and a non-negative offset")
+        with open_db() as db:
+            main_item, alternate_item = Item.__table__.alias("main_item"), Item.__table__.alias("alternate_item")
+            statement = (select(AlternateCode)
+                         .join(main_item, main_item.c.id == AlternateCode.main_item_id)
+                         .join(alternate_item, alternate_item.c.id == AlternateCode.alternate_item_id))
+            if search.strip():
+                needle = f"%{search.strip().lower()}%"
+                statement = statement.where(or_(func.lower(main_item.c.code).like(needle), func.lower(main_item.c.name).like(needle),
+                                                func.lower(alternate_item.c.code).like(needle), func.lower(alternate_item.c.name).like(needle)))
+            total = db.scalar(select(func.count()).select_from(statement.subquery()))
+            entries = db.scalars(statement.order_by(main_item.c.code, AlternateCode.id).offset(offset).limit(limit)).all()
+            return {"total": total, "offset": offset, "limit": limit,
+                    "items": alternate_rows(db, list(entries), _check_price_access(request))}
+
+    @app.post("/api/planning/alternate-codes", status_code=201)
+    def create_alternate_code(payload: AlternateCodeInput, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            check_alternate(db, db.get(Item, payload.main_item_id), db.get(Item, payload.alternate_item_id))
+            entry = AlternateCode(main_item_id=payload.main_item_id, alternate_item_id=payload.alternate_item_id, sob_percent=payload.sob_percent)
+            db.add(entry)
+            db.flush()
+            check_alternate_share(db, payload.main_item_id)
+            db.commit()
+            return alternate_rows(db, [entry], _check_price_access(request))[0]
+
+    @app.patch("/api/planning/alternate-codes/{alternate_id}")
+    def update_alternate_code(alternate_id: int, payload: AlternateCodeUpdate, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            entry = db.get(AlternateCode, alternate_id)
+            if not entry:
+                raise HTTPException(status_code=404, detail="Alternate code not found")
+            entry.sob_percent = payload.sob_percent
+            db.flush()
+            check_alternate_share(db, entry.main_item_id)
+            db.commit()
+            return alternate_rows(db, [entry], _check_price_access(request))[0]
+
+    @app.delete("/api/planning/alternate-codes/{alternate_id}", status_code=204)
+    def delete_alternate_code(alternate_id: int, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            entry = db.get(AlternateCode, alternate_id)
+            if not entry:
+                raise HTTPException(status_code=404, detail="Alternate code not found")
+            db.delete(entry)
+            db.commit()
+            return Response(status_code=204)
+
+    @app.post("/api/planning/alternate-codes/upload", status_code=201)
+    async def upload_alternate_codes(request: Request):
+        """Alternate codes from Excel (heading row found automatically): Main code, Alternate
+        code, SOB %. An existing main / alternate pair gets the new SOB. All rows or none."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = _read_flexible_sheet(await request.body(), ALTERNATE_CODE_COLUMN_ALIASES, {"main_code", "alternate_code", "sob_percent"})
+        with open_db() as db:
+            seen: set[tuple[str, str]] = set()
+            mains: set[int] = set()
+            added = updated = 0
+            for row in rows:
+                row_number = row["_excel_row"]
+                main_code, alternate_code = str(row.get("main_code") or "").strip(), str(row.get("alternate_code") or "").strip()
+                if not main_code or not alternate_code:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: main code and alternate code are required")
+                key = (main_code.lower(), alternate_code.lower())
+                if key in seen:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {main_code} / {alternate_code} is repeated in the file")
+                seen.add(key)
+                try:
+                    sob = float(str(row.get("sob_percent") if row.get("sob_percent") is not None else "").replace("%", "").strip())
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB % must be a number") from exc
+                if not 0 < sob <= 100:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB % must be more than 0 and at most 100")
+                main = db.scalar(select(Item).where(func.lower(Item.code) == key[0]))
+                alternate = db.scalar(select(Item).where(func.lower(Item.code) == key[1]))
+                if not main or not alternate:
+                    missing = main_code if not main else alternate_code
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {missing} is not in T1 Material Master")
+                existing = db.scalar(select(AlternateCode).where(AlternateCode.main_item_id == main.id, AlternateCode.alternate_item_id == alternate.id))
+                try:
+                    check_alternate(db, main, alternate, existing.id if existing else None)
+                except HTTPException as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=f"Row {row_number}: {exc.detail}") from exc
+                if existing:
+                    existing.sob_percent = sob
+                    updated += 1
+                else:
+                    db.add(AlternateCode(main_item_id=main.id, alternate_item_id=alternate.id, sob_percent=sob))
+                    added += 1
+                db.flush()
+                mains.add(main.id)
+            for main_id in mains:
+                check_alternate_share(db, main_id)
+            db.commit()
+            return {"rows": len(rows), "added": added, "updated": updated}
+
+    @app.get("/api/planning/alternate-codes.{file_format}")
+    def export_alternate_codes(file_format: str, request: Request):
+        current_user(request)
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            rows = alternate_rows(db, list(db.scalars(select(AlternateCode)).all()), can_price)
+        rows.sort(key=lambda row: (row["main_code"], row["alternate_code"]))
+        headers = ["Main code", "Main name", "Main SOB %", "Alternate code", "Alternate name", "Alternate SOB %", "Unit"]
+        if can_price:
+            headers += ["Main price", "Main currency", "Alternate price", "Alternate currency"]
+        values = [[r["main_code"], r["main_name"], r["main_sob_percent"], r["alternate_code"], r["alternate_name"], r["sob_percent"], r["uom"]]
+                  + ([r["main_unit_price"], r["main_currency"], r["unit_price"], r["currency"]] if can_price else []) for r in rows]
+        output = _generic_workbook("Alternate codes", headers, values) if file_format == "xlsx" else _generic_pdf("Alternate codes", headers, values)
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if file_format == "xlsx" else "application/pdf"
+        return StreamingResponse(output, media_type=media, headers={"Content-Disposition": f'attachment; filename="alternate-codes.{file_format}"'})
 
     # ------------------------------------------------------------------ supplier materials
     def supplier_material_json(material: SupplierMaterial, can_price: bool) -> dict:
@@ -3378,6 +3676,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             "actuals": ["model_code", "actual_quantity", "oem_stock"],
             "own-stock": ["material_code", "quantity"],
             "supplier-stock": ["supplier_code", "material_code", "tier", "parent_supplier_code", "quantity", "available_quantity", "arrival_month"],
+            "alternate-codes": ["main_code", "alternate_code", "sob_percent"],
             "supplier-parts": ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency",
                                "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months"],
         }
@@ -3670,6 +3969,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
             def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None) -> None:
                 tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity, "item": item})
+                # Alternate codes follow their main code's line, with their SOB share of its quantity.
+                if item is not None and quantity is not None:
+                    for alternate in price.alternates(item.id):
+                        tree.append({"depth": depth, "level": level, "has_children": False, "item": items.get(alternate["material_id"]),
+                                     "path": {**path, level: (alternate["code"], f"{alternate['name']} (alternate of {item.code}, SOB {alternate['sob_percent']:g}%)")},
+                                     "quantity": quantity * alternate["sob_percent"] / 100, "alternate": alternate})
 
             def part_lines(parent_id: int, level: str, depth: int, path: dict) -> None:
                 for link in children.get(parent_id, []):
@@ -3735,12 +4040,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         rows = []
         for entry in tree:
             item = entry["item"]
-            values = [BOM_TREE_LEVEL_NAMES[entry["level"]]]
+            values = [BOM_TREE_LEVEL_NAMES[entry["level"]] + (" alternate" if entry.get("alternate") else "")]
             for level in levels:
                 values.extend(entry["path"].get(level, ("", "")))
             values += [entry["quantity"] if entry["quantity"] is not None else "", item.uom if item else ""]
             if can_price:
-                priced = prices.get(item.id) if item else None
+                priced = (entry["alternate"] if entry.get("alternate") else prices.get(item.id)) if item else None
                 values += [priced["unit_price"] if priced else "", priced["currency"] if priced else ""]
             rows.append({"depth": entry["depth"], "has_children": entry["has_children"], "values": values})
         title = f"{tab if tab.endswith('BOM') else tab + ' BOM'} tree"

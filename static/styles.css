@@ -478,3 +478,7 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 .sb-sources-editor .form-control { margin-bottom: 4px; }
 .modal:has(.sb-sources-editor) { width: min(1000px, 100%); }
 .supplier-inline-form { border-bottom: 1px solid #edf1f4; }
+
+/* Alternate codes in the BOM tree: follow their main code's row */
+#pageContent[data-view="master"] tr.tree-alternate > td { font-style: italic; color: #7a5a12; background: #fffaf0; }
+#pageContent[data-view="master"] tr.tree-alternate > td.tree-inherited { color: #a08a5c; }
