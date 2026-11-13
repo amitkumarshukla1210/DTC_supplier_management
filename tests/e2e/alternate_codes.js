@@ -80,6 +80,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Alternate row repeats the parent (Motor)", altText.includes("AC-MOTOR"));
   const mainText = await mainRow.textContent();
   check("Main row shows main 60% and blended price 496", mainText.includes("main 60%") && mainText.includes("496"), mainText);
+  const mainCells = await mainRow.locator("td").allTextContents();
+  check("Main row quantity = its share 2 x 60% = 1.2, BOM quantity shown in the name", mainCells.includes("1.2") && mainText.includes("main 60% of 2"), JSON.stringify(mainCells));
+  check("Edit on the main row still carries the full BOM quantity 2", (await mainRow.getAttribute("data-quantity")) === "2");
 
   // edit SOB to 50% in the tab
   await page.click('[data-bom-tab="Alternate codes"]');
@@ -97,6 +100,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Level 1: alternate qty 1.5 and repeats the model code", l1Alt.includes("1.5") && l1Alt.includes("AC-MODEL"), JSON.stringify(l1Alt));
   const l1Main = await page.locator('#masterTable tr[data-bom-level1-row][data-material-id="' + chip + '"]').textContent();
   check("Level 1: main price 500 (50% x 480 + 50% x 520)", l1Main.includes("500") && l1Main.includes("main 50%"), l1Main);
+  check("Level 1: main quantity 3 x 50% = 1.5", (await page.locator('#masterTable tr[data-bom-level1-row][data-material-id="' + chip + '"] td').allTextContents()).includes("1.5"));
   await page.screenshot({ path: __dirname + "/alternate_codes.png" });
 
   // delete: tree back to the main code alone

@@ -719,7 +719,8 @@ function treePrice(item) {
 // the alternate's own price. Columns to the left repeat the main row's parents.
 function withAlternates(tab, row, item, level) {
   if (!item.alternates?.length) return treeRowHtml(tab, row);
-  const main = { ...row, cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}%`] } };
+  // Main row shows its own SOB share of the BOM quantity; Edit still changes the full BOM quantity.
+  const main = { ...row, quantity: number(item.main_quantity, 4), cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}% of ${number(item.quantity, 4)}`] } };
   const inherit = TREE_LEVELS[tab].flatMap((name, index) => row.cells[name] || [row.inherit?.[index * 2] || "", row.inherit?.[index * 2 + 1] || ""]);
   return treeRowHtml(tab, main) + item.alternates.map((alt) => treeRowHtml(tab, {
     depth: row.depth, inherit, className: "tree-alternate", attributes: `data-alternate-of="${item.material_id}"`,

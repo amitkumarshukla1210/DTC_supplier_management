@@ -1963,6 +1963,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if not listed:
                 continue
             row["main_sob_percent"] = 100 - sum(alternate["sob_percent"] for alternate in listed)
+            # The main code's own share of the BOM quantity (main + alternates = BOM quantity)
+            row["main_quantity"] = row["quantity"] * row["main_sob_percent"] / 100
             for alternate in listed:
                 alternate["quantity"] = row["quantity"] * alternate["sob_percent"] / 100
                 if not can_price:
@@ -3968,10 +3970,17 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 children.setdefault(link.parent_item_id, []).append(link)
 
             def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None) -> None:
-                tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity, "item": item})
+                alternates = price.alternates(item.id) if item is not None and quantity is not None else []
+                if alternates:
+                    # Main code row: its own SOB share of the BOM quantity
+                    main_share = 100 - sum(alternate["sob_percent"] for alternate in alternates)
+                    path = {**path, level: (path[level][0], f"{path[level][1]} (main {main_share:g}% of {quantity:g})")}
+                    tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity * main_share / 100, "item": item})
+                else:
+                    tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity, "item": item})
                 # Alternate codes follow their main code's line, with their SOB share of its quantity.
-                if item is not None and quantity is not None:
-                    for alternate in price.alternates(item.id):
+                if alternates:
+                    for alternate in alternates:
                         tree.append({"depth": depth, "level": level, "has_children": False, "item": items.get(alternate["material_id"]),
                                      "path": {**path, level: (alternate["code"], f"{alternate['name']} (alternate of {item.code}, SOB {alternate['sob_percent']:g}%)")},
                                      "quantity": quantity * alternate["sob_percent"] / 100, "alternate": alternate})

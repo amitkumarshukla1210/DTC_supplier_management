@@ -47,7 +47,7 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 **Product Master → Alternate codes** holds your own alternate code for a part code you buy (e.g. `FL001MICROCHIPNEO` for `FL001MICROCHIP`), with the alternate's SOB %. It applies everywhere the main code is used:
 
 - **BOM price:** main share × main price + each alternate's SOB × its own price (each code's own price is its SOB-weighted Direct supplier price, or the Material Master price). If the codes are priced in different currencies, the main code's price is shown.
-- **BOM tree (screen, Excel, PDF):** each alternate follows its main code's row, with its SOB share of the line quantity and its own price; the main row shows "main N%".
+- **BOM tree (screen, Excel, PDF):** the main code row shows its own SOB share of the quantity ("main 40% of 4" → 1.6), and each alternate follows it with its share and its own price; main + alternates = the BOM quantity. Edit still changes the full BOM quantity.
 - **Planning:** Shortage & excess and the PO plan split the main code's demand: the alternate takes its SOB %, the main code keeps the rest (100 − all its alternates' SOB).
 
 Rules: both codes are in T1 Material Master, are bought parts (no in-house BOM, no negative BOM quantity) and use the same unit; an alternate belongs to one main code and has no alternates of its own; the alternates of a code add up to at most 100%. A code in Alternate codes cannot be deleted from T1 Material Master. Excel upload accepts your own headings (Main code / Part code, Alternate code, SOB %); all rows or none.

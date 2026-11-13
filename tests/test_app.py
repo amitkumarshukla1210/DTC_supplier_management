@@ -1332,10 +1332,13 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertAlmostEqual(l2["unit_price"], 496)
         self.assertIn("AC-CHIP 60% x 480.00 + AC-CHIPNEO 40% x 520.00", l2["price_source"])
         self.assertEqual(l2["main_sob_percent"], 60)
+        self.assertAlmostEqual(l2["main_quantity"], 1.2)  # 2 x 60%; main 1.2 + alternate 0.8 = BOM 2
+        self.assertEqual(l2["quantity"], 2)  # the BOM line itself is unchanged (Edit uses it)
         self.assertEqual([(a["code"], a["sob_percent"], a["quantity"], a["unit_price"]) for a in l2["alternates"]], [("AC-CHIPNEO", 40, 0.8, 520)])
         l1 = next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == chip)
         self.assertAlmostEqual(l1["unit_price"], 496)
         self.assertAlmostEqual(l1["alternates"][0]["quantity"], 1.2)
+        self.assertAlmostEqual(l1["main_quantity"], 1.8)  # 3 x 60%
         many = self.client.get("/api/planning/part-boms", params={"tab": "Level 2 Part BOM"}).json()["items"]
         self.assertEqual(many[0]["alternates"][0]["code"], "AC-CHIPNEO")
         self.assertNotIn("alternates", next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == motor))
@@ -1351,6 +1354,8 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("SOB 40%", alternate[l2_code + 1])
         self.assertEqual(sheet.row_dimensions[5 + main_index + 1].outline_level, sheet.row_dimensions[5 + main_index].outline_level)
         self.assertAlmostEqual(rows[main_index][headers.index("Part price")], 496)
+        self.assertAlmostEqual(rows[main_index][headers.index("Quantity")], 1.2)
+        self.assertIn("(main 60% of 2)", rows[main_index][l2_code + 1])
 
         # Planning: demand split by SOB (plan 100 models: CHIP 2 + 3 = 5 per model = 500)
         plan = self.client.post("/api/planning/plans", json={"issue_month": "2026-10", "workspace": "trial", "rows": [{"model_code": "AC-MODEL", "target_month": "2026-10", "quantity": 100}]})
