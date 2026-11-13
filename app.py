@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -632,6 +632,8 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
         if not parent or not component or component.parent_item_id != item_id:
             raise HTTPException(status_code=404, detail="BOM component not found for this parent item")
         child = db.get(Item, component.child_item_id)
+        # alternate code SOB saved on this BOM line (table from planning.py)
+        db.execute(text("DELETE FROM bom_line_alternates WHERE component_id = :id"), {"id": component_id})
         db.delete(component)
         _record_activity(db, f"{child.code if child else 'Component'} removed from {parent.code} BOM")
         db.commit()

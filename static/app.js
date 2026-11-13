@@ -513,17 +513,16 @@ async function renderMaster() {
     : state.bomTab === "Material Master"
       ? '<button class="button" data-action="new-model">Add model</button><button class="button button-primary" data-action="new-material">Add material</button>'
       : tierTab ? `<button class="button button-primary" data-action="new-tier-material">Add ${tierTab} material</button>` : "";
-  const altSection = `<section class="panel table-panel">${panelHeader("Alternate codes", "Your own alternate code for a part code you buy (e.g. FL001MICROCHIPNEO for FL001MICROCHIP). It applies everywhere the main code is used: the alternate takes its SOB % of the main code's demand (Shortage & excess, PO plan) and BOM cost; the main code keeps the rest. Both codes come from T1 Material Master, are bought parts and use the same unit.")}
+  const altSection = `<section class="panel table-panel">${panelHeader("Alternate codes", "Which code is an alternate of which (e.g. FL101STEEL0.8 for FL001STEEL0.8). Both codes come from T1 Material Master, are bought parts and use the same unit. The SOB is set on each BOM line: click the main code's row in Model BOM Level 1, Level 2 or Level 3 Part BOM. It is 0% (main code 100%) until you set it.")}
       <form id="altAddForm" class="panel-body form-grid">
         <label class="field"><span>Search main code</span><input class="form-control" id="altMainSearch" type="search" placeholder="Type a code or name" /></label>
         <label class="field"><span>Main code (purchased parts)</span><select class="form-control" id="altMainSelect" required><option value="">Loading…</option></select></label>
         <label class="field"><span>Search alternate code</span><input class="form-control" id="altAltSearch" type="search" placeholder="Type a code or name" /></label>
         <label class="field"><span>Alternate code (purchased parts)</span><select class="form-control" id="altAltSelect" required><option value="">Loading…</option></select></label>
-        <label class="field"><span>Alternate SOB (%)</span><input class="form-control" type="number" name="sob_percent" min="0.01" max="100" step="any" required placeholder="e.g. 40" /></label>
         <div class="field"><span>&nbsp;</span><button class="button button-primary" type="submit">Add alternate code</button></div>
       </form>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search main or alternate code / name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/alternate-codes.xlsx">Template</a><a class="button button-small" href="/api/planning/alternate-codes.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/alternate-codes.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
-      <form id="altUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload alternate codes (Main code, Alternate code, SOB %; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
+      <form id="altUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload alternate codes (Main code, Alternate code; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
       <div id="altTable"></div></section>`;
   content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", actions)}
     <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab === "Material Master" ? "T1 Material Master" : tab)}</button>`).join("")}</div>
@@ -720,7 +719,8 @@ function treePrice(item) {
 function withAlternates(tab, row, item, level) {
   if (!item.alternates?.length) return treeRowHtml(tab, row);
   // Main row shows its own SOB share of the BOM quantity; Edit still changes the full BOM quantity.
-  const main = { ...row, quantity: number(item.main_quantity, 4), cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}% of ${number(item.quantity, 4)}`] } };
+  const lineAlternates = item.alternates.map((alt) => ({ id: alt.material_id, code: alt.code, name: alt.name, sob: alt.sob_percent }));
+  const main = { ...row, attributes: `${row.attributes || ""} data-alternates="${esc(JSON.stringify(lineAlternates))}"`, quantity: number(item.main_quantity, 4), cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}% of ${number(item.quantity, 4)}`] } };
   const inherit = TREE_LEVELS[tab].flatMap((name, index) => row.cells[name] || [row.inherit?.[index * 2] || "", row.inherit?.[index * 2 + 1] || ""]);
   return treeRowHtml(tab, main) + item.alternates.map((alt) => treeRowHtml(tab, {
     depth: row.depth, inherit, className: "tree-alternate", attributes: `data-alternate-of="${item.material_id}"`,
@@ -943,11 +943,10 @@ function initAlternateCodesTab() {
   $("#altAddForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
-    const body = { main_item_id: Number($("#altMainSelect").value), alternate_item_id: Number($("#altAltSelect").value), sob_percent: Number(form.elements.sob_percent.value) };
+    const body = { main_item_id: Number($("#altMainSelect").value), alternate_item_id: Number($("#altAltSelect").value) };
     try {
       const saved = await api("/api/planning/alternate-codes", { method: "POST", body: JSON.stringify(body) });
-      toast(`${saved.alternate_code} added as alternate of ${saved.main_code} (${number(saved.sob_percent, 2)}%)`);
-      form.elements.sob_percent.value = "";
+      toast(`${saved.alternate_code} added as alternate of ${saved.main_code}. Set its SOB on each BOM line.`);
       loadAlternateCodes(0);
     } catch (error) { toast(error.message, true); }
   });
@@ -956,7 +955,7 @@ function initAlternateCodesTab() {
     const form = event.currentTarget;
     try {
       const result = await uploadExcel("/api/planning/alternate-codes/upload", new FormData(form).get("workbook"));
-      toast(`${result.rows} row(s): ${result.added} added, ${result.updated} updated`);
+      toast(`${result.rows} row(s): ${result.added} added, ${result.already_there} already there`);
       form.reset();
       loadAlternateCodes(0);
     } catch (error) { toast(error.message, true); }
@@ -971,24 +970,8 @@ async function loadAlternateCodes(offset = 0) {
   const result = await api(`/api/planning/alternate-codes?${new URLSearchParams({ offset: String(offset), limit: "500", search })}`);
   state.altItems = result.items;
   const priced = canSeePrices();
-  const rows = result.items.map((a) => `<tr><td>${esc(a.main_code)}</td><td>${esc(a.main_name)}</td><td>${number(a.main_sob_percent, 2)}%</td><td>${esc(a.alternate_code)}</td><td>${esc(a.alternate_name)}</td><td>${number(a.sob_percent, 2)}%</td><td>${esc(a.uom)}</td><td>${priced && a.main_unit_price !== undefined ? money(a.main_unit_price, a.main_currency) : "Restricted"}</td><td>${priced && a.unit_price !== undefined ? money(a.unit_price, a.currency) : "Restricted"}</td><td><button class="text-button" data-alt-edit="${a.id}">Edit</button></td><td><button class="text-button button-danger" data-alt-delete="${a.id}">Delete</button></td></tr>`).join("");
-  target.innerHTML = `${table(["Main code", "Main name", "Main SOB", "Alternate code", "Alternate name", "Alternate SOB", "Unit", "Main price", "Alternate price", "Edit", "Delete"], rows, search ? "No alternate codes match this search." : "No alternate codes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No alternate codes"}</span><div><button class="button button-small" data-alt-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-alt-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
-}
-
-function openAlternateEdit(entry) {
-  if (!entry) return;
-  $("#modalTitle").textContent = `Alternate ${entry.alternate_code} of ${entry.main_code}`;
-  $("#modalBody").innerHTML = `<form id="altEditForm" class="form-grid">${field("Alternate SOB (%)", "sob_percent", "number", { required: true, min: 0.01, max: 100, step: "any", value: entry.sob_percent })}<p class="subtle field full">The main code ${esc(entry.main_code)} keeps 100% minus all its alternates' SOB.</p><div class="modal-footer field full"><button class="button button-primary">Save SOB</button></div></form>`;
-  modalLayer.hidden = false;
-  $("#altEditForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      await api(`/api/planning/alternate-codes/${entry.id}`, { method: "PATCH", body: JSON.stringify({ sob_percent: Number(event.currentTarget.elements.sob_percent.value) }) });
-      modalLayer.hidden = true;
-      toast("SOB saved");
-      loadAlternateCodes(0);
-    } catch (error) { toast(error.message, true); }
-  });
+  const rows = result.items.map((a) => `<tr><td>${esc(a.main_code)}</td><td>${esc(a.main_name)}</td><td>${esc(a.alternate_code)}</td><td>${esc(a.alternate_name)}</td><td>${esc(a.uom)}</td><td>${priced && a.main_unit_price !== undefined ? money(a.main_unit_price, a.main_currency) : "Restricted"}</td><td>${priced && a.unit_price !== undefined ? money(a.unit_price, a.currency) : "Restricted"}</td><td><button class="text-button button-danger" data-alt-delete="${a.id}">Delete</button></td></tr>`).join("");
+  target.innerHTML = `${table(["Main code", "Main name", "Alternate code", "Alternate name", "Unit", "Main price", "Alternate price", "Delete"], rows, search ? "No alternate codes match this search." : "No alternate codes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No alternate codes"}</span><div><button class="button button-small" data-alt-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-alt-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
 }
 
 // Material Master: 500 a page from the server; search covers all codes
@@ -1879,9 +1862,22 @@ function openModal(type, record = {}) {
     title = "Add supplier";
     form = `<form id="modalForm" class="form-grid">${field("Supplier name", "name", "text", { required: true })}${field("Category", "category", "text", { required: true })}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
   }
+  // Alternate code SOB on this BOM line (0% = not used here); the main code keeps the rest
+  const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
+  if (lineAlternates.length) {
+    form = form.replace('<div class="modal-footer field full">', `<fieldset class="field full line-alternates"><legend>Alternate code SOB on this BOM line</legend>${lineAlternates.map((alt) => `<label class="field"><span>${esc(alt.code)} · ${esc(alt.name)} (%)</span><input class="form-control" type="number" min="0" max="100" step="any" data-line-alt="${alt.id}" value="${alt.sob}" /></label>`).join("")}<label class="field"><span>Main code SOB (%)</span><input class="form-control" id="lineMainSob" readonly /></label><p class="subtle field full">0% = alternate not used on this line. Only this line changes; other BOMs keep their own SOB.</p></fieldset><div class="modal-footer field full">`);
+  }
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = form;
   modalLayer.hidden = false;
+  if (lineAlternates.length) {
+    const syncMain = () => {
+      const used = [...$("#modalForm").querySelectorAll("[data-line-alt]")].reduce((sum, input) => sum + Number(input.value || 0), 0);
+      $("#lineMainSob").value = `${number(100 - used, 2)}`;
+    };
+    $("#modalForm").addEventListener("input", (event) => { if (event.target.matches("[data-line-alt]")) syncMain(); });
+    syncMain();
+  }
   if (type === "material") {
     const choice = $("#categorySelect");
     const fresh = $("#categoryNew");
@@ -1929,15 +1925,26 @@ function openModal(type, record = {}) {
   }
   $("#modalForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const formEl = event.currentTarget;  // event.currentTarget is empty after the first await
+    const altInputs = [...formEl.querySelectorAll("[data-line-alt]")];
+    const values = Object.fromEntries(new FormData(formEl).entries());
     try {
       let result;
+      // Save this line's alternate SOB first (refused as a whole if it adds up to more than 100%);
+      // skipped if the line's part code is being changed.
+      const sameCode = type !== "component" || Number(values.child_item_id) === Number(record.material_id);
+      if (altInputs.length && sameCode) {
+        await api("/api/planning/bom-line-alternates", { method: "PUT", body: JSON.stringify({
+          model_bom_id: record.root_bom_id || null, component_id: record.root_bom_id ? null : record.component_id,
+          alternates: altInputs.map((input) => ({ alternate_item_id: Number(input.dataset.lineAlt), sob_percent: Number(input.value || 0) })),
+        }) });
+      }
       if (type === "product") {
-        values.model_ids = [...new FormData(event.currentTarget).getAll("model_ids")].map(Number);
+        values.model_ids = [...new FormData(formEl).getAll("model_ids")].map(Number);
         result = await api(record.id ? `/api/planning/products/${record.id}` : "/api/planning/products", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
       if (type === "model") {
-        values.product_ids = [...new FormData(event.currentTarget).getAll("product_ids")].map(Number);
+        values.product_ids = [...new FormData(formEl).getAll("product_ids")].map(Number);
         result = await api(record.id ? `/api/planning/models/${record.id}` : "/api/planning/models", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
       if (type === "material") {
@@ -1953,7 +1960,7 @@ function openModal(type, record = {}) {
         values.model_id = Number(values.model_id);
         values.material_id = Number(values.material_id);
         values.quantity = Number(values.quantity);
-        values.uom = event.currentTarget.elements.uom.value;
+        values.uom = formEl.elements.uom.value;
         result = await api(record.root_bom_id ? `/api/planning/model-bom/${values.model_id}/${record.root_bom_id}` : `/api/planning/model-bom/${values.model_id}`, { method: record.root_bom_id ? "PATCH" : "POST", body: JSON.stringify(values) });
         state.selectedModel = String(values.model_id);
       }
@@ -2103,11 +2110,9 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/planning/tier-materials/${tierDelete.dataset.tierDelete}`, { method: "DELETE" }); toast("Code deleted"); return loadTierMaterialPage(0); }
     catch (error) { toast(error.message, true); return; }
   }
-  const altEdit = event.target.closest("[data-alt-edit]");
-  if (altEdit) return openAlternateEdit((state.altItems || []).find((a) => String(a.id) === altEdit.dataset.altEdit));
   const altDelete = event.target.closest("[data-alt-delete]");
   if (altDelete) {
-    if (!window.confirm("Delete this alternate code? Its demand and cost go back to the main code.")) return;
+    if (!window.confirm("Delete this alternate code? Its SOB on every BOM line goes back to the main code.")) return;
     try { await api(`/api/planning/alternate-codes/${altDelete.dataset.altDelete}`, { method: "DELETE" }); toast("Alternate code deleted"); return loadAlternateCodes(0); }
     catch (error) { toast(error.message, true); return; }
   }
@@ -2180,6 +2185,7 @@ document.addEventListener("click", async (event) => {
       quantity: Number(bomEdit.dataset.quantity),
       uom: bomEdit.dataset.uom,
       model_id: Number(bomEdit.dataset.modelId || state.selectedModel),
+      alternates: JSON.parse(bomEdit.closest("tr")?.dataset.alternates || "[]"),
     };
     const model = state.models.find((item) => item.id === record.model_id);
     if (model) {

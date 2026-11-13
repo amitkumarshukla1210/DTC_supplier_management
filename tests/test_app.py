@@ -1288,19 +1288,24 @@ class SupplierHubApiTests(unittest.TestCase):
         export = self.client.get("/api/planning/tier-materials/T3.xlsx")
         self.assertEqual(export.status_code, 200)
 
-    def test_alternate_codes_split_price_tree_and_planning_demand(self):
-        # Hand-worked: CHIP 480 (supplier A) at 60% + CHIPNEO 520 (supplier B) at 40%
-        # = 288 + 208 = 496 per piece. Motor uses 2 CHIP; plan 100 motors -> CHIP demand 200,
-        # split 120 on CHIP (supplier A) and 80 on CHIPNEO (supplier B).
+    def test_alternate_codes_sob_per_bom_line_price_tree_and_planning(self):
+        # Alternate SOB is set per BOM line, 0% until set. Hand-worked:
+        #   Motor BOM line CHIP qty 2, NEO 80%: main 20% -> 0.4 / 1.6; price 0.2x480 + 0.8x520 = 512
+        #   Direct L1 line CHIP qty 3, NEO 30% + X 10%: main 60% -> 1.8 / 0.9 / 0.3;
+        #   price 0.6x480 + 0.3x520 + 0.1x600 = 504
+        #   Plan 100 models: CHIP 100x(0.4+1.8) = 220, NEO 100x(1.6+0.9) = 250, X 30 (total 500)
         def material(code, name, uom="PCS", cost=0):
             response = self.client.post("/api/planning/materials", json={"code": code, "name": name, "uom": uom, "unit_cost": cost, "currency": "INR"})
             self.assertEqual(response.status_code, 201, response.text)
             return response.json()["id"]
-        chip, neo, chipx = material("AC-CHIP", "MicroChip", cost=500), material("AC-CHIPNEO", "MicroChipNeo"), material("AC-CHIPX", "MicroChip X")
-        motor, steel = material("AC-MOTOR", "Motor"), material("AC-STEEL", "Steel", "kg")
+        chip, neo, chipx = material("AC-CHIP", "MicroChip", cost=500), material("AC-CHIPNEO", "MicroChipNeo"), material("AC-CHIPX", "MicroChip X", cost=600)
+        motor, steel, other = material("AC-MOTOR", "Motor"), material("AC-STEEL", "Steel", "kg"), material("AC-OTHER", "Other chip")
         model = self.client.post("/api/planning/models", json={"code": "AC-MODEL", "name": "Alt model"}).json()["id"]
-        self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).status_code, 201)
-        self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": chip, "quantity": 3, "uom": "PCS"}).status_code, 201)
+        model2 = self.client.post("/api/planning/models", json={"code": "AC-MODEL2", "name": "Alt model 2"}).json()["id"]
+        for m in (model, model2):
+            self.assertEqual(self.client.post(f"/api/planning/model-bom/{m}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        direct = self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": chip, "quantity": 3, "uom": "PCS"}).json()["id"]
+        direct2 = self.client.post(f"/api/planning/model-bom/{model2}", json={"material_id": chip, "quantity": 3, "uom": "PCS"}).json()["id"]
         self.assertEqual(self.client.post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": chip, "quantity": 2}]}).status_code, 201)
         sup_a = self.client.post("/api/suppliers", json={"name": "Chip Maker A", "category": "Electrical", "country": "India"}).json()["id"]
         sup_b = self.client.post("/api/suppliers", json={"name": "Chip Maker B", "category": "Electrical", "country": "India"}).json()["id"]
@@ -1308,104 +1313,151 @@ class SupplierHubApiTests(unittest.TestCase):
             response = self.client.post("/api/planning/supplier-parts", json={"material_id": material_id, "supplier_id": supplier, "sob_percent": 100, "unit_price": price, "currency": "INR"})
             self.assertEqual(response.status_code, 201, response.text)
 
-        def add(main, alternate, sob):
-            return self.client.post("/api/planning/alternate-codes", json={"main_item_id": main, "alternate_item_id": alternate, "sob_percent": sob})
-        # rules
-        self.assertIn("its own alternate", add(chip, chip, 10).json()["detail"])
-        self.assertIn("same unit", add(chip, steel, 10).json()["detail"])
-        self.assertIn("made in-house", add(motor, chip, 10).json()["detail"])
-        self.assertEqual(add(chip, neo, 0).status_code, 422)
-        self.assertEqual(add(chip, neo, 101).status_code, 422)
-        created = add(chip, neo, 40)
+        def add(main, alternate):
+            return self.client.post("/api/planning/alternate-codes", json={"main_item_id": main, "alternate_item_id": alternate})
+        # pair rules
+        self.assertIn("its own alternate", add(chip, chip).json()["detail"])
+        self.assertIn("same unit", add(chip, steel).json()["detail"])
+        self.assertIn("made in-house", add(motor, chip).json()["detail"])
+        created = add(chip, neo)
         self.assertEqual(created.status_code, 201, created.text)
         entry = created.json()
-        self.assertEqual((entry["main_code"], entry["alternate_code"], entry["sob_percent"], entry["main_sob_percent"]), ("AC-CHIP", "AC-CHIPNEO", 40, 60))
-        self.assertEqual((entry["main_unit_price"], entry["unit_price"]), (480, 520))
-        self.assertIn("already an alternate of AC-CHIP", add(chipx, neo, 10).json()["detail"])
-        self.assertIn("cannot be an alternate", add(chipx, chip, 10).json()["detail"])
-        self.assertIn("is itself an alternate", add(neo, chipx, 10).json()["detail"])
-        self.assertIn("add up to 110%", add(chip, chipx, 70).json()["detail"])
-        self.assertEqual(self.client.get("/api/planning/alternate-codes").json()["total"], 1)
+        self.assertNotIn("sob_percent", entry)  # no SOB on the Alternate codes tab
+        self.assertEqual((entry["main_code"], entry["alternate_code"], entry["main_unit_price"], entry["unit_price"]), ("AC-CHIP", "AC-CHIPNEO", 480, 520))
+        self.assertEqual(add(chip, chipx).status_code, 201)
+        self.assertIn("already an alternate of AC-CHIP", add(other, neo).json()["detail"])
+        self.assertIn("cannot be an alternate", add(other, chip).json()["detail"])
+        self.assertIn("is itself an alternate", add(neo, other).json()["detail"])
 
-        # BOM rows: blended price and the alternate with its SOB share of the quantity
-        l2 = self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]
-        self.assertAlmostEqual(l2["unit_price"], 496)
-        self.assertIn("AC-CHIP 60% x 480.00 + AC-CHIPNEO 40% x 520.00", l2["price_source"])
-        self.assertEqual(l2["main_sob_percent"], 60)
-        self.assertAlmostEqual(l2["main_quantity"], 1.2)  # 2 x 60%; main 1.2 + alternate 0.8 = BOM 2
-        self.assertEqual(l2["quantity"], 2)  # the BOM line itself is unchanged (Edit uses it)
-        self.assertEqual([(a["code"], a["sob_percent"], a["quantity"], a["unit_price"]) for a in l2["alternates"]], [("AC-CHIPNEO", 40, 0.8, 520)])
-        l1 = next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == chip)
-        self.assertAlmostEqual(l1["unit_price"], 496)
-        self.assertAlmostEqual(l1["alternates"][0]["quantity"], 1.2)
-        self.assertAlmostEqual(l1["main_quantity"], 1.8)  # 3 x 60%
-        many = self.client.get("/api/planning/part-boms", params={"tab": "Level 2 Part BOM"}).json()["items"]
-        self.assertEqual(many[0]["alternates"][0]["code"], "AC-CHIPNEO")
-        self.assertNotIn("alternates", next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == motor))
+        component = self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]["component_id"]
 
-        # Excel tree: alternate row right after its main line, same outline level, share of quantity
-        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/bom-tree/xlsx", params={"tab": "Model BOM Level 1", "model_id": model}).content)).active
-        headers = [cell.value for cell in sheet[4]]
-        rows = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=5)]
-        l2_code = headers.index("L2 part code")
-        main_index = next(i for i, r in enumerate(rows) if r[l2_code] == "AC-CHIP")
-        alternate = rows[main_index + 1]
-        self.assertEqual((alternate[0], alternate[l2_code], alternate[headers.index("Quantity")], alternate[headers.index("Part price")]), ("L2 alternate", "AC-CHIPNEO", 0.8, 520))
-        self.assertIn("SOB 40%", alternate[l2_code + 1])
-        self.assertEqual(sheet.row_dimensions[5 + main_index + 1].outline_level, sheet.row_dimensions[5 + main_index].outline_level)
-        self.assertAlmostEqual(rows[main_index][headers.index("Part price")], 496)
-        self.assertAlmostEqual(rows[main_index][headers.index("Quantity")], 1.2)
-        self.assertIn("(main 60% of 2)", rows[main_index][l2_code + 1])
+        def l2_row():
+            return self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]
 
-        # Planning: demand split by SOB (plan 100 models: CHIP 2 + 3 = 5 per model = 500)
+        def l1_row(model_id):
+            return next(r for r in self.client.get(f"/api/planning/model-bom/{model_id}").json()["items"] if r["material_id"] == chip)
+
+        def plan_demand():
+            report = self.client.get("/api/planning/report", params={"workspace": "trial", "start_month": "2026-10", "end_month": "2026-10"}).json()
+            return {r["material_code"]: r["plan_demand"] for r in report["items"] if r["material_code"].startswith("AC-CHIP")}
+
+        # default 0%: main code keeps 100%, alternates listed with 0
+        row = l2_row()
+        self.assertEqual((row["main_sob_percent"], row["main_quantity"], row["unit_price"]), (100, 2, 480))
+        self.assertEqual([(a["code"], a["sob_percent"], a["quantity"]) for a in row["alternates"]], [("AC-CHIPNEO", 0, 0), ("AC-CHIPX", 0, 0)])
         plan = self.client.post("/api/planning/plans", json={"issue_month": "2026-10", "workspace": "trial", "rows": [{"model_code": "AC-MODEL", "target_month": "2026-10", "quantity": 100}]})
         self.assertEqual(plan.status_code, 201, plan.text)
-        report = self.client.get("/api/planning/report", params={"workspace": "trial", "start_month": "2026-10", "end_month": "2026-10"}).json()
-        demand = {r["material_code"]: r["plan_demand"] for r in report["items"] if r["material_code"].startswith("AC-CHIP")}
-        self.assertEqual(demand, {"AC-CHIP": 300, "AC-CHIPNEO": 200})
+        self.assertEqual(plan_demand(), {"AC-CHIP": 500})
 
-        # SOB edit: 100% on the alternate -> the main code takes nothing
-        self.assertEqual(self.client.patch(f"/api/planning/alternate-codes/{entry['id']}", json={"sob_percent": 100}).json()["main_sob_percent"], 0)
-        l2 = self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]
-        self.assertAlmostEqual(l2["unit_price"], 520)
-        report = self.client.get("/api/planning/report", params={"workspace": "trial", "start_month": "2026-10", "end_month": "2026-10"}).json()
-        self.assertEqual({r["material_code"]: r["plan_demand"] for r in report["items"] if r["material_code"].startswith("AC-CHIP")}, {"AC-CHIP": 0, "AC-CHIPNEO": 500})
+        def save(alternates, model_bom_id=None, component_id=None):
+            return self.client.put("/api/planning/bom-line-alternates", json={"model_bom_id": model_bom_id, "component_id": component_id,
+                                                                            "alternates": [{"alternate_item_id": a, "sob_percent": s} for a, s in alternates]})
+        # line SOB rules
+        self.assertEqual(save([(neo, 10)]).status_code, 422)  # no line given
+        self.assertEqual(save([(neo, 10)], direct, component).status_code, 422)  # two lines given
+        self.assertIn("not an alternate of AC-CHIP", save([(other, 10)], component_id=component).json()["detail"])
+        self.assertIn("adds up to 110%", save([(neo, 70), (chipx, 40)], model_bom_id=direct).json()["detail"])
+        self.assertEqual(save([(neo, -1)], model_bom_id=direct).status_code, 422)
+        # Motor BOM line 80%, direct line 30% + 10%
+        saved = save([(neo, 80), (chipx, 0)], component_id=component)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["main_sob_percent"], 20)
+        self.assertEqual(save([(neo, 30), (chipx, 10)], model_bom_id=direct).json()["main_sob_percent"], 60)
 
-        # codes in use cannot be deleted from T1
-        self.assertEqual(self.client.delete(f"/api/planning/materials/{neo}").status_code, 409)
+        row = l2_row()
+        self.assertEqual(row["quantity"], 2)  # the BOM line itself is unchanged (Edit uses it)
+        self.assertAlmostEqual(row["main_quantity"], 0.4)
+        self.assertAlmostEqual(row["unit_price"], 512)
+        self.assertIn("AC-CHIP 20% x 480.00 + AC-CHIPNEO 80% x 520.00", row["price_source"])
+        self.assertEqual([(a["code"], a["sob_percent"]) for a in row["alternates"]], [("AC-CHIPNEO", 80), ("AC-CHIPX", 0)])
+        self.assertAlmostEqual(row["alternates"][0]["quantity"], 1.6)
+        row = l1_row(model)
+        self.assertEqual(row["main_sob_percent"], 60)
+        self.assertAlmostEqual(row["main_quantity"], 1.8)
+        self.assertAlmostEqual(row["unit_price"], 504)
+        self.assertEqual([round(a["quantity"], 6) for a in row["alternates"]], [0.9, 0.3])
+        # the other model's direct line keeps its own SOB (0%); the shared Motor BOM line is 80% for both models
+        self.assertEqual((l1_row(model2)["main_sob_percent"], l1_row(model2)["unit_price"]), (100, 480))
+        many = self.client.get("/api/planning/part-boms", params={"tab": "Level 2 Part BOM"}).json()["items"]
+        self.assertEqual(many[0]["main_sob_percent"], 20)
+        self.assertNotIn("alternates", next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == motor))
 
-        # Excel upload with the user's own headings and a title row; all rows or none
-        def sheet_bytes(rows):
-            workbook = Workbook()
-            ws = workbook.active
-            ws.append(["Alternate code list"])
-            ws.append(["Part Code", "Alternate Code", "SOB %"])
-            for row in rows:
-                ws.append(row)
-            buffer = io.BytesIO()
-            workbook.save(buffer)
-            return buffer.getvalue()
-        upload = self.client.post("/api/planning/alternate-codes/upload", content=sheet_bytes([["AC-CHIP", "AC-CHIPNEO", 30], ["ac-chip", "AC-CHIPX", "20%"]]))
-        self.assertEqual(upload.status_code, 201, upload.text)
-        self.assertEqual((upload.json()["added"], upload.json()["updated"]), (1, 1))
-        listed = {r["alternate_code"]: (r["sob_percent"], r["main_sob_percent"]) for r in self.client.get("/api/planning/alternate-codes", params={"search": "chip"}).json()["items"]}
-        self.assertEqual(listed, {"AC-CHIPNEO": (30, 50), "AC-CHIPX": (20, 50)})
-        bad = self.client.post("/api/planning/alternate-codes/upload", content=sheet_bytes([["AC-CHIP", "AC-CHIPNEO", 90], ["AC-CHIP", "AC-NOPE", 5]]))
-        self.assertEqual(bad.status_code, 422)
-        self.assertIn("Row 4: AC-NOPE is not in T1", bad.json()["detail"])
-        over = self.client.post("/api/planning/alternate-codes/upload", content=sheet_bytes([["AC-CHIP", "AC-CHIPNEO", 90]]))
-        self.assertIn("add up to 110%", over.json()["detail"])
-        self.assertEqual({r["alternate_code"]: r["sob_percent"] for r in self.client.get("/api/planning/alternate-codes").json()["items"]}, {"AC-CHIPNEO": 30, "AC-CHIPX": 20})
-        # AC-CHIPX has no BOM or supplier link: only its alternate-code entry blocks the delete
+        # planning demand split per line
+        demand = plan_demand()
+        self.assertEqual({k: round(v, 6) for k, v in demand.items()}, {"AC-CHIP": 220, "AC-CHIPNEO": 250, "AC-CHIPX": 30})
+
+        # Excel tree: per-line split, alternates right after their main line
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/bom-tree/xlsx", params={"tab": "Model BOM Level 1", "model_id": model}).content)).active
+        headers = [cell.value for cell in sheet[4]]
+        rows = [[cell.value for cell in r] for r in sheet.iter_rows(min_row=5)]
+        qty, price_col, l1_code, l2_code = headers.index("Quantity"), headers.index("Part price"), headers.index("L1 part code"), headers.index("L2 part code")
+        main_index = next(i for i, r in enumerate(rows) if r[l2_code] == "AC-CHIP")
+        self.assertAlmostEqual(rows[main_index][qty], 0.4)
+        self.assertAlmostEqual(rows[main_index][price_col], 512)
+        self.assertIn("(main 20% of 2)", rows[main_index][l2_code + 1])
+        neo_row = rows[main_index + 1]
+        self.assertEqual((neo_row[0], neo_row[l2_code], neo_row[price_col]), ("L2 alternate", "AC-CHIPNEO", 520))
+        self.assertAlmostEqual(neo_row[qty], 1.6)
+        self.assertIn("SOB 80%", neo_row[l2_code + 1])
+        self.assertEqual(sheet.row_dimensions[5 + main_index + 1].outline_level, sheet.row_dimensions[5 + main_index].outline_level)
+        direct_index = next(i for i, r in enumerate(rows) if r[l1_code] == "AC-CHIP" and r[l2_code] in (None, ""))
+        self.assertAlmostEqual(rows[direct_index][qty], 1.8)
+        self.assertAlmostEqual(rows[direct_index][price_col], 504)
+
+        # a code in Alternate codes cannot be deleted from T1 (AC-CHIPX has no other use)
         blocked = self.client.delete(f"/api/planning/materials/{chipx}")
         self.assertEqual(blocked.status_code, 409)
         self.assertIn("Alternate codes", blocked.json()["detail"])
+        # deleting a pair gives its SOB back to the main code: direct line 70% main, 0.7x480 + 0.3x520 = 492
+        pair_x = next(r["id"] for r in self.client.get("/api/planning/alternate-codes").json()["items"] if r["alternate_code"] == "AC-CHIPX")
+        self.assertEqual(self.client.delete(f"/api/planning/alternate-codes/{pair_x}").status_code, 204)
+        row = l1_row(model)
+        self.assertEqual((row["main_sob_percent"], len(row["alternates"])), (70, 1))
+        self.assertAlmostEqual(row["unit_price"], 492)
+        # re-adding the pair starts at 0% again on every line (its old SOB was removed)
+        self.assertEqual(add(chip, chipx).status_code, 201)
+        self.assertEqual({a["code"]: a["sob_percent"] for a in l1_row(model)["alternates"]}, {"AC-CHIPNEO": 30, "AC-CHIPX": 0})
+        # deleting a BOM line removes its SOB: the newest line (its id is re-used) added again starts at 0%
+        self.assertEqual(save([(neo, 50)], model_bom_id=direct2).status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/planning/model-bom/{model2}/{direct2}").status_code, 204)
+        again = self.client.post(f"/api/planning/model-bom/{model2}", json={"material_id": chip, "quantity": 3, "uom": "PCS"}).json()["id"]
+        self.assertEqual(again, direct2)
+        self.assertEqual(l1_row(model2)["main_sob_percent"], 100)
+        # re-uploading the Motor BOM keeps the line and its SOB
+        workbook = Workbook()
+        ws = workbook.active
+        ws.append(["parent_code", "material_code", "quantity", "uom"])
+        ws.append(["AC-MOTOR", "AC-CHIP", 4, "PCS"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        upload = self.client.post(f"/api/planning/part-bom/{motor}/upload", params={"tab": "Level 2 Part BOM"}, content=buffer.getvalue())
+        self.assertEqual(upload.status_code, 201, upload.text)
+        row = l2_row()
+        self.assertEqual((row["quantity"], row["main_sob_percent"]), (4, 20))
+        self.assertAlmostEqual(row["main_quantity"], 0.8)
+
+        # Excel upload of pairs with the user's own headings; SOB column not needed
+        def sheet_bytes(data):
+            workbook = Workbook()
+            ws = workbook.active
+            ws.append(["Alternate code list"])
+            ws.append(["Part Code", "Alternate Code"])
+            for r in data:
+                ws.append(r)
+            buffer = io.BytesIO()
+            workbook.save(buffer)
+            return buffer.getvalue()
+        result = self.client.post("/api/planning/alternate-codes/upload", content=sheet_bytes([["AC-CHIP", "AC-CHIPNEO"], ["ac-chip", "AC-CHIPX"]]))
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertEqual((result.json()["added"], result.json()["already_there"]), (0, 2))
+        bad = self.client.post("/api/planning/alternate-codes/upload", content=sheet_bytes([["AC-OTHER", "AC-STEEL"], ["AC-CHIP", "AC-NOPE"]]))
+        self.assertEqual(bad.status_code, 422)
+        self.assertIn("Row 3: ", bad.json()["detail"])
+        self.assertEqual(self.client.get("/api/planning/alternate-codes", params={"search": "chip"}).json()["total"], 2)  # pairs unchanged by the failed upload
         for file_format in ("xlsx", "pdf"):
             self.assertEqual(self.client.get(f"/api/planning/alternate-codes.{file_format}").status_code, 200)
-        self.assertEqual(self.client.get("/api/planning/templates/alternate-codes.xlsx").status_code, 200)
-        # delete
-        self.assertEqual(self.client.delete(f"/api/planning/alternate-codes/{entry['id']}").status_code, 204)
-        self.assertEqual(self.client.get("/api/planning/alternate-codes").json()["total"], 1)
+        template = load_workbook(io.BytesIO(self.client.get("/api/planning/templates/alternate-codes.xlsx").content)).active
+        self.assertEqual([c.value for c in template[1]], ["main_code", "alternate_code"])
 
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,

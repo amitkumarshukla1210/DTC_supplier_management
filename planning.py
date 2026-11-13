@@ -325,15 +325,29 @@ class SupplierBOMLineSource(Base):
 
 
 class AlternateCode(Base):
-    """Your own alternate code for a part code (e.g. FL001MICROCHIPNEO for FL001MICROCHIP),
-    used everywhere the main code is used. The alternate takes sob_percent of the main
-    code's demand and cost; the main code keeps the rest (100 - sum of its alternates)."""
+    """Your own alternate code for a part code (e.g. FL101STEEL0.8 for FL001STEEL0.8). The SOB
+    is set on each BOM line that uses the main code (BOMLineAlternate), 0% until set there;
+    sob_percent here is no longer used."""
     __tablename__ = "alternate_codes"
     __table_args__ = (UniqueConstraint("main_item_id", "alternate_item_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     main_item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
     alternate_item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), unique=True)
+    sob_percent: Mapped[float] = mapped_column(Float)
+
+
+class BOMLineAlternate(Base):
+    """Alternate code SOB on one BOM line: a Model BOM Level 1 line (model_bom_id) or a
+    Level 2 / Level 3 part BOM line (component_id). The main code keeps 100 - sum of these.
+    main_item_id is the line's code when the SOB was saved; it applies only while it still matches."""
+    __tablename__ = "bom_line_alternates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    model_bom_id: Mapped[int | None] = mapped_column(ForeignKey("model_bom.id", ondelete="CASCADE"), nullable=True, index=True)
+    component_id: Mapped[int | None] = mapped_column(ForeignKey("bom_components.id", ondelete="CASCADE"), nullable=True, index=True)
+    main_item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
+    alternate_item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
     sob_percent: Mapped[float] = mapped_column(Float)
 
 
@@ -436,11 +450,17 @@ class SupplierBOMLineInput(BaseModel):
 class AlternateCodeInput(BaseModel):
     main_item_id: int
     alternate_item_id: int
-    sob_percent: float = Field(gt=0, le=100)
 
 
-class AlternateCodeUpdate(BaseModel):
-    sob_percent: float = Field(gt=0, le=100)
+class LineAlternateSOB(BaseModel):
+    alternate_item_id: int
+    sob_percent: float = Field(ge=0, le=100)
+
+
+class LineAlternatesInput(BaseModel):
+    model_bom_id: int | None = None
+    component_id: int | None = None
+    alternates: list[LineAlternateSOB] = []
 
 
 class SupplierBOMLineUpdate(BaseModel):
@@ -628,25 +648,7 @@ ALTERNATE_CODE_COLUMN_ALIASES = {
     "main_material_code": "main_code", "original_code": "main_code", "code": "main_code",
     "alternate_code": "alternate_code", "alternate_part_code": "alternate_code", "alt_code": "alternate_code",
     "alternate": "alternate_code", "alternative_code": "alternate_code", "new_code": "alternate_code",
-    "sob": "sob_percent", "sob_percent": "sob_percent", "sob_%": "sob_percent", "alternate_sob": "sob_percent",
-    "alternate_sob_percent": "sob_percent", "share": "sob_percent", "share_percent": "sob_percent",
 }
-
-
-def _split_alternate_usage(usage: dict[int, float], groups: dict[int, list[tuple[int, float]]]) -> dict[int, float]:
-    """Move each alternate's SOB share of a main code's quantity onto the alternate code:
-    main keeps (100 - sum of alternates' SOB)%, each alternate gets its SOB%."""
-    if not groups:
-        return usage
-    result = dict(usage)
-    for main_id, quantity in usage.items():
-        alternates = groups.get(main_id)
-        if not alternates:
-            continue
-        result[main_id] = result.get(main_id, 0) - quantity * sum(sob for _, sob in alternates) / 100
-        for alternate_id, sob in alternates:
-            result[alternate_id] = result.get(alternate_id, 0) + quantity * sob / 100
-    return result
 
 
 def _price_cells(row: dict, row_number: int, can_price: bool) -> tuple[float, str]:
@@ -777,28 +779,56 @@ def _price_status(link: SupplierPart, current_month: str) -> str:
     return "Update due" if months_since_update >= interval else "Current"
 
 
-def _item_map(db: Session) -> tuple[dict[int, Item], dict[int, list[tuple[int, float]]]]:
+def _item_map(db: Session) -> tuple[dict[int, Item], dict[int, list[tuple[int, float, int]]]]:
     items = {item.id: item for item in db.scalars(select(Item)).all()}
-    children: dict[int, list[tuple[int, float]]] = {}
-    for row in db.execute(select(BOMComponent.parent_item_id, BOMComponent.child_item_id, BOMComponent.quantity)):
-        children.setdefault(row.parent_item_id, []).append((row.child_item_id, row.quantity))
+    children: dict[int, list[tuple[int, float, int]]] = {}
+    for row in db.execute(select(BOMComponent.parent_item_id, BOMComponent.child_item_id, BOMComponent.quantity, BOMComponent.id)):
+        children.setdefault(row.parent_item_id, []).append((row.child_item_id, row.quantity, row.id))
     return items, children
 
 
-def _rollup_model_bom(
-    roots: list[ModelBOM], children: dict[int, list[tuple[int, float]]]
-) -> dict[int, float]:
-    result: dict[int, float] = {}
+def _line_alternate_splits(db: Session) -> tuple[dict[int, list[tuple[int, float]]], dict[int, list[tuple[int, float]]]]:
+    """Alternate SOB per BOM line: (by Model BOM Level 1 line id, by part BOM line id) ->
+    [(alternate item id, SOB %)]. Only SOB > 0, only for current main / alternate pairs and
+    only while the line still uses the main code the SOB was saved for."""
+    pairs = set(db.execute(select(AlternateCode.main_item_id, AlternateCode.alternate_item_id)).all())
+    root_items = dict(db.execute(select(ModelBOM.id, ModelBOM.material_id)).all())
+    component_items = dict(db.execute(select(BOMComponent.id, BOMComponent.child_item_id)).all())
+    by_root: dict[int, list[tuple[int, float]]] = {}
+    by_component: dict[int, list[tuple[int, float]]] = {}
+    for entry in db.scalars(select(BOMLineAlternate).where(BOMLineAlternate.sob_percent > 0)).all():
+        if (entry.main_item_id, entry.alternate_item_id) not in pairs:
+            continue
+        if entry.model_bom_id is not None and root_items.get(entry.model_bom_id) == entry.main_item_id:
+            by_root.setdefault(entry.model_bom_id, []).append((entry.alternate_item_id, entry.sob_percent))
+        elif entry.component_id is not None and component_items.get(entry.component_id) == entry.main_item_id:
+            by_component.setdefault(entry.component_id, []).append((entry.alternate_item_id, entry.sob_percent))
+    return by_root, by_component
 
-    def walk(item_id: int, qty: float, ancestors: frozenset[int]) -> None:
+
+def _rollup_model_bom(
+    roots: list[ModelBOM], children: dict[int, list[tuple[int, float, int]]],
+    root_splits: dict[int, list[tuple[int, float]]] | None = None,
+    component_splits: dict[int, list[tuple[int, float]]] | None = None,
+) -> dict[int, float]:
+    """Material quantity per model. On a BOM line with alternate SOB, each alternate takes its
+    SOB % of that line's quantity and the main code keeps the rest."""
+    result: dict[int, float] = {}
+    root_splits = root_splits or {}
+    component_splits = component_splits or {}
+
+    def walk(item_id: int, qty: float, ancestors: frozenset[int], split: list[tuple[int, float]] = ()) -> None:
         if item_id in ancestors:
             raise HTTPException(status_code=422, detail="Circular BOM detected")
+        for alternate_id, sob in split:
+            result[alternate_id] = result.get(alternate_id, 0) + qty * sob / 100
+        qty = qty * (100 - sum(sob for _, sob in split)) / 100
         result[item_id] = result.get(item_id, 0) + qty
-        for child_id, child_qty in children.get(item_id, ()):
-            walk(child_id, qty * child_qty, ancestors | {item_id})
+        for child_id, child_qty, component_id in children.get(item_id, ()):
+            walk(child_id, qty * child_qty, ancestors | {item_id}, component_splits.get(component_id, ()))
 
     for root in roots:
-        walk(root.material_id, root.quantity, frozenset())
+        walk(root.material_id, root.quantity, frozenset(), root_splits.get(root.id, ()))
     return result
 
 
@@ -823,12 +853,10 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
     if cycle_ids:
         for row in db.scalars(select(PlanLine).where(PlanLine.cycle_id.in_(cycle_ids))).all():
             plan_by_cycle_month.setdefault((row.cycle_id, row.target_month), {})[row.model_id] = row.quantity
-    alternate_groups: dict[int, list[tuple[int, float]]] = {}
-    for alternate in db.scalars(select(AlternateCode)).all():
-        alternate_groups.setdefault(alternate.main_item_id, []).append((alternate.alternate_item_id, alternate.sob_percent))
-    # Alternate codes take their SOB share of the main code's demand.
+    # Alternate codes take their SOB share of each BOM line's demand (SOB set per line).
+    root_splits, component_splits = _line_alternate_splits(db)
     material_usage_by_model = {
-        model_id: _split_alternate_usage(_rollup_model_bom(roots_by_model.get(model_id, []), children), alternate_groups)
+        model_id: _rollup_model_bom(roots_by_model.get(model_id, []), children, root_splits, component_splits)
         for model_id in models
     }
     actuals = db.scalars(select(ActualProduction).where(
@@ -1617,6 +1645,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=404, detail="Model not found")
             if db.scalar(select(PlanLine.id).where(PlanLine.model_id == model_id)) or db.scalar(select(ActualProduction.id).where(ActualProduction.model_id == model_id)):
                 raise HTTPException(status_code=409, detail="This model has plan or actual history and cannot be deleted")
+            db.execute(delete(BOMLineAlternate).where(BOMLineAlternate.model_bom_id.in_(select(ModelBOM.id).where(ModelBOM.model_id == model_id))))
             db.execute(delete(ModelBOM).where(ModelBOM.model_id == model_id))
             db.execute(delete(ProductModelProduct).where(ProductModelProduct.model_id == model_id))
             db.delete(model)
@@ -1851,6 +1880,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             entry = db.get(ModelBOM, bom_id)
             if not entry or entry.model_id != model_id:
                 raise HTTPException(status_code=404, detail="BOM line not found")
+            db.execute(delete(BOMLineAlternate).where(BOMLineAlternate.model_bom_id == bom_id))
             db.delete(entry)
             db.commit()
             return Response(status_code=204)
@@ -1898,9 +1928,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     def bom_price_lookup(db: Session, material_ids: Iterable[int] | None = None):
         """BOM part price. Each code's own price = SOB-weighted price of its Direct suppliers:
         sum(price x SOB) / sum(SOB); Material Master price when no Direct supplier has a price,
-        or when the suppliers quote in different currencies. A code with alternate codes is
-        priced main share x main price + each alternate's SOB x its own price.
-        price.alternates(item_id) lists the alternates with their SOB and own price."""
+        or when the suppliers quote in different currencies. On a BOM line with alternate SOB
+        the line price is blended by price.blend (main share x main price + SOB x alternate price).
+        price.alternates(item_id) lists the code's alternates with their own price."""
         if material_ids is not None:
             material_ids = set(material_ids)
         groups = alternate_groups(db, material_ids)
@@ -1931,45 +1961,79 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 item = alternate_items.get(alternate.alternate_item_id)
                 if item:
                     rows.append({"id": alternate.id, "material_id": item.id, "code": item.code, "name": item.name,
-                                 "uom": item.uom, "sob_percent": alternate.sob_percent, **own_price(item)})
+                                 "uom": item.uom, **own_price(item)})
             return rows
 
-        def price(item: Item) -> dict:
-            main = own_price(item)
-            others = alternates(item.id)
-            if not others:
+        def blend(item: Item, main: dict, listed: list[dict]) -> dict:
+            """Line price with alternate SOB: listed = alternates with 'sob_percent' for this line."""
+            used = [a for a in listed if a["sob_percent"] > 0]
+            if not used:
                 return main
-            main_share = 100 - sum(alternate["sob_percent"] for alternate in others)
-            parts = ([(main_share, item.code, main)] if main_share > 0 else []) + [(a["sob_percent"], a["code"], a) for a in others]
+            main_share = 100 - sum(a["sob_percent"] for a in used)
+            parts = ([(main_share, item.code, main)] if main_share > 0 else []) + [(a["sob_percent"], a["code"], a) for a in used]
             if len({part["currency"] for _, _, part in parts}) != 1:
                 return {**main, "price_source": f"{main['price_source']}; main code only (alternate codes priced in another currency)"}
             detail = " + ".join(f"{code} {share:g}% x {part['unit_price']:,.2f}" for share, code, part in parts)
             return {"unit_price": sum(share * part["unit_price"] for share, _, part in parts) / 100,
                     "currency": parts[0][2]["currency"], "price_source": f"SOB-weighted with alternate codes: {detail}"}
 
+        price = own_price
         price.alternates = alternates
         price.own = own_price
+        price.blend = blend
         return price
 
+    def line_sobs(db: Session, model_bom_ids: Iterable[int] = (), component_ids: Iterable[int] = (), everything: bool = False) -> dict[tuple[str, int], dict[tuple[int, int], float]]:
+        """Saved alternate SOB per BOM line: ('root', id) / ('component', id) -> {(main id, alternate id): SOB}."""
+        model_bom_ids, component_ids = list(model_bom_ids), list(component_ids)
+        conditions = [BOMLineAlternate.id.is_not(None)] if everything else []
+        if model_bom_ids:
+            conditions.append(BOMLineAlternate.model_bom_id.in_(model_bom_ids))
+        if component_ids:
+            conditions.append(BOMLineAlternate.component_id.in_(component_ids))
+        result: dict[tuple[str, int], dict[tuple[int, int], float]] = {}
+        if not conditions:
+            return result
+        for entry in db.scalars(select(BOMLineAlternate).where(or_(*conditions))).all():
+            key = ("root", entry.model_bom_id) if entry.model_bom_id is not None else ("component", entry.component_id)
+            result.setdefault(key, {})[(entry.main_item_id, entry.alternate_item_id)] = entry.sob_percent
+        return result
+
+    def line_alternates(price, item: Item, saved: dict[tuple[int, int], float], quantity: float) -> tuple[list[dict], float]:
+        """The code's alternates with this line's SOB (0% until set) and share of the quantity."""
+        listed = price.alternates(item.id)
+        for alternate in listed:
+            alternate["sob_percent"] = saved.get((item.id, alternate["material_id"]), 0.0)
+            alternate["quantity"] = quantity * alternate["sob_percent"] / 100
+        return listed, 100 - sum(alternate["sob_percent"] for alternate in listed)
+
     def add_alternates(db: Session, rows: list[dict], can_price: bool) -> None:
-        """Each BOM row whose code has alternate codes gets 'main_sob_percent' and 'alternates'
-        (code, name, SOB %, its share of the line quantity and, with price access, its own price)."""
+        """Each BOM row whose code has alternate codes gets 'alternates' (code, name, this line's
+        SOB %, its share of the line quantity, own price), 'main_sob_percent', 'main_quantity'
+        and, with price access, the line price blended by SOB."""
         groups = alternate_groups(db, {row["material_id"] for row in rows})
         if not groups:
             return
         price = bom_price_lookup(db, groups)
-        for row in rows:
-            listed = price.alternates(row["material_id"])
-            if not listed:
+        main_rows = [row for row in rows if row["material_id"] in groups]
+        saved = line_sobs(db, [row["root_bom_id"] for row in main_rows if row.get("root_bom_id")],
+                          [row["component_id"] for row in main_rows if row.get("component_id")])
+        items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(list(groups)))).all()}
+        for row in main_rows:
+            item = items.get(row["material_id"])
+            if not item:
                 continue
-            row["main_sob_percent"] = 100 - sum(alternate["sob_percent"] for alternate in listed)
+            key = ("root", row["root_bom_id"]) if row.get("root_bom_id") else ("component", row.get("component_id"))
+            listed, main_share = line_alternates(price, item, saved.get(key, {}), row["quantity"])
+            row["main_sob_percent"] = main_share
             # The main code's own share of the BOM quantity (main + alternates = BOM quantity)
-            row["main_quantity"] = row["quantity"] * row["main_sob_percent"] / 100
-            for alternate in listed:
-                alternate["quantity"] = row["quantity"] * alternate["sob_percent"] / 100
-                if not can_price:
-                    for key in ("unit_price", "currency", "price_source"):
-                        alternate.pop(key, None)
+            row["main_quantity"] = row["quantity"] * main_share / 100
+            if can_price:
+                row.update(price.blend(item, price.own(item), listed))
+            else:
+                for alternate in listed:
+                    for k in ("unit_price", "currency", "price_source"):
+                        alternate.pop(k, None)
             row["alternates"] = listed
 
     def bom_parent_material_ids(db: Session, tab: str) -> set[int]:
@@ -2176,6 +2240,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             keep_child_ids = {child_id for child_id, _ in parsed}
             for link in db.scalars(select(BOMComponent).where(BOMComponent.parent_item_id == parent_material_id)).all():
                 if link.child_item_id not in keep_child_ids:
+                    db.execute(delete(BOMLineAlternate).where(BOMLineAlternate.component_id == link.id))
                     db.delete(link)
             for child_id, quantity in parsed:
                 existing = links_by_pair.get((parent_material_id, child_id))
@@ -2634,35 +2699,59 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         if db.scalar(others.where(AlternateCode.alternate_item_id == main.id).limit(1)):
             raise HTTPException(status_code=422, detail=f"{main.code} is itself an alternate code, so it cannot have alternates")
 
-    def check_alternate_share(db: Session, main_id: int) -> None:
-        total = db.scalar(select(func.sum(AlternateCode.sob_percent)).where(AlternateCode.main_item_id == main_id)) or 0
-        if total > 100 + 1e-9:
-            main = db.get(Item, main_id)
-            raise HTTPException(status_code=422, detail=f"Alternate codes of {main.code if main else 'this code'} add up to {total:g}% SOB; the total cannot be more than 100%")
-
     def alternate_rows(db: Session, entries: list[AlternateCode], can_price: bool) -> list[dict]:
         ids = {entry.main_item_id for entry in entries} | {entry.alternate_item_id for entry in entries}
         items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(ids))).all()} if ids else {}
         price = bom_price_lookup(db, {entry.main_item_id for entry in entries}) if can_price else None
-        totals: dict[int, float] = dict(db.execute(
-            select(AlternateCode.main_item_id, func.sum(AlternateCode.sob_percent))
-            .where(AlternateCode.main_item_id.in_({entry.main_item_id for entry in entries})).group_by(AlternateCode.main_item_id)
-        ).all()) if entries else {}
         rows = []
         for entry in entries:
             main, alternate = items.get(entry.main_item_id), items.get(entry.alternate_item_id)
             if not main or not alternate:
                 continue
             row = {"id": entry.id, "main_item_id": main.id, "main_code": main.code, "main_name": main.name,
-                   "main_sob_percent": 100 - totals.get(main.id, 0), "alternate_item_id": alternate.id,
-                   "alternate_code": alternate.code, "alternate_name": alternate.name, "uom": main.uom,
-                   "sob_percent": entry.sob_percent}
+                   "alternate_item_id": alternate.id, "alternate_code": alternate.code,
+                   "alternate_name": alternate.name, "uom": main.uom}
             if price:
                 main_price, alternate_price = price.own(main), price.own(alternate)
                 row.update(main_unit_price=main_price["unit_price"], main_currency=main_price["currency"],
                            unit_price=alternate_price["unit_price"], currency=alternate_price["currency"])
             rows.append(row)
         return rows
+
+    @app.put("/api/planning/bom-line-alternates")
+    def save_line_alternates(payload: LineAlternatesInput, request: Request):
+        """Alternate code SOB on one BOM line (Model BOM Level 1 line or Level 2 / 3 part BOM
+        line). Codes not listed go to 0%; the main code keeps 100 - sum."""
+        current_user(request)
+        _check_supply_role(request)
+        if (payload.model_bom_id is None) == (payload.component_id is None):
+            raise HTTPException(status_code=422, detail="Give either model_bom_id or component_id")
+        with open_db() as db:
+            line = db.get(ModelBOM, payload.model_bom_id) if payload.model_bom_id is not None else db.get(BOMComponent, payload.component_id)
+            if not line:
+                raise HTTPException(status_code=404, detail="BOM line not found")
+            main = db.get(Item, line.material_id if payload.model_bom_id is not None else line.child_item_id)
+            allowed = {a.alternate_item_id for a in alternate_groups(db, [main.id]).get(main.id, [])}
+            seen: set[int] = set()
+            for entry in payload.alternates:
+                if entry.alternate_item_id not in allowed:
+                    other = db.get(Item, entry.alternate_item_id)
+                    raise HTTPException(status_code=422, detail=f"{other.code if other else 'This code'} is not an alternate of {main.code}; add it in Product Master → Alternate codes first")
+                if entry.alternate_item_id in seen:
+                    raise HTTPException(status_code=422, detail="An alternate code is listed twice")
+                seen.add(entry.alternate_item_id)
+            total = sum(entry.sob_percent for entry in payload.alternates)
+            if total > 100 + 1e-9:
+                raise HTTPException(status_code=422, detail=f"Alternate SOB on this line adds up to {total:g}%; the total cannot be more than 100%")
+            column = BOMLineAlternate.model_bom_id if payload.model_bom_id is not None else BOMLineAlternate.component_id
+            db.execute(delete(BOMLineAlternate).where(column == (payload.model_bom_id if payload.model_bom_id is not None else payload.component_id)))
+            for entry in payload.alternates:
+                if entry.sob_percent > 0:
+                    db.add(BOMLineAlternate(model_bom_id=payload.model_bom_id, component_id=payload.component_id, main_item_id=main.id,
+                                            alternate_item_id=entry.alternate_item_id, sob_percent=entry.sob_percent))
+            db.commit()
+            return {"main_code": main.code, "main_sob_percent": 100 - total,
+                    "alternates": [{"alternate_item_id": e.alternate_item_id, "sob_percent": e.sob_percent} for e in payload.alternates]}
 
     @app.get("/api/planning/alternate-codes")
     def list_alternate_codes(request: Request, search: str = "", offset: int = 0, limit: int = 500):
@@ -2689,24 +2778,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         _check_supply_role(request)
         with open_db() as db:
             check_alternate(db, db.get(Item, payload.main_item_id), db.get(Item, payload.alternate_item_id))
-            entry = AlternateCode(main_item_id=payload.main_item_id, alternate_item_id=payload.alternate_item_id, sob_percent=payload.sob_percent)
+            # SOB is set on each BOM line (0% until then)
+            entry = AlternateCode(main_item_id=payload.main_item_id, alternate_item_id=payload.alternate_item_id, sob_percent=0)
             db.add(entry)
-            db.flush()
-            check_alternate_share(db, payload.main_item_id)
-            db.commit()
-            return alternate_rows(db, [entry], _check_price_access(request))[0]
-
-    @app.patch("/api/planning/alternate-codes/{alternate_id}")
-    def update_alternate_code(alternate_id: int, payload: AlternateCodeUpdate, request: Request):
-        current_user(request)
-        _check_supply_role(request)
-        with open_db() as db:
-            entry = db.get(AlternateCode, alternate_id)
-            if not entry:
-                raise HTTPException(status_code=404, detail="Alternate code not found")
-            entry.sob_percent = payload.sob_percent
-            db.flush()
-            check_alternate_share(db, entry.main_item_id)
             db.commit()
             return alternate_rows(db, [entry], _check_price_access(request))[0]
 
@@ -2718,6 +2792,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             entry = db.get(AlternateCode, alternate_id)
             if not entry:
                 raise HTTPException(status_code=404, detail="Alternate code not found")
+            # its SOB on BOM lines goes back to the main code
+            db.execute(delete(BOMLineAlternate).where(BOMLineAlternate.main_item_id == entry.main_item_id,
+                                                      BOMLineAlternate.alternate_item_id == entry.alternate_item_id))
             db.delete(entry)
             db.commit()
             return Response(status_code=204)
@@ -2725,14 +2802,13 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     @app.post("/api/planning/alternate-codes/upload", status_code=201)
     async def upload_alternate_codes(request: Request):
         """Alternate codes from Excel (heading row found automatically): Main code, Alternate
-        code, SOB %. An existing main / alternate pair gets the new SOB. All rows or none."""
+        code. Pairs already there are left as they are; SOB is set on each BOM line. All rows or none."""
         current_user(request)
         _check_supply_role(request)
-        rows = _read_flexible_sheet(await request.body(), ALTERNATE_CODE_COLUMN_ALIASES, {"main_code", "alternate_code", "sob_percent"})
+        rows = _read_flexible_sheet(await request.body(), ALTERNATE_CODE_COLUMN_ALIASES, {"main_code", "alternate_code"})
         with open_db() as db:
             seen: set[tuple[str, str]] = set()
-            mains: set[int] = set()
-            added = updated = 0
+            added = existing_pairs = 0
             for row in rows:
                 row_number = row["_excel_row"]
                 main_code, alternate_code = str(row.get("main_code") or "").strip(), str(row.get("alternate_code") or "").strip()
@@ -2742,12 +2818,6 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 if key in seen:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: {main_code} / {alternate_code} is repeated in the file")
                 seen.add(key)
-                try:
-                    sob = float(str(row.get("sob_percent") if row.get("sob_percent") is not None else "").replace("%", "").strip())
-                except ValueError as exc:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB % must be a number") from exc
-                if not 0 < sob <= 100:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB % must be more than 0 and at most 100")
                 main = db.scalar(select(Item).where(func.lower(Item.code) == key[0]))
                 alternate = db.scalar(select(Item).where(func.lower(Item.code) == key[1]))
                 if not main or not alternate:
@@ -2759,17 +2829,13 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 except HTTPException as exc:
                     raise HTTPException(status_code=exc.status_code, detail=f"Row {row_number}: {exc.detail}") from exc
                 if existing:
-                    existing.sob_percent = sob
-                    updated += 1
+                    existing_pairs += 1
                 else:
-                    db.add(AlternateCode(main_item_id=main.id, alternate_item_id=alternate.id, sob_percent=sob))
+                    db.add(AlternateCode(main_item_id=main.id, alternate_item_id=alternate.id, sob_percent=0))
                     added += 1
                 db.flush()
-                mains.add(main.id)
-            for main_id in mains:
-                check_alternate_share(db, main_id)
             db.commit()
-            return {"rows": len(rows), "added": added, "updated": updated}
+            return {"rows": len(rows), "added": added, "already_there": existing_pairs}
 
     @app.get("/api/planning/alternate-codes.{file_format}")
     def export_alternate_codes(file_format: str, request: Request):
@@ -2780,10 +2846,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         with open_db() as db:
             rows = alternate_rows(db, list(db.scalars(select(AlternateCode)).all()), can_price)
         rows.sort(key=lambda row: (row["main_code"], row["alternate_code"]))
-        headers = ["Main code", "Main name", "Main SOB %", "Alternate code", "Alternate name", "Alternate SOB %", "Unit"]
+        headers = ["Main code", "Main name", "Alternate code", "Alternate name", "Unit"]
         if can_price:
             headers += ["Main price", "Main currency", "Alternate price", "Alternate currency"]
-        values = [[r["main_code"], r["main_name"], r["main_sob_percent"], r["alternate_code"], r["alternate_name"], r["sob_percent"], r["uom"]]
+        values = [[r["main_code"], r["main_name"], r["alternate_code"], r["alternate_name"], r["uom"]]
                   + ([r["main_unit_price"], r["main_currency"], r["unit_price"], r["currency"]] if can_price else []) for r in rows]
         output = _generic_workbook("Alternate codes", headers, values) if file_format == "xlsx" else _generic_pdf("Alternate codes", headers, values)
         media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if file_format == "xlsx" else "application/pdf"
@@ -3678,7 +3744,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             "actuals": ["model_code", "actual_quantity", "oem_stock"],
             "own-stock": ["material_code", "quantity"],
             "supplier-stock": ["supplier_code", "material_code", "tier", "parent_supplier_code", "quantity", "available_quantity", "arrival_month"],
-            "alternate-codes": ["main_code", "alternate_code", "sob_percent"],
+            "alternate-codes": ["main_code", "alternate_code"],
             "supplier-parts": ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency",
                                "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months"],
         }
@@ -3965,15 +4031,19 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             items = {item.id: item for item in db.scalars(select(Item)).all()}
             price = bom_price_lookup(db)
             prices = {item_id: price(item) for item_id, item in items.items()}
+            line_prices: dict[int, dict] = {}  # tree index -> price blended with that line's alternate SOB
             children: dict[int, list[BOMComponent]] = {}
             for link in db.scalars(select(BOMComponent).order_by(BOMComponent.id)).all():
                 children.setdefault(link.parent_item_id, []).append(link)
 
-            def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None) -> None:
-                alternates = price.alternates(item.id) if item is not None and quantity is not None else []
+            saved_sobs = line_sobs(db, everything=True)
+
+            def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None, line: tuple | None = None) -> None:
+                alternates, main_share = (line_alternates(price, item, saved_sobs.get(line, {}), quantity)
+                                          if item is not None and quantity is not None and price.alternates(item.id) else ([], 100))
                 if alternates:
+                    line_prices[len(tree)] = price.blend(item, prices[item.id], alternates)
                     # Main code row: its own SOB share of the BOM quantity
-                    main_share = 100 - sum(alternate["sob_percent"] for alternate in alternates)
                     path = {**path, level: (path[level][0], f"{path[level][1]} (main {main_share:g}% of {quantity:g})")}
                     tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity * main_share / 100, "item": item})
                 else:
@@ -3992,7 +4062,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         continue
                     child_path = {**path, level: (child.code, child.name)}
                     deeper = level == "l2" and bool(children.get(child.id))
-                    emit(depth, level, child_path, deeper, link.quantity, child)
+                    emit(depth, level, child_path, deeper, link.quantity, child, ("component", link.id))
                     if deeper:
                         part_lines(child.id, "l3", depth + 1, child_path)
 
@@ -4007,7 +4077,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         continue
                     line_path = {**path, "l1": (item.code, item.name)}
                     deeper = bool(children.get(item.id))
-                    emit(depth, "l1", line_path, deeper, root.quantity, item)
+                    emit(depth, "l1", line_path, deeper, root.quantity, item, ("root", root.id))
                     if deeper:
                         part_lines(item.id, "l2", depth + 1, line_path)
 
@@ -4047,14 +4117,14 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         if can_price:
             headers += ["Part price", "Currency"]
         rows = []
-        for entry in tree:
+        for index, entry in enumerate(tree):
             item = entry["item"]
             values = [BOM_TREE_LEVEL_NAMES[entry["level"]] + (" alternate" if entry.get("alternate") else "")]
             for level in levels:
                 values.extend(entry["path"].get(level, ("", "")))
             values += [entry["quantity"] if entry["quantity"] is not None else "", item.uom if item else ""]
             if can_price:
-                priced = (entry["alternate"] if entry.get("alternate") else prices.get(item.id)) if item else None
+                priced = (entry["alternate"] if entry.get("alternate") else line_prices.get(index) or prices.get(item.id)) if item else None
                 values += [priced["unit_price"] if priced else "", priced["currency"] if priced else ""]
             rows.append({"depth": entry["depth"], "has_children": entry["has_children"], "values": values})
         title = f"{tab if tab.endswith('BOM') else tab + ' BOM'} tree"

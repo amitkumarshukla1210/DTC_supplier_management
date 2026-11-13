@@ -482,3 +482,5 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 /* Alternate codes in the BOM tree: follow their main code's row */
 #pageContent[data-view="master"] tr.tree-alternate > td { font-style: italic; color: #7a5a12; background: #fffaf0; }
 #pageContent[data-view="master"] tr.tree-alternate > td.tree-inherited { color: #a08a5c; }
+.line-alternates { border: 1px solid #f0d9a8; background: #fffaf0; border-radius: 10px; padding: 10px 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.line-alternates legend { font-weight: 700; color: #7a5a12; padding: 0 6px; }
