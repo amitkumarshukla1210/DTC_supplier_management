@@ -720,11 +720,13 @@ function withAlternates(tab, row, item, level) {
   if (!item.alternates?.length) return treeRowHtml(tab, row);
   // Main row shows its own SOB share of the BOM quantity; Edit still changes the full BOM quantity.
   const lineAlternates = item.alternates.map((alt) => ({ id: alt.material_id, code: alt.code, name: alt.name, sob: alt.sob_percent }));
-  const main = { ...row, attributes: `${row.attributes || ""} data-alternates="${esc(JSON.stringify(lineAlternates))}"`, quantity: number(item.main_quantity, 4), cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}% of ${number(item.quantity, 4)}`] } };
+  const next = item.sob_next_change;  // next dated SOB change (e.g. a replacement from Jan 2027)
+  const later = (sob) => (next ? ` → ${number(sob, 2)}% from ${monthLabel(next.from_month)}` : "");
+  const main = { ...row, attributes: `${row.attributes || ""} data-alternates="${esc(JSON.stringify(lineAlternates))}"`, quantity: number(item.main_quantity, 4), cells: { ...row.cells, [level]: [row.cells[level][0], `${row.cells[level][1]} · main ${number(item.main_sob_percent, 2)}% of ${number(item.quantity, 4)}${later(next?.main_sob_percent)}`] } };
   const inherit = TREE_LEVELS[tab].flatMap((name, index) => row.cells[name] || [row.inherit?.[index * 2] || "", row.inherit?.[index * 2 + 1] || ""]);
   return treeRowHtml(tab, main) + item.alternates.map((alt) => treeRowHtml(tab, {
     depth: row.depth, inherit, className: "tree-alternate", attributes: `data-alternate-of="${item.material_id}"`,
-    cells: { [level]: [`↳ ${alt.code}`, `${alt.name} · alternate ${number(alt.sob_percent, 2)}%`] },
+    cells: { [level]: [`↳ ${alt.code}`, `${alt.name} · alternate ${number(alt.sob_percent, 2)}%${later(alt.next_sob_percent)}`] },
     quantity: number(alt.quantity, 4), uom: alt.uom, price: treePrice(alt),
   })).join("");
 }
@@ -1635,6 +1637,7 @@ function reportRows(rows = state.report) {
     <td>${number(row.excess_qty)} ${esc(row.uom)}${row.excess_value === undefined ? "" : `<small>${money(row.excess_value, row.currency)}</small>`}</td>
     <td>${number(row.lead_time_days, 0)} days</td><td><span class="criticality criticality-${row.criticality.toLowerCase().replace(" ", "-")}">${esc(row.criticality)}</span></td>
     <td>${esc(row.plan_revision)}</td>
+    <td>${row.sob_change_from ? `from ${esc(monthLabel(row.sob_change_from))}<small class="${row.sob_demand_change < 0 ? "sob-down" : "sob-up"}">${row.sob_demand_change > 0 ? "+" : ""}${number(row.sob_demand_change)} ${esc(row.uom)} demand</small>` : "—"}</td>
   </tr>`).join("");
 }
 
@@ -1653,7 +1656,7 @@ async function renderReports() {
     </section>
     <section class="panel table-panel">${panelHeader("Supplier shortage & excess table", "Critical shortages are listed first; prices and values are visible only to users with explicit access.")}
       <div class="table-toolbar"><div class="toolbar-group" id="reportFilters"></div><button class="button button-small" data-action="clear-report-filters">Clear all filters</button></div>
-      <div id="reportTable">${table(["Month", "Material", "Supplier", "Upstream parent", "Tier", "SOB", "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Projected balance", "Coverage", "Shortage", "Recommended PO", "Excess", "Lead time", "Criticality", "Plan revision"], "", "Generate a report to see shortages and excess.")}</div>
+      <div id="reportTable">${table(["Month", "Material", "Supplier", "Upstream parent", "Tier", "SOB", "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Projected balance", "Coverage", "Shortage", "Recommended PO", "Excess", "Lead time", "Criticality", "Plan revision", "SOB change"], "", "Generate a report to see shortages and excess.")}</div>
     </section>`;
   $("#reportForm").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1693,7 +1696,7 @@ function renderReportTable() {
     + filterSelector("Supplier", "supplier_name", state.report.map((row) => row.supplier_name))
     + filterSelector("Tier", "tier", state.report.map((row) => row.tier))
     + filterSelector("Criticality", "criticality", state.report.map((row) => row.criticality));
-  const headers = ["Month", "Material", "Supplier", "Upstream parent", "Tier", "SOB", "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Projected balance", "Coverage", "Shortage", "Recommended PO", "Excess", "Lead time", "Criticality", "Plan revision"];
+  const headers = ["Month", "Material", "Supplier", "Upstream parent", "Tier", "SOB", "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Projected balance", "Coverage", "Shortage", "Recommended PO", "Excess", "Lead time", "Criticality", "Plan revision", "SOB change"];
   $("#reportTable").innerHTML = `${table(headers, reportRows(), "No rows match the active filters.")}<div class="table-toolbar pagination-toolbar"><span>${state.reportTotal ? `${(state.reportOffset + 1).toLocaleString()}–${Math.min(state.reportOffset + state.report.length, state.reportTotal).toLocaleString()} of ${state.reportTotal.toLocaleString()}` : "No report rows"}</span><div><button class="button button-small" data-report-page="${Math.max(0, state.reportOffset - 1000)}" ${state.reportOffset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-report-page="${state.reportOffset + 1000}" ${state.reportOffset + state.report.length >= state.reportTotal ? "disabled" : ""}>Next</button></div></div>`;
   filters.querySelectorAll("[data-filter-key]").forEach((input) => input.addEventListener("change", () => {
     $("#reportTable").innerHTML = `${table(headers, reportRows(), "No rows match the active filters.")}<div class="table-toolbar pagination-toolbar"><span>${state.reportTotal ? `${(state.reportOffset + 1).toLocaleString()}–${Math.min(state.reportOffset + state.report.length, state.reportTotal).toLocaleString()} of ${state.reportTotal.toLocaleString()}` : "No report rows"}</span><div><button class="button button-small" data-report-page="${Math.max(0, state.reportOffset - 1000)}" ${state.reportOffset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-report-page="${state.reportOffset + 1000}" ${state.reportOffset + state.report.length >= state.reportTotal ? "disabled" : ""}>Next</button></div></div>`;
@@ -1865,7 +1868,7 @@ function openModal(type, record = {}) {
   // Alternate code SOB on this BOM line (0% = not used here); the main code keeps the rest
   const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
   if (lineAlternates.length) {
-    form = form.replace('<div class="modal-footer field full">', `<fieldset class="field full line-alternates"><legend>Alternate code SOB on this BOM line</legend>${lineAlternates.map((alt) => `<label class="field"><span>${esc(alt.code)} · ${esc(alt.name)} (%)</span><input class="form-control" type="number" min="0" max="100" step="any" data-line-alt="${alt.id}" value="${alt.sob}" /></label>`).join("")}<label class="field"><span>Main code SOB (%)</span><input class="form-control" id="lineMainSob" readonly /></label><p class="subtle field full">0% = alternate not used on this line. Only this line changes; other BOMs keep their own SOB.</p></fieldset><div class="modal-footer field full">`);
+    form = form.replace('<div class="modal-footer field full">', `<fieldset class="field full line-alternates"><legend>Alternate code SOB on this BOM line</legend>${lineAlternates.map((alt) => `<label class="field"><span>${esc(alt.code)} · ${esc(alt.name)} (%)</span><input class="form-control" type="number" min="0" max="100" step="any" data-line-alt="${alt.id}" value="${alt.sob}" /></label>`).join("")}<label class="field"><span>Main code SOB (%)</span><input class="form-control" id="lineMainSob" readonly /></label><label class="field"><span>SOB valid from month (empty = all months)</span><input class="form-control" type="month" id="lineSobFrom" /></label><label class="field line-everywhere"><span>Apply to</span><span class="check-row"><input type="checkbox" id="lineSobEverywhere" /> every BOM line using this code (all models, L1 direct and part BOMs)</span></label><p class="subtle field full">0% = alternate not used. Earlier months keep the SOB valid then; a code replacement = 100% on the new code from the month.</p><div class="field full" id="lineSobHistory"><span class="subtle">Loading SOB history…</span></div></fieldset><div class="modal-footer field full">`);
   }
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = form;
@@ -1877,6 +1880,30 @@ function openModal(type, record = {}) {
     };
     $("#modalForm").addEventListener("input", (event) => { if (event.target.matches("[data-line-alt]")) syncMain(); });
     syncMain();
+    const lineQuery = () => new URLSearchParams(record.root_bom_id ? { model_bom_id: record.root_bom_id } : { component_id: record.component_id });
+    const showHistory = async (setDefault = false) => {
+      const holder = $("#lineSobHistory");
+      if (!holder) return;
+      try {
+        const { history } = await api(`/api/planning/bom-line-alternates?${lineQuery()}`);
+        // first SOB on a line: all months; a later change: from this month by default
+        if (setDefault) $("#lineSobFrom").value = history.length ? monthNow() : "";
+        holder.innerHTML = history.length ? `<table class="sob-history"><thead><tr><th>From</th>${lineAlternates.map((alt) => `<th>${esc(alt.code)}</th>`).join("")}<th>Main</th><th></th></tr></thead><tbody>${history.map((change) => `<tr data-sob-change="${esc(change.from_month)}"><td>${change.from_month ? esc(monthLabel(change.from_month)) : "Start"}</td>${lineAlternates.map((alt) => `<td>${number(change.alternates.find((a) => a.alternate_item_id === alt.id)?.sob_percent || 0, 2)}%</td>`).join("")}<td>${number(change.main_sob_percent, 2)}%</td><td><button type="button" class="text-button button-danger" data-sob-change-delete="${esc(change.from_month)}">Remove</button></td></tr>`).join("")}</tbody></table>` : '<span class="subtle">No SOB set on this line yet (main code 100%).</span>';
+      } catch (error) { holder.textContent = error.message; }
+    };
+    $("#lineSobHistory").addEventListener("click", async (event) => {
+      const remove = event.target.closest("[data-sob-change-delete]");
+      if (!remove) return;
+      const query = lineQuery();
+      query.set("from_month", remove.dataset.sobChangeDelete);
+      try {
+        await api(`/api/planning/bom-line-alternates?${query}`, { method: "DELETE" });
+        toast("SOB change removed");
+        await showHistory();
+        renderPage();
+      } catch (error) { toast(error.message, true); }
+    });
+    showHistory(true);
   }
   if (type === "material") {
     const choice = $("#categorySelect");
@@ -1936,6 +1963,7 @@ function openModal(type, record = {}) {
       if (altInputs.length && sameCode) {
         await api("/api/planning/bom-line-alternates", { method: "PUT", body: JSON.stringify({
           model_bom_id: record.root_bom_id || null, component_id: record.root_bom_id ? null : record.component_id,
+          from_month: formEl.querySelector("#lineSobFrom")?.value || "", apply_everywhere: !!formEl.querySelector("#lineSobEverywhere")?.checked,
           alternates: altInputs.map((input) => ({ alternate_item_id: Number(input.dataset.lineAlt), sob_percent: Number(input.value || 0) })),
         }) });
       }

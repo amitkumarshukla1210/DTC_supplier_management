@@ -114,6 +114,37 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Direct line: alternate 0.9, repeats the model code", l1Alt.includes("0.9") && l1Alt.includes("AC-MODEL"), JSON.stringify(l1Alt));
   await page.screenshot({ path: __dirname + "/alternate_codes.png" });
 
+  // dated SOB change (a replacement): NEO 100% from Jan 2099 on every line using AC-CHIP
+  mainRow = await openMotor();
+  await mainRow.locator("td").nth(3).click();
+  await page.waitForSelector("#lineSobHistory table");
+  check("History lists the start SOB (80% / main 20%)", (await page.locator("#lineSobHistory tbody tr").count()) === 1 && (await page.locator("#lineSobHistory tbody tr").textContent()).includes("80%"), await page.locator("#lineSobHistory").textContent());
+  check("From month defaults to this month once a line has history", (await page.inputValue("#lineSobFrom")) === await page.evaluate(() => monthNow()));
+  await page.fill("#lineSobFrom", "2099-01");
+  await page.fill(`#modalForm [data-line-alt="${neo}"]`, "100");
+  await page.check("#lineSobEverywhere");
+  await page.click("#modalForm .modal-footer button");
+  await page.waitForFunction(() => document.querySelector("#modalLayer").hidden);
+  mainRow = await openMotor();
+  const motorMain = await mainRow.textContent();
+  const motorAlt = await page.locator("#masterTable tr.tree-alternate").first().textContent();
+  check("Motor line keeps this month's SOB and shows the dated change", motorMain.includes("main 20% of 2 → 0% from Jan 2099") && motorAlt.includes("alternate 80% → 100% from Jan 2099") && (await mainRow.locator("td").allTextContents()).includes("0.4"), motorMain + " | " + motorAlt);
+  await page.click('[data-bom-tab="Model BOM Level 1"]');
+  await page.waitForSelector("#masterTable tr.tree-alternate");
+  check("Apply-everywhere also dated the direct L1 line", (await l1Main().textContent()).includes("main 70% of 3 → 0% from Jan 2099"), await l1Main().textContent());
+  // history shows both changes; remove the Jan 2099 change on the Motor line
+  mainRow = await openMotor();
+  await mainRow.locator("td").nth(3).click();
+  await page.waitForFunction(() => document.querySelectorAll("#lineSobHistory tbody tr").length === 2);
+  check("History shows Start and Jan 2099", (await page.locator("#lineSobHistory tbody tr").nth(1).textContent()).includes("Jan 2099"));
+  await page.locator("#modalBody .line-alternates").screenshot({ path: __dirname + "/sob_history.png" });
+  await page.click('#lineSobHistory [data-sob-change-delete="2099-01"]');
+  await page.waitForFunction(() => document.querySelectorAll("#lineSobHistory tbody tr").length === 1);
+  check("Remove a change from the history", true);
+  await page.evaluate(() => { document.querySelector("#modalLayer").hidden = true; });
+  mainRow = await openMotor();
+  check("Motor line no longer shows the removed change", !(await mainRow.textContent()).includes("2099"));
+
   // delete the pair: tree back to the main code alone
   await page.click('[data-bom-tab="Alternate codes"]');
   await page.waitForSelector("[data-alt-delete]");

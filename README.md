@@ -52,6 +52,10 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 - **BOM price of the line:** main share × main price + each alternate's SOB × its own price.
 - **Planning:** Shortage & excess and the PO plan split each line's demand by that line's SOB.
 
+**SOB changes by month (history):** in the line's edit window, set **SOB valid from month** (empty = all months) and, if wanted, tick **every BOM line using this code** to make the same change everywhere (all models, L1 direct and part BOMs). Every change is kept: earlier months are planned on the SOB valid then, later months on the new one. The edit window lists the line's history (Start, Nov 2026, …) and a change can be removed. A **code replacement** is an SOB change: add the new code in Alternate codes, then give it 100% from the month (main code 0%). The BOM tree shows this month's SOB and the next change ("main 40% → 0% from Jan 2027").
+
+**Shortage & excess** gets an **SOB change** column (also in the Excel report): from the month of the latest SOB change that moved a code's demand, it shows that month and the demand change against the SOB before it (e.g. "from Nov 2026, −100 PCS" on the main code, "+100 PCS" on the alternate), so you see which code goes into shortage and which into excess because of the change.
+
 Rules: both codes are in T1 Material Master, are bought parts and use the same unit; an alternate belongs to one main code and has no alternates of its own; a line's alternates add up to at most 100%. Deleting a pair or a BOM line removes its SOB. A code in Alternate codes cannot be deleted from T1 Material Master.
 
 ## Supplier materials and supplier BOM (cost breakdown)

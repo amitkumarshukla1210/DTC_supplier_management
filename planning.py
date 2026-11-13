@@ -43,6 +43,7 @@ REPORT_HEADERS = [
     "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Incoming PO",
     "Projected balance", "Coverage days", "Buffer target", "Shortage", "Recommended PO",
     "Excess", "Unit cost", "Shortage value", "Excess value", "Lead time days", "Criticality", "Plan revision",
+    "SOB change from", "Demand change from SOB change",
 ]
 
 
@@ -340,7 +341,9 @@ class AlternateCode(Base):
 class BOMLineAlternate(Base):
     """Alternate code SOB on one BOM line: a Model BOM Level 1 line (model_bom_id) or a
     Level 2 / Level 3 part BOM line (component_id). The main code keeps 100 - sum of these.
-    main_item_id is the line's code when the SOB was saved; it applies only while it still matches."""
+    main_item_id is the line's code when the SOB was saved; it applies only while it still matches.
+    from_month: the SOB applies from this month ("YYYY-MM") until the next change; "" = from the
+    start. Every change is kept, so older months are planned on the SOB valid then (history)."""
     __tablename__ = "bom_line_alternates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -349,6 +352,7 @@ class BOMLineAlternate(Base):
     main_item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
     alternate_item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
     sob_percent: Mapped[float] = mapped_column(Float)
+    from_month: Mapped[str] = mapped_column(String(7), default="")
 
 
 class MaterialTransfer(Base):
@@ -461,6 +465,8 @@ class LineAlternatesInput(BaseModel):
     model_bom_id: int | None = None
     component_id: int | None = None
     alternates: list[LineAlternateSOB] = []
+    from_month: str = ""  # "" = from the start (all months)
+    apply_everywhere: bool = False  # same change on every BOM line using this main code
 
 
 class SupplierBOMLineUpdate(BaseModel):
@@ -787,23 +793,48 @@ def _item_map(db: Session) -> tuple[dict[int, Item], dict[int, list[tuple[int, f
     return items, children
 
 
-def _line_alternate_splits(db: Session) -> tuple[dict[int, list[tuple[int, float]]], dict[int, list[tuple[int, float]]]]:
-    """Alternate SOB per BOM line: (by Model BOM Level 1 line id, by part BOM line id) ->
-    [(alternate item id, SOB %)]. Only SOB > 0, only for current main / alternate pairs and
-    only while the line still uses the main code the SOB was saved for."""
+def _sob_at(entries: Iterable[tuple[str, int, float]], month: str) -> dict[int, float]:
+    """Alternate SOB valid in a month from a line's history [(from_month, alternate id, SOB)]:
+    for each alternate the latest change on or before the month ("" = from the start)."""
+    latest: dict[int, tuple[str, float]] = {}
+    for from_month, alternate_id, sob in entries:
+        if from_month <= month and (alternate_id not in latest or from_month >= latest[alternate_id][0]):
+            latest[alternate_id] = (from_month, sob)
+    return {alternate_id: sob for alternate_id, (_, sob) in latest.items()}
+
+
+def _line_alternate_history(db: Session) -> tuple[dict[int, list[tuple[str, int, float]]], dict[int, list[tuple[str, int, float]]], list[str]]:
+    """Alternate SOB history per BOM line: (by Model BOM Level 1 line id, by part BOM line id)
+    -> [(from_month, alternate item id, SOB %)], and the sorted months in which an SOB changes.
+    Only current main / alternate pairs, and only while the line still uses the main code."""
     pairs = set(db.execute(select(AlternateCode.main_item_id, AlternateCode.alternate_item_id)).all())
     root_items = dict(db.execute(select(ModelBOM.id, ModelBOM.material_id)).all())
     component_items = dict(db.execute(select(BOMComponent.id, BOMComponent.child_item_id)).all())
-    by_root: dict[int, list[tuple[int, float]]] = {}
-    by_component: dict[int, list[tuple[int, float]]] = {}
-    for entry in db.scalars(select(BOMLineAlternate).where(BOMLineAlternate.sob_percent > 0)).all():
+    by_root: dict[int, list[tuple[str, int, float]]] = {}
+    by_component: dict[int, list[tuple[str, int, float]]] = {}
+    months: set[str] = set()
+    for entry in db.scalars(select(BOMLineAlternate)).all():
         if (entry.main_item_id, entry.alternate_item_id) not in pairs:
             continue
+        record = (entry.from_month or "", entry.alternate_item_id, entry.sob_percent)
         if entry.model_bom_id is not None and root_items.get(entry.model_bom_id) == entry.main_item_id:
-            by_root.setdefault(entry.model_bom_id, []).append((entry.alternate_item_id, entry.sob_percent))
+            by_root.setdefault(entry.model_bom_id, []).append(record)
         elif entry.component_id is not None and component_items.get(entry.component_id) == entry.main_item_id:
-            by_component.setdefault(entry.component_id, []).append((entry.alternate_item_id, entry.sob_percent))
-    return by_root, by_component
+            by_component.setdefault(entry.component_id, []).append(record)
+        else:
+            continue
+        if record[0]:
+            months.add(record[0])
+    return by_root, by_component, sorted(months)
+
+
+def _splits_at(history: dict[int, list[tuple[str, int, float]]], month: str) -> dict[int, list[tuple[int, float]]]:
+    result: dict[int, list[tuple[int, float]]] = {}
+    for line_id, entries in history.items():
+        used = [(alternate_id, sob) for alternate_id, sob in _sob_at(entries, month).items() if sob > 0]
+        if used:
+            result[line_id] = used
+    return result
 
 
 def _rollup_model_bom(
@@ -853,12 +884,36 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
     if cycle_ids:
         for row in db.scalars(select(PlanLine).where(PlanLine.cycle_id.in_(cycle_ids))).all():
             plan_by_cycle_month.setdefault((row.cycle_id, row.target_month), {})[row.model_id] = row.quantity
-    # Alternate codes take their SOB share of each BOM line's demand (SOB set per line).
-    root_splits, component_splits = _line_alternate_splits(db)
-    material_usage_by_model = {
-        model_id: _rollup_model_bom(roots_by_model.get(model_id, []), children, root_splits, component_splits)
-        for model_id in models
+    # Alternate codes take their SOB share of each BOM line's demand. The SOB can change from a
+    # month (history), so the usage per model is worked out for each SOB period.
+    root_history, component_history, change_months = _line_alternate_history(db)
+    periods = [""] + change_months  # period key = month its SOB starts ("" = from the start)
+    usage_by_period = {
+        key: {
+            model_id: _rollup_model_bom(roots_by_model.get(model_id, []), children,
+                                        _splits_at(root_history, key or "0000-00"), _splits_at(component_history, key or "0000-00"))
+            for model_id in models
+        }
+        for key in periods
     }
+
+    def period_of(month_text: str) -> str:
+        return max((key for key in periods if key <= month_text), default="")
+
+    # SOB changes that moved a material's usage: material -> [change months]
+    material_changes: dict[int, list[str]] = {}
+    for previous, key in zip(periods, periods[1:]):
+        for model_id in models:
+            before, after = usage_by_period[previous][model_id], usage_by_period[key][model_id]
+            for material_id in set(before) | set(after):
+                if abs(before.get(material_id, 0) - after.get(material_id, 0)) > 1e-12 and key not in material_changes.get(material_id, []):
+                    material_changes.setdefault(material_id, []).append(key)
+    material_usage_by_model: dict[int, dict[int, float]] = {}
+    for usage in usage_by_period.values():
+        for model_id, rolled in usage.items():
+            merged = material_usage_by_model.setdefault(model_id, {})
+            for material_id in rolled:
+                merged.setdefault(material_id, 0)
     actuals = db.scalars(select(ActualProduction).where(
         ActualProduction.workspace == workspace,
         ActualProduction.period >= start_month,
@@ -927,10 +982,23 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
         plan_demand_by_material: dict[int, float] = {}
         actual_demand_by_material: dict[int, float] = {}
         actual_models_by_material: dict[int, set[int]] = {}
+        month_usage = usage_by_period[period_of(month)]
+        # demand change caused by the latest SOB change (on or before this month) that moved each material
+        sob_change_by_material: dict[int, tuple[str, float]] = {}
+        for material_id, changes in material_changes.items():
+            done = [key for key in changes if key <= month]
+            if done:
+                previous = periods[periods.index(done[-1]) - 1]
+                delta = sum(
+                    (plan_by_cycle_month.get((cycle.id, month), {}).get(model_id, 0) if cycle else 0)
+                    * (month_usage[model_id].get(material_id, 0) - usage_by_period[previous][model_id].get(material_id, 0))
+                    for model_id in models
+                )
+                sob_change_by_material[material_id] = (done[-1], delta)
         for model_id, model in models.items():
             planned_qty = plan_by_cycle_month.get((cycle.id, month), {}).get(model_id, 0) if cycle else 0
             actual = actual_by_key.get((month, model_id))
-            rolled = material_usage_by_model.get(model_id, {})
+            rolled = month_usage.get(model_id, {})
             for material_id, unit_qty in rolled.items():
                 plan_demand_by_material[material_id] = plan_demand_by_material.get(material_id, 0) + planned_qty * unit_qty
                 if actual:
@@ -938,6 +1006,7 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
                     actual_models_by_material.setdefault(material_id, set()).add(model_id)
         for material_id in set(plan_demand_by_material) | set(actual_demand_by_material):
             plan_demand = plan_demand_by_material.get(material_id, 0)
+            sob_change_month, sob_change_delta = sob_change_by_material.get(material_id, ("", 0.0))
             expected_actual_models = material_models.get(material_id, set())
             actual_demand = (
                 actual_demand_by_material.get(material_id, 0)
@@ -1023,6 +1092,8 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
                             "lead_time_days": link.lead_time_days,
                             "criticality": _criticality(link.lead_time_days),
                             "plan_revision": f"Rev.{cycle.revision:02d}" if cycle else "No plan",
+                            "sob_change_from": sob_change_month,
+                            "sob_demand_change": sob_change_delta * link.sob_percent / 100,
                         })
                     projected[link.id] = max(0, supplier_balance)
                 if shares < 100 and material:
@@ -1051,6 +1122,8 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
                         "currency": material.currency, "shortage_value": unassigned_shortage * material.unit_cost,
                         "excess_value": 0, "lead_time_days": 0, "criticality": "Very Low",
                         "plan_revision": f"Rev.{cycle.revision:02d}" if cycle else "No plan",
+                        "sob_change_from": sob_change_month,
+                        "sob_demand_change": sob_change_delta * unassigned_share / 100,
                     })
             own_stock_current[material_id] = max(0, own_stock_opening.get(material_id, 0) - own_stock_used)
         period = _plus_months(period, 1)
@@ -1103,6 +1176,7 @@ def _report_workbook(rows: list[dict], title: str) -> io.BytesIO:
         row.get("coverage_days"), row.get("buffer_target"), row.get("shortage_qty"), row.get("recommended_po_qty"),
         row.get("excess_qty"), row.get("unit_price"), row.get("shortage_value"), row.get("excess_value"),
         row.get("lead_time_days"), row.get("criticality"), row.get("plan_revision"),
+        row.get("sob_change_from") or "", row.get("sob_demand_change") or 0,
     ] for row in rows))
 
 
@@ -1323,6 +1397,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                    ("lead_time_days", "INTEGER NOT NULL DEFAULT 0"), ("buffer_days", "INTEGER NOT NULL DEFAULT 0")):
             if column not in present:
                 db.execute(sa_text(f"ALTER TABLE supplier_materials ADD COLUMN {column} {definition}"))
+        # bom_line_alternates gained from_month (SOB history); earlier SOB applies from the start
+        if "from_month" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("bom_line_alternates")}:
+            db.execute(sa_text("ALTER TABLE bom_line_alternates ADD COLUMN from_month VARCHAR(7) NOT NULL DEFAULT ''"))
         db.commit()
 
     @app.middleware("http")
@@ -1983,37 +2060,50 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         price.blend = blend
         return price
 
-    def line_sobs(db: Session, model_bom_ids: Iterable[int] = (), component_ids: Iterable[int] = (), everything: bool = False) -> dict[tuple[str, int], dict[tuple[int, int], float]]:
-        """Saved alternate SOB per BOM line: ('root', id) / ('component', id) -> {(main id, alternate id): SOB}."""
+    def line_sobs(db: Session, model_bom_ids: Iterable[int] = (), component_ids: Iterable[int] = (), everything: bool = False) -> dict[tuple[str, int], list[tuple[str, int, int, float]]]:
+        """Saved alternate SOB history per BOM line: ('root', id) / ('component', id) ->
+        [(from_month, main id, alternate id, SOB)]."""
         model_bom_ids, component_ids = list(model_bom_ids), list(component_ids)
         conditions = [BOMLineAlternate.id.is_not(None)] if everything else []
         if model_bom_ids:
             conditions.append(BOMLineAlternate.model_bom_id.in_(model_bom_ids))
         if component_ids:
             conditions.append(BOMLineAlternate.component_id.in_(component_ids))
-        result: dict[tuple[str, int], dict[tuple[int, int], float]] = {}
+        result: dict[tuple[str, int], list[tuple[str, int, int, float]]] = {}
         if not conditions:
             return result
         for entry in db.scalars(select(BOMLineAlternate).where(or_(*conditions))).all():
             key = ("root", entry.model_bom_id) if entry.model_bom_id is not None else ("component", entry.component_id)
-            result.setdefault(key, {})[(entry.main_item_id, entry.alternate_item_id)] = entry.sob_percent
+            result.setdefault(key, []).append((entry.from_month or "", entry.main_item_id, entry.alternate_item_id, entry.sob_percent))
         return result
 
-    def line_alternates(price, item: Item, saved: dict[tuple[int, int], float], quantity: float) -> tuple[list[dict], float]:
-        """The code's alternates with this line's SOB (0% until set) and share of the quantity."""
+    def line_alternates(price, item: Item, history: list[tuple[str, int, int, float]], quantity: float, month: str) -> tuple[list[dict], float, dict | None]:
+        """The code's alternates with this line's SOB valid in the month (0% until set), their share
+        of the quantity, and the next SOB change after the month (if any)."""
         listed = price.alternates(item.id)
+        allowed = {alternate["material_id"] for alternate in listed}
+        entries = [(from_month, alternate_id, sob) for from_month, main_id, alternate_id, sob in history
+                   if main_id == item.id and alternate_id in allowed]
+        now = _sob_at(entries, month)
+        later = sorted({from_month for from_month, _, _ in entries if from_month > month})
+        upcoming = _sob_at(entries, later[0]) if later else None
         for alternate in listed:
-            alternate["sob_percent"] = saved.get((item.id, alternate["material_id"]), 0.0)
+            alternate["sob_percent"] = now.get(alternate["material_id"], 0.0)
             alternate["quantity"] = quantity * alternate["sob_percent"] / 100
-        return listed, 100 - sum(alternate["sob_percent"] for alternate in listed)
+            if upcoming is not None:
+                alternate["next_sob_percent"] = upcoming.get(alternate["material_id"], 0.0)
+        next_change = ({"from_month": later[0], "main_sob_percent": 100 - sum(upcoming.get(a["material_id"], 0.0) for a in listed)}
+                       if upcoming is not None else None)
+        return listed, 100 - sum(alternate["sob_percent"] for alternate in listed), next_change
 
-    def add_alternates(db: Session, rows: list[dict], can_price: bool) -> None:
+    def add_alternates(db: Session, rows: list[dict], can_price: bool, month: str | None = None) -> None:
         """Each BOM row whose code has alternate codes gets 'alternates' (code, name, this line's
-        SOB %, its share of the line quantity, own price), 'main_sob_percent', 'main_quantity'
-        and, with price access, the line price blended by SOB."""
+        SOB % this month, its share of the line quantity, own price, next SOB), 'main_sob_percent',
+        'main_quantity', 'sob_next_change' and, with price access, the line price blended by SOB."""
         groups = alternate_groups(db, {row["material_id"] for row in rows})
         if not groups:
             return
+        month = month or _month_text(date.today())
         price = bom_price_lookup(db, groups)
         main_rows = [row for row in rows if row["material_id"] in groups]
         saved = line_sobs(db, [row["root_bom_id"] for row in main_rows if row.get("root_bom_id")],
@@ -2024,8 +2114,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if not item:
                 continue
             key = ("root", row["root_bom_id"]) if row.get("root_bom_id") else ("component", row.get("component_id"))
-            listed, main_share = line_alternates(price, item, saved.get(key, {}), row["quantity"])
+            listed, main_share, next_change = line_alternates(price, item, saved.get(key, []), row["quantity"], month)
             row["main_sob_percent"] = main_share
+            row["sob_month"] = month
+            row["sob_next_change"] = next_change
             # The main code's own share of the BOM quantity (main + alternates = BOM quantity)
             row["main_quantity"] = row["quantity"] * main_share / 100
             if can_price:
@@ -2718,19 +2810,50 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             rows.append(row)
         return rows
 
+    def bom_line(db: Session, model_bom_id: int | None, component_id: int | None):
+        if (model_bom_id is None) == (component_id is None):
+            raise HTTPException(status_code=422, detail="Give either model_bom_id or component_id")
+        line = db.get(ModelBOM, model_bom_id) if model_bom_id is not None else db.get(BOMComponent, component_id)
+        if not line:
+            raise HTTPException(status_code=404, detail="BOM line not found")
+        main = db.get(Item, line.material_id if model_bom_id is not None else line.child_item_id)
+        return line, main
+
+    def line_history_rows(db: Session, model_bom_id: int | None, component_id: int | None, main: Item) -> list[dict]:
+        """SOB history of one line, one entry per change month (oldest first)."""
+        allowed = [a.alternate_item_id for a in alternate_groups(db, [main.id]).get(main.id, [])]
+        column = BOMLineAlternate.model_bom_id if model_bom_id is not None else BOMLineAlternate.component_id
+        entries = [(e.from_month or "", e.alternate_item_id, e.sob_percent) for e in db.scalars(
+            select(BOMLineAlternate).where(column == (model_bom_id if model_bom_id is not None else component_id),
+                                           BOMLineAlternate.main_item_id == main.id)).all() if e.alternate_item_id in allowed]
+        rows = []
+        for from_month in sorted({entry[0] for entry in entries}):
+            state = _sob_at(entries, from_month)
+            values = {alternate_id: state.get(alternate_id, 0.0) for alternate_id in allowed}
+            rows.append({"from_month": from_month, "alternates": [{"alternate_item_id": k, "sob_percent": v} for k, v in values.items()],
+                         "main_sob_percent": 100 - sum(values.values())})
+        return rows
+
+    @app.get("/api/planning/bom-line-alternates")
+    def get_line_alternates(request: Request, model_bom_id: int | None = None, component_id: int | None = None):
+        """Alternate SOB history of one BOM line: what changed and from which month."""
+        current_user(request)
+        with open_db() as db:
+            _, main = bom_line(db, model_bom_id, component_id)
+            return {"main_code": main.code, "history": line_history_rows(db, model_bom_id, component_id, main)}
+
     @app.put("/api/planning/bom-line-alternates")
     def save_line_alternates(payload: LineAlternatesInput, request: Request):
-        """Alternate code SOB on one BOM line (Model BOM Level 1 line or Level 2 / 3 part BOM
-        line). Codes not listed go to 0%; the main code keeps 100 - sum."""
+        """Alternate code SOB on a BOM line from a month ("" = from the start), kept as history.
+        Codes not listed get 0% from that month; the main code keeps 100 - sum. With
+        apply_everywhere the same change goes on every BOM line using the main code."""
         current_user(request)
         _check_supply_role(request)
-        if (payload.model_bom_id is None) == (payload.component_id is None):
-            raise HTTPException(status_code=422, detail="Give either model_bom_id or component_id")
+        from_month = payload.from_month.strip()
+        if from_month:
+            from_month = _month_text(_month(from_month))
         with open_db() as db:
-            line = db.get(ModelBOM, payload.model_bom_id) if payload.model_bom_id is not None else db.get(BOMComponent, payload.component_id)
-            if not line:
-                raise HTTPException(status_code=404, detail="BOM line not found")
-            main = db.get(Item, line.material_id if payload.model_bom_id is not None else line.child_item_id)
+            _, main = bom_line(db, payload.model_bom_id, payload.component_id)
             allowed = {a.alternate_item_id for a in alternate_groups(db, [main.id]).get(main.id, [])}
             seen: set[int] = set()
             for entry in payload.alternates:
@@ -2743,15 +2866,37 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             total = sum(entry.sob_percent for entry in payload.alternates)
             if total > 100 + 1e-9:
                 raise HTTPException(status_code=422, detail=f"Alternate SOB on this line adds up to {total:g}%; the total cannot be more than 100%")
-            column = BOMLineAlternate.model_bom_id if payload.model_bom_id is not None else BOMLineAlternate.component_id
-            db.execute(delete(BOMLineAlternate).where(column == (payload.model_bom_id if payload.model_bom_id is not None else payload.component_id)))
-            for entry in payload.alternates:
-                if entry.sob_percent > 0:
-                    db.add(BOMLineAlternate(model_bom_id=payload.model_bom_id, component_id=payload.component_id, main_item_id=main.id,
-                                            alternate_item_id=entry.alternate_item_id, sob_percent=entry.sob_percent))
+            values = {alternate_id: 0.0 for alternate_id in allowed}
+            values.update({entry.alternate_item_id: entry.sob_percent for entry in payload.alternates})
+            if payload.apply_everywhere:
+                lines = [("root", line_id) for line_id in db.scalars(select(ModelBOM.id).where(ModelBOM.material_id == main.id)).all()]
+                lines += [("component", line_id) for line_id in db.scalars(select(BOMComponent.id).where(BOMComponent.child_item_id == main.id)).all()]
+            else:
+                lines = [("root", payload.model_bom_id) if payload.model_bom_id is not None else ("component", payload.component_id)]
+            for kind, line_id in lines:
+                column = BOMLineAlternate.model_bom_id if kind == "root" else BOMLineAlternate.component_id
+                db.execute(delete(BOMLineAlternate).where(column == line_id, BOMLineAlternate.from_month == from_month))
+                for alternate_id, sob in values.items():
+                    db.add(BOMLineAlternate(model_bom_id=line_id if kind == "root" else None, component_id=line_id if kind == "component" else None,
+                                            main_item_id=main.id, alternate_item_id=alternate_id, sob_percent=sob, from_month=from_month))
             db.commit()
-            return {"main_code": main.code, "main_sob_percent": 100 - total,
-                    "alternates": [{"alternate_item_id": e.alternate_item_id, "sob_percent": e.sob_percent} for e in payload.alternates]}
+            return {"main_code": main.code, "main_sob_percent": 100 - total, "from_month": from_month, "lines": len(lines),
+                    "history": line_history_rows(db, payload.model_bom_id, payload.component_id, main)}
+
+    @app.delete("/api/planning/bom-line-alternates", status_code=204)
+    def delete_line_alternate_change(request: Request, from_month: str, model_bom_id: int | None = None, component_id: int | None = None):
+        """Remove one SOB change (one from-month) from a BOM line's history."""
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            bom_line(db, model_bom_id, component_id)
+            column = BOMLineAlternate.model_bom_id if model_bom_id is not None else BOMLineAlternate.component_id
+            removed = db.execute(delete(BOMLineAlternate).where(column == (model_bom_id if model_bom_id is not None else component_id),
+                                                                 BOMLineAlternate.from_month == from_month)).rowcount
+            if not removed:
+                raise HTTPException(status_code=404, detail="No SOB change from this month on this line")
+            db.commit()
+            return Response(status_code=204)
 
     @app.get("/api/planning/alternate-codes")
     def list_alternate_codes(request: Request, search: str = "", offset: int = 0, limit: int = 500):
@@ -4037,14 +4182,16 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 children.setdefault(link.parent_item_id, []).append(link)
 
             saved_sobs = line_sobs(db, everything=True)
+            this_month = _month_text(date.today())
 
             def emit(depth: int, level: str, path: dict, has_children: bool, quantity=None, item: Item | None = None, line: tuple | None = None) -> None:
-                alternates, main_share = (line_alternates(price, item, saved_sobs.get(line, {}), quantity)
-                                          if item is not None and quantity is not None and price.alternates(item.id) else ([], 100))
+                alternates, main_share, next_change = (line_alternates(price, item, saved_sobs.get(line, []), quantity, this_month)
+                                                       if item is not None and quantity is not None and price.alternates(item.id) else ([], 100, None))
+                later = f", {next_change['main_sob_percent']:g}% from {next_change['from_month']}" if next_change else ""
                 if alternates:
                     line_prices[len(tree)] = price.blend(item, prices[item.id], alternates)
                     # Main code row: its own SOB share of the BOM quantity
-                    path = {**path, level: (path[level][0], f"{path[level][1]} (main {main_share:g}% of {quantity:g})")}
+                    path = {**path, level: (path[level][0], f"{path[level][1]} (main {main_share:g}% of {quantity:g}{later})")}
                     tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity * main_share / 100, "item": item})
                 else:
                     tree.append({"depth": depth, "level": level, "path": path, "has_children": has_children, "quantity": quantity, "item": item})
@@ -4052,7 +4199,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 if alternates:
                     for alternate in alternates:
                         tree.append({"depth": depth, "level": level, "has_children": False, "item": items.get(alternate["material_id"]),
-                                     "path": {**path, level: (alternate["code"], f"{alternate['name']} (alternate of {item.code}, SOB {alternate['sob_percent']:g}%)")},
+                                     "path": {**path, level: (alternate["code"], f"{alternate['name']} (alternate of {item.code}, SOB {alternate['sob_percent']:g}%"
+                                                                     + (f", {alternate['next_sob_percent']:g}% from {next_change['from_month']}" if next_change else "") + ")")},
                                      "quantity": quantity * alternate["sob_percent"] / 100, "alternate": alternate})
 
             def part_lines(parent_id: int, level: str, depth: int, path: dict) -> None:

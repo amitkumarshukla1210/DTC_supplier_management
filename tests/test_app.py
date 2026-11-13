@@ -1459,6 +1459,87 @@ class SupplierHubApiTests(unittest.TestCase):
         template = load_workbook(io.BytesIO(self.client.get("/api/planning/templates/alternate-codes.xlsx").content)).active
         self.assertEqual([c.value for c in template[1]], ["main_code", "alternate_code"])
 
+    def test_alternate_sob_changes_by_month_with_history_and_report_impact(self):
+        # Hand-worked, per model: direct L1 CHIP 3, Motor BOM CHIP 2; plan 100 models a month.
+        #   Motor line SOB NEO: 30% from the start, 80% from 2026-11 (this line only).
+        #   From 2027-01 NEO replaces CHIP everywhere (100%, applied to every line).
+        #   Oct-26: CHIP 3 + 1.4 = 4.4 -> 440, NEO 0.6 -> 60
+        #   Nov-26 / Dec-26: CHIP 3 + 0.4 -> 340, NEO 160; change vs before Nov: CHIP -100, NEO +100
+        #   Jan-27: CHIP 0, NEO 500; change vs Nov SOB: CHIP -340, NEO +340
+        def material(code, name, cost=0):
+            return self.client.post("/api/planning/materials", json={"code": code, "name": name, "uom": "PCS", "unit_cost": cost, "currency": "INR"}).json()["id"]
+        chip, neo, motor = material("SH-CHIP", "MicroChip", 500), material("SH-NEO", "MicroChipNeo"), material("SH-MOTOR", "Motor")
+        model = self.client.post("/api/planning/models", json={"code": "SH-MODEL", "name": "History model"}).json()["id"]
+        self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": motor, "quantity": 1, "uom": "PCS"}).status_code, 201)
+        direct = self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": chip, "quantity": 3, "uom": "PCS"}).json()["id"]
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{motor}/new", json={"tab": "Level 2 Part BOM", "lines": [{"child_item_id": chip, "quantity": 2}]}).status_code, 201)
+        component = self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]["component_id"]
+        sup_a = self.client.post("/api/suppliers", json={"name": "SH Maker A", "category": "Electrical", "country": "India"}).json()["id"]
+        sup_b = self.client.post("/api/suppliers", json={"name": "SH Maker B", "category": "Electrical", "country": "India"}).json()["id"]
+        for material_id, supplier, price in ((chip, sup_a, 480), (neo, sup_b, 520)):
+            self.assertEqual(self.client.post("/api/planning/supplier-parts", json={"material_id": material_id, "supplier_id": supplier, "sob_percent": 100, "unit_price": price, "currency": "INR"}).status_code, 201)
+        self.assertEqual(self.client.post("/api/planning/alternate-codes", json={"main_item_id": chip, "alternate_item_id": neo}).status_code, 201)
+
+        def save(sob, from_month="", model_bom_id=None, component_id=None, everywhere=False):
+            return self.client.put("/api/planning/bom-line-alternates", json={
+                "model_bom_id": model_bom_id, "component_id": component_id, "from_month": from_month, "apply_everywhere": everywhere,
+                "alternates": [{"alternate_item_id": neo, "sob_percent": sob}]})
+        self.assertEqual(save(30, component_id=component).status_code, 200)
+        self.assertEqual(save(80, "2026-11", component_id=component).status_code, 200)
+        self.assertEqual(save(50, "2026-13", component_id=component).status_code, 422)
+        replaced = save(100, "Jan-2027", model_bom_id=direct, everywhere=True)
+        self.assertEqual(replaced.status_code, 200, replaced.text)
+        self.assertEqual((replaced.json()["from_month"], replaced.json()["lines"]), ("2027-01", 2))
+
+        # history of the Motor line: what changed and from when
+        history = self.client.get("/api/planning/bom-line-alternates", params={"component_id": component}).json()["history"]
+        self.assertEqual([(h["from_month"], h["alternates"][0]["sob_percent"], h["main_sob_percent"]) for h in history],
+                         [("", 30, 70), ("2026-11", 80, 20), ("2027-01", 100, 0)])
+        direct_history = self.client.get("/api/planning/bom-line-alternates", params={"model_bom_id": direct}).json()["history"]
+        self.assertEqual([(h["from_month"], h["main_sob_percent"]) for h in direct_history], [("2027-01", 0)])
+
+        plan_rows = [{"model_code": "SH-MODEL", "target_month": m, "quantity": 100} for m in ("2026-10", "2026-11", "2026-12", "2027-01")]
+        self.assertEqual(self.client.post("/api/planning/plans", json={"issue_month": "2026-10", "workspace": "trial", "rows": plan_rows}).status_code, 201)
+
+        def report():
+            items = self.client.get("/api/planning/report", params={"workspace": "trial", "start_month": "2026-10", "end_month": "2027-01"}).json()["items"]
+            return {(r["month"], r["material_code"]): (round(r["plan_demand"], 6), r["sob_change_from"], round(r["sob_demand_change"], 6))
+                    for r in items if r["material_code"] in ("SH-CHIP", "SH-NEO")}
+        self.assertEqual(report(), {
+            ("2026-10", "SH-CHIP"): (440, "", 0), ("2026-10", "SH-NEO"): (60, "", 0),
+            ("2026-11", "SH-CHIP"): (340, "2026-11", -100), ("2026-11", "SH-NEO"): (160, "2026-11", 100),
+            ("2026-12", "SH-CHIP"): (340, "2026-11", -100), ("2026-12", "SH-NEO"): (160, "2026-11", 100),
+            ("2027-01", "SH-CHIP"): (0, "2027-01", -340), ("2027-01", "SH-NEO"): (500, "2027-01", 340),
+        })
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/report.xlsx", params={"workspace": "trial", "start_month": "2026-10", "end_month": "2027-01"}).content)).active
+        header_row = next(r for r in sheet.iter_rows(values_only=True) if r and "Plan revision" in r)
+        self.assertEqual(list(header_row[-2:]), ["SOB change from", "Demand change from SOB change"])
+
+        # BOM rows show the SOB valid this month and the next change
+        today = date.today().strftime("%Y-%m")
+        expected_now = 30 if today < "2026-11" else 80 if today < "2027-01" else 100
+        expected_next = ("2026-11", 20) if today < "2026-11" else ("2027-01", 0) if today < "2027-01" else None
+        row = self.client.get(f"/api/planning/part-bom/{motor}", params={"tab": "Level 2 Part BOM"}).json()["items"][0]
+        self.assertEqual((row["alternates"][0]["sob_percent"], row["main_sob_percent"]), (expected_now, 100 - expected_now))
+        self.assertEqual((row["sob_next_change"]["from_month"], row["sob_next_change"]["main_sob_percent"]) if row["sob_next_change"] else None, expected_next)
+
+        # undo one change: remove the 2027-01 change on the direct line -> Jan-27 CHIP 3 x 100 = 300 again
+        self.assertEqual(self.client.delete("/api/planning/bom-line-alternates", params={"model_bom_id": direct, "from_month": "2027-01"}).status_code, 204)
+        self.assertEqual(self.client.delete("/api/planning/bom-line-alternates", params={"model_bom_id": direct, "from_month": "2027-01"}).status_code, 404)
+        self.assertEqual(report()[("2027-01", "SH-CHIP")][0], 300)
+        # re-saving the same month replaces that change (no duplicate rows)
+        import sqlite3
+        db_file = Path(self.temp_dir.name) / "test.db"
+        count = lambda: sqlite3.connect(db_file).execute("SELECT COUNT(*) FROM bom_line_alternates WHERE component_id = ?", (component,)).fetchone()[0]
+        before = count()
+        self.assertEqual(save(70, "2026-11", component_id=component).status_code, 200)
+        self.assertEqual(count(), before)
+        # removing a middle change leaves the others: Nov-26 back to 30% (start), Jan-27 still 100%
+        self.assertEqual(self.client.delete("/api/planning/bom-line-alternates", params={"component_id": component, "from_month": "2026-11"}).status_code, 204)
+        history = self.client.get("/api/planning/bom-line-alternates", params={"component_id": component}).json()["history"]
+        self.assertEqual([(h["from_month"], h["alternates"][0]["sob_percent"]) for h in history], [("", 30), ("2027-01", 100)])
+        self.assertEqual(report()[("2026-11", "SH-CHIP")][0], 440)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns
@@ -1471,6 +1552,10 @@ class SupplierHubApiTests(unittest.TestCase):
         connection.execute("CREATE TABLE supplier_materials (id INTEGER PRIMARY KEY, supplier_id INTEGER, code VARCHAR(48), name VARCHAR(180), uom VARCHAR(24), unit_price FLOAT, currency VARCHAR(3), UNIQUE (supplier_id, code))")
         supplier_id = connection.execute("SELECT id FROM suppliers LIMIT 1").fetchone()[0]
         connection.execute("INSERT INTO supplier_materials (supplier_id, code, name, uom, unit_price, currency) VALUES (?, 'OLD-1', 'Old solder', 'kg', 900, 'INR')", (supplier_id,))
+        # bom_line_alternates from before SOB history (no from_month): its SOB applies from the start
+        connection.execute("DROP TABLE bom_line_alternates")
+        connection.execute("CREATE TABLE bom_line_alternates (id INTEGER PRIMARY KEY, model_bom_id INTEGER, component_id INTEGER, main_item_id INTEGER, alternate_item_id INTEGER, sob_percent FLOAT)")
+        connection.execute("INSERT INTO bom_line_alternates (model_bom_id, main_item_id, alternate_item_id, sob_percent) VALUES (1, 1, 2, 30)")
         connection.commit()
         connection.close()
         client = TestClient(create_app(f"sqlite:///{db_path}"))
@@ -1478,6 +1563,7 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(client.post("/api/auth/setup", json={"username": "admin", "full_name": "Test Admin", "password": "Secure-test-password-2026!"}).status_code, 201)
         columns = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(supplier_materials)")}
         self.assertTrue({"item_id", "tier_material_id", "lead_time_days", "buffer_days"} <= columns, columns)
+        self.assertEqual(sqlite3.connect(db_path).execute("SELECT from_month, sob_percent FROM bom_line_alternates").fetchall(), [("", 30.0)])
         rows = client.get("/api/planning/supplier-materials", params={"supplier_id": supplier_id}).json()["items"]
         self.assertEqual([(r["code"], r["source"], r["unit_price"], r["lead_time_days"]) for r in rows], [("OLD-1", "Own", 900, 0)])
         client.__exit__(None, None, None)

@@ -484,3 +484,9 @@ tr[data-edit-material] > td:not(:nth-last-child(-n+2)) { cursor: pointer; }
 #pageContent[data-view="master"] tr.tree-alternate > td.tree-inherited { color: #a08a5c; }
 .line-alternates { border: 1px solid #f0d9a8; background: #fffaf0; border-radius: 10px; padding: 10px 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .line-alternates legend { font-weight: 700; color: #7a5a12; padding: 0 6px; }
+.line-alternates .check-row { display: flex; align-items: center; gap: 8px; font-weight: 500; color: #425466; min-height: 44px; }
+.sob-history { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
+.sob-history th, .sob-history td { padding: 6px 8px; border-bottom: 1px solid #efe3c8; text-align: left; }
+.sob-history th { color: #7a5a12; font-weight: 700; }
+small.sob-down { display: block; color: #b42318; }
+small.sob-up { display: block; color: #067647; }
