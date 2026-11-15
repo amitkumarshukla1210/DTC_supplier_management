@@ -1994,6 +1994,8 @@ class SupplierHubApiTests(unittest.TestCase):
         used = {m["code"]: m["used_in"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
         self.assertEqual(used, {"UI-MOTOR": "L1", "UI-STATOR": "L2", "UI-COPPER": "L3", "UI-GASKET": "L1 & L2", "UI-BOLT": "L2 & L3",
                                 "UI-WIRE": "L1 & L3", "UI-STEEL": "L1 & L2 & L3", "UI-SPARE": ""})
+        movable = {m["code"]: m["movable"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
+        self.assertEqual([code for code, ok in movable.items() if ok], ["UI-SPARE"])  # only the code in no BOM can move
         # alternates: IMPORT 20% on STATOR's STEEL line (L3) -> "L3 (alternate)"; NEWIMP 0% -> not used;
         # BOLT is a line at L2 & L3 and 30% alternate of WIRE on the model's L1 line -> "L1 & L2 & L3 (alternate)"
         imp, newimp = material("IMPORT"), material("NEWIMP")
@@ -2008,6 +2010,8 @@ class SupplierHubApiTests(unittest.TestCase):
                                                                              "alternates": [{"alternate_item_id": ids["BOLT"], "sob_percent": 30}]}).status_code, 200)
         used = {m["code"]: m["used_in"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
         self.assertEqual((used["UI-IMPORT"], used["UI-NEWIMP"], used["UI-BOLT"], used["UI-STEEL"]), ("L3 (alternate)", "", "L1 & L2 & L3 (alternate)", "L1 & L2 & L3"))
+        movable = {m["code"]: m["movable"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
+        self.assertEqual((movable["UI-IMPORT"], movable["UI-NEWIMP"], movable["UI-SPARE"]), (False, False, True))  # alternates (even at 0%) stay in T1
         sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/tables/materials/xlsx").content)).active
         header = next(r for r in sheet.iter_rows(values_only=True) if r and r[0] == "Material code")
         self.assertEqual(list(header[:3]), ["Material code", "Material name", "Used in"])

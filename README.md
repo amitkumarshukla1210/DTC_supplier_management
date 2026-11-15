@@ -53,7 +53,7 @@ The **Used in** column (right after Material name, also in the Excel / PDF downl
 ## T1 Material Master: delete and Move to T2/T3
 
 - **Delete** says exactly what still uses a code (e.g. "used in 1 T1 supplier/material relationship, 2 part BOM lines"). Part BOMs not linked to any model also count. Material requests of the retired stock screens (install sample) no longer block a delete.
-- **Move to T2/T3** (per row): a code put in T1 by mistake moves to T2 or T3 Material Master with its name, category, unit and price. Supplier material-master entries and T2/T3 relationships switch to the moved code. Anything that needs a T1 code (your BOM lines, its own part BOM, T1 relationships, supplier BOMs, Alternate codes, own stock, transfers) blocks the move and is listed.
+- **Move to T2/T3** (per row, shown only for codes in no BOM (L1/L2/L3) and not in Alternate codes): a code put in T1 by mistake moves to T2 or T3 Material Master with its name, category, unit and price. Supplier material-master entries and T2/T3 relationships switch to the moved code. Anything that needs a T1 code (your BOM lines, its own part BOM, T1 relationships, supplier BOMs, Alternate codes, own stock, transfers) blocks the move and is listed.
 
 ## Category list
 

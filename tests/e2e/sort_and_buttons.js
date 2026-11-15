@@ -98,6 +98,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const usedRow = page.locator('#materialMasterTable tbody tr:has-text("SB-PART")');
   const unusedRow = page.locator('#materialMasterTable tbody tr:has-text("MAT-101")');
   check("A code in a BOM shows where (SB-PART: L1) and is not red", (await usedRow.locator("td").nth(2).textContent()) === "L1" && !(await usedRow.evaluate((tr) => tr.classList.contains("material-unused"))));
+  check("A code in a BOM has no Move button", (await usedRow.locator("[data-move-material]").count()) === 0 && (await unusedRow.locator("[data-move-material]").count()) === 1);
   check("A code in no BOM shows 'Not used' in red", (await unusedRow.locator("td").nth(2).textContent()) === "Not used" && await unusedRow.evaluate((tr) => tr.classList.contains("material-unused") && getComputedStyle(tr.cells[0]).color === "rgb(180, 35, 24)"));
   // Move a code put in T1 by mistake to T2
   await api("POST", "/api/planning/materials", { code: "SB-ADC12", name: "ADC12", uom: "kg", category: "Raw material" });

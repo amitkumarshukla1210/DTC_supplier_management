@@ -1931,11 +1931,16 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             rows = db.scalars(statement.offset(offset).limit(limit)).all()
             can_price = _check_price_access(request)
             levels = bom_levels(db)
+            page_ids = [item.id for item in rows]
+            in_alternates = set(db.scalars(select(AlternateCode.main_item_id).where(AlternateCode.main_item_id.in_(page_ids))).all()) | \
+                set(db.scalars(select(AlternateCode.alternate_item_id).where(AlternateCode.alternate_item_id.in_(page_ids))).all()) if page_ids else set()
             return {
                 "total": total, "offset": offset, "limit": limit,
                 "items": [{
                     "id": item.id, "code": item.code, "name": item.name, "category": item.category,
                     "used_in": " & ".join(levels.get(item.id, [])),  # "" = not used in any BOM
+                    # Move to T2/T3 is offered only for codes in no BOM (L1/L2/L3) and not in Alternate codes
+                    "movable": not levels.get(item.id) and item.id not in in_alternates,
                     "uom": item.uom, "stock_on_hand": item.stock_on_hand, "reorder_level": item.reorder_level,
                     "buffer_days": getattr(item, "buffer_days", 0),
                     **({"unit_cost": item.unit_cost, "currency": item.currency} if can_price else {}),
