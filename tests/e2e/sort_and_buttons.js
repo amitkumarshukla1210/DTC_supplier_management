@@ -99,6 +99,19 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const unusedRow = page.locator('#materialMasterTable tbody tr:has-text("MAT-101")');
   check("A code in a BOM shows where (SB-PART: L1) and is not red", (await usedRow.locator("td").nth(2).textContent()) === "L1" && !(await usedRow.evaluate((tr) => tr.classList.contains("material-unused"))));
   check("A code in no BOM shows 'Not used' in red", (await unusedRow.locator("td").nth(2).textContent()) === "Not used" && await unusedRow.evaluate((tr) => tr.classList.contains("material-unused") && getComputedStyle(tr.cells[0]).color === "rgb(180, 35, 24)"));
+  // Move a code put in T1 by mistake to T2
+  await api("POST", "/api/planning/materials", { code: "SB-ADC12", name: "ADC12", uom: "kg", category: "Raw material" });
+  await page.fill("#masterSearch", "SB-ADC12");
+  await page.click("[data-execute-master-search]");
+  await page.waitForFunction(() => document.querySelectorAll("#materialMasterTable tbody tr").length === 1);
+  await page.click('#materialMasterTable tbody tr:has-text("SB-ADC12") [data-move-material]');
+  await page.waitForSelector('[data-move-to="T2"]');
+  check("Move opens the T2 / T3 choice (not the Edit form)", await page.locator('[data-move-to="T3"]').isVisible() && (await page.locator("#modalForm").count()) === 0);
+  await page.click('[data-move-to="T2"]');
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("moved to T2"));
+  check("Moved to T2 Material Master", (await api("GET", "/api/planning/tier-materials?tier=T2&search=SB-ADC12")).items.length === 1 && (await api("GET", "/api/planning/materials?search=SB-ADC12")).total === 0);
+  await page.click('[data-bom-tab="Material Master"]');
+  await page.waitForSelector("#materialMasterTable table");
   check("T1 Material Master: Add material above the table", await above('[data-action="new-material"]', "#materialMasterTable table"));
   await page.click('[data-bom-tab="T2 Material Master"]');
   await page.waitForSelector("#tierMaterialTable tbody tr");
@@ -106,9 +119,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("T2 Material Master: Add T2 material above the table", await above('[data-action="new-tier-material"]', "#tierMaterialTable table"));
   await sortBy("#tierMaterialTable", 4, "asc");
   const prices = await columnTexts("#tierMaterialTable", 4);
-  check("Prices sort as numbers (75, 520, 1,800)", JSON.stringify(prices) === JSON.stringify(["75", "520", "1,800"]), JSON.stringify(prices));
+  check("Prices sort as numbers (0, 75, 520, 1,800; SB-ADC12 moved in at 0)", JSON.stringify(prices) === JSON.stringify(["0", "75", "520", "1,800"]), JSON.stringify(prices));
   await sortBy("#tierMaterialTable", 4, "desc");
-  check("Prices Z → A (1,800, 520, 75)", JSON.stringify(await columnTexts("#tierMaterialTable", 4)) === JSON.stringify(["1,800", "520", "75"]));
+  check("Prices Z → A (1,800, 520, 75, 0)", JSON.stringify(await columnTexts("#tierMaterialTable", 4)) === JSON.stringify(["1,800", "520", "75", "0"]));
 
   // tree table: an expanded model's lines stay under it when sorting
   await page.click('[data-bom-tab="Product Master"]');

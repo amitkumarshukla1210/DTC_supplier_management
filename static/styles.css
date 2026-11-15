@@ -535,3 +535,4 @@ th.sorted-desc summary::after { content: " ▼"; font-size: 10px; color: #247ac0
 /* T1 Material Master: a code used in no BOM (Model BOM Level 1, Level 2 / Level 3 Part BOM) */
 #pageContent[data-view="master"] tr.material-unused > td { color: #b42318; background: #fff1f0; }
 #pageContent[data-view="master"] tr.material-unused > td:first-child { box-shadow: inset 3px 0 0 #d92d20; }
+.move-material .move-buttons { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }

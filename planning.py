@@ -24,7 +24,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, delete, func, or_, select
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, delete, func, or_, select, update as sa_update
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 from starlette.responses import JSONResponse
 import xlsxwriter
@@ -2115,6 +2115,41 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 response_data.update(unit_cost=item.unit_cost, currency=item.currency)
             return response_data
 
+    def material_uses(db: Session, material_id: int) -> list[tuple[str, int, bool]]:
+        """What uses a T1 code: (description, count, can follow the code to T2/T3)."""
+        def count(model, *conditions) -> int:
+            return db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0
+        from sqlalchemy import text as sa_text
+        sources = db.execute(sa_text("SELECT COUNT(*) FROM supplier_bom_line_sources WHERE item_id = :id"), {"id": material_id}).scalar() or 0
+        uses = [
+            ("Model BOM Level 1 line", count(ModelBOM, ModelBOM.material_id == material_id), False),
+            ("part BOM line", count(BOMComponent, BOMComponent.child_item_id == material_id), False),
+            ("line in its own part BOM", count(BOMComponent, BOMComponent.parent_item_id == material_id), False),
+            ("T1 supplier/material relationship", count(SupplierPart, SupplierPart.material_id == material_id, SupplierPart.tier == TOP_TIER), False),
+            ("T2/T3 supplier/material relationship", count(SupplierPart, SupplierPart.material_id == material_id, SupplierPart.tier != TOP_TIER), True),
+            ("supplier material master entry", count(SupplierMaterial, SupplierMaterial.item_id == material_id), True),
+            ("supplier BOM (as the part you buy)", count(SupplierBOMLine, SupplierBOMLine.product_material_id == material_id), False),
+            ("supplier BOM line", count(SupplierBOMLine, SupplierBOMLine.item_id == material_id), False),
+            ("supplier BOM source", sources, False),
+            ("alternate code entry", count(AlternateCode, or_(AlternateCode.main_item_id == material_id, AlternateCode.alternate_item_id == material_id)), False),
+            ("own stock entry", count(OwnStockSnapshot, OwnStockSnapshot.material_id == material_id), False),
+            ("supplier-to-supplier transfer", count(MaterialTransfer, MaterialTransfer.material_id == material_id), False),
+        ]
+        return [(label, number, follows) for label, number, follows in uses if number]
+
+    def describe_uses(uses: list[tuple[str, int, bool]]) -> str:
+        return ", ".join(f"{number} {label}{'s' if number != 1 and not label.endswith('BOM)') else ''}" for label, number, _ in uses)
+
+    def remove_retired_records(db: Session, material_id: int) -> None:
+        """Material requests of the retired stock screens (install sample) are not shown anywhere."""
+        from sqlalchemy import text as sa_text
+        for statement in (
+            "DELETE FROM stock_deliveries WHERE po_id IN (SELECT id FROM stock_purchase_orders WHERE request_id IN (SELECT id FROM material_requests WHERE item_id = :id))",
+            "DELETE FROM stock_purchase_orders WHERE request_id IN (SELECT id FROM material_requests WHERE item_id = :id)",
+            "DELETE FROM material_requests WHERE item_id = :id",
+        ):
+            db.execute(sa_text(statement), {"id": material_id})
+
     @app.delete("/api/planning/materials/{material_id}", status_code=204)
     def delete_material(material_id: int, request: Request):
         current_user(request)
@@ -2124,23 +2159,44 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             item = db.get(Item, material_id)
             if not item:
                 raise HTTPException(status_code=404, detail="Material not found")
-            referenced = (
-                db.scalar(select(ModelBOM.id).where(ModelBOM.material_id == material_id))
-                or db.scalar(select(BOMComponent.id).where(or_(BOMComponent.parent_item_id == material_id, BOMComponent.child_item_id == material_id)))
-                or db.scalar(select(SupplierPart.id).where(SupplierPart.material_id == material_id))
-                or db.scalar(select(OwnStockSnapshot.id).where(OwnStockSnapshot.material_id == material_id))
-                or db.scalar(select(MaterialTransfer.id).where(MaterialTransfer.material_id == material_id))
-                or db.scalar(select(MaterialRequest.id).where(MaterialRequest.item_id == material_id))
-                or db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.item_id == material_id).limit(1))
-                or db.scalar(select(SupplierBOMLine.id).where(or_(SupplierBOMLine.item_id == material_id, SupplierBOMLine.product_material_id == material_id)).limit(1))
-            )
-            if referenced:
-                raise HTTPException(status_code=409, detail="This material is used by a BOM, supplier, supplier material master, stock snapshot or transfer; remove those references first")
-            if db.scalar(select(AlternateCode.id).where(or_(AlternateCode.main_item_id == material_id, AlternateCode.alternate_item_id == material_id)).limit(1)):
-                raise HTTPException(status_code=409, detail="This material is a main or alternate code in Alternate codes; remove it there first")
+            uses = material_uses(db, material_id)
+            if uses:
+                raise HTTPException(status_code=409, detail=f"{item.code} cannot be deleted: it is used in {describe_uses(uses)}. Remove those first, or use Move to T2/T3 if it belongs there")
+            remove_retired_records(db, material_id)
             db.delete(item)
             db.commit()
             return Response(status_code=204)
+
+    @app.post("/api/planning/materials/{material_id}/move")
+    def move_material_to_tier(material_id: int, request: Request, tier: str):
+        """A code put in T1 Material Master by mistake moves to T2 or T3 Material Master (code, name,
+        category, unit, price). Supplier material-master entries and T2/T3 relationships follow it;
+        anything that needs a T1 code (your BOMs, T1 relationships, alternates, stock ...) must be
+        removed first and is listed."""
+        current_user(request)
+        _check_supply_role(request)
+        if tier not in {"T2", "T3"}:
+            raise HTTPException(status_code=422, detail="Move to T2 or T3 Material Master")
+        with open_db() as db:
+            item = db.get(Item, material_id)
+            if not item:
+                raise HTTPException(status_code=404, detail="Material not found")
+            uses = material_uses(db, material_id)
+            blocking = [use for use in uses if not use[2]]
+            if blocking:
+                raise HTTPException(status_code=409, detail=f"{item.code} cannot move to {tier} Material Master: it is used in {describe_uses(blocking)}, which need a T1 code. Remove those first")
+            moved = TierMaterial(tier=tier, code=item.code, name=item.name, category=item.category, uom=item.uom,
+                                 unit_price=item.unit_cost, currency=item.currency)
+            db.add(moved)
+            db.flush()
+            relationships = db.execute(sa_update(SupplierPart).where(SupplierPart.material_id == material_id)
+                                       .values(material_id=None, tier_material_id=moved.id)).rowcount
+            entries = db.execute(sa_update(SupplierMaterial).where(SupplierMaterial.item_id == material_id)
+                                 .values(item_id=None, tier_material_id=moved.id)).rowcount
+            remove_retired_records(db, material_id)
+            db.delete(item)
+            db.commit()
+            return {"code": moved.code, "tier": tier, "relationships": relationships, "supplier_materials": entries}
 
     @app.get("/api/planning/model-bom/{model_id}")
     def get_model_bom(model_id: int, request: Request, tab: str = "Model BOM Level 1", offset: int = 0, limit: int = 250, search: str = ""):

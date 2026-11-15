@@ -50,6 +50,11 @@ Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹
 
 The **Used in** column (right after Material name, also in the Excel / PDF download) shows the BOM levels a code is a line of: **L1** (Model BOM Level 1), **L2** (a Level 2 Part BOM, under an L1 part), **L3** (a Level 3 Part BOM, under an L2 part), or combinations such as **L1 & L2**, **L2 & L3**, **L1 & L3**, **L1 & L2 & L3**. An **alternate code** counts as used at the level of each BOM line where it has an SOB above 0% (in any month) and shows e.g. **L3 (alternate)**. A code used in no BOM (and not an alternate above 0% anywhere) shows **Not used** and its row is red.
 
+## T1 Material Master: delete and Move to T2/T3
+
+- **Delete** says exactly what still uses a code (e.g. "used in 1 T1 supplier/material relationship, 2 part BOM lines"). Part BOMs not linked to any model also count. Material requests of the retired stock screens (install sample) no longer block a delete.
+- **Move to T2/T3** (per row): a code put in T1 by mistake moves to T2 or T3 Material Master with its name, category, unit and price. Supplier material-master entries and T2/T3 relationships switch to the moved code. Anything that needs a T1 code (your BOM lines, its own part BOM, T1 relationships, supplier BOMs, Alternate codes, own stock, transfers) blocks the move and is listed.
+
 ## Category list
 
 **Product Master → Category** holds the one category list used for parts (T1, T2, T3) and suppliers; every category field is a dropdown from it with **+ Add new category**. Add, rename (every part and supplier using it follows) or delete (refused while used). A new category typed in a dropdown or found in an Excel upload is added to the list automatically, written as in the list when only the capitals differ ("steel raw MATERIAL" → "Steel Raw material").

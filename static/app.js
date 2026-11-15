@@ -1103,6 +1103,23 @@ async function loadSobLog(offset = 0) {
   target.innerHTML = `${table(["Changed on", "Changed by", "Action", "Main code", "Level", "Used in", "SOB from month", "SOB split"], rows, search ? "No SOB changes match this search." : "No SOB changes yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}` : "No changes"}</span><div><button class="button button-small" data-sob-log-page="${Math.max(0, offset - 500)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-sob-log-page="${offset + 500}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
 }
 
+// A code put in T1 Material Master by mistake moves to T2 or T3 Material Master
+function openMoveMaterial(item) {
+  if (!item) return;
+  $("#modalTitle").textContent = `Move ${item.code} · ${item.name}`;
+  $("#modalBody").innerHTML = `<div class="move-material"><p>Move this code out of T1 Material Master into:</p><div class="move-buttons"><button class="button button-primary" data-move-to="T2">Move to T2 Material Master</button><button class="button button-primary" data-move-to="T3">Move to T3 Material Master</button></div><p class="subtle">Code, name, category, unit and price move with it. Supplier material-master entries and T2/T3 supplier relationships switch to the moved code. If it is still in your BOMs, a T1 supplier relationship, Alternate codes, own stock or a transfer, the move is refused and the message lists what to remove first.</p></div>`;
+  modalLayer.hidden = false;
+  $("#modalBody").querySelectorAll("[data-move-to]").forEach((button) => button.addEventListener("click", async () => {
+    try {
+      const result = await api(`/api/planning/materials/${item.id}/move?tier=${button.dataset.moveTo}`, { method: "POST" });
+      modalLayer.hidden = true;
+      toast(`${result.code} moved to ${result.tier} Material Master (${result.relationships} relationship${result.relationships === 1 ? "" : "s"}, ${result.supplier_materials} supplier material entr${result.supplier_materials === 1 ? "y" : "ies"} switched)`);
+      await loadCoreData();
+      renderPage();
+    } catch (error) { toast(error.message, true); }
+  }));
+}
+
 // Material Master: 500 a page from the server; search covers all codes
 async function loadMaterialMasterPage(offset = 0) {
   const target = $("#materialMasterTable");
@@ -1113,9 +1130,9 @@ async function loadMaterialMasterPage(offset = 0) {
   state.materialPageItems = result.items;
   const canPrice = state.user.can_view_prices || state.user.role === "Admin";
   // Used in = BOM levels the code is a line of; a code used in no BOM is shown in red
-  const rows = result.items.map((item) => `<tr data-edit-material="${item.id}" tabindex="0" class="${item.used_in ? "" : "material-unused"}" title="${item.used_in ? "" : "Not used in Model BOM Level 1, Level 2 or Level 3 Part BOM"}"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.used_in || "Not used")}</td><td>${esc(item.category)}</td><td>${esc(item.uom)}</td><td>${number(item.stock_on_hand)}</td><td>${number(item.buffer_days, 0)} days</td><td>${canPrice ? money(item.unit_cost, item.currency) : "Restricted"}</td><td><button class="text-button" data-edit-material="${item.id}">Edit</button></td><td><button class="text-button button-danger" data-delete-material="${item.id}">Delete</button></td></tr>`).join("");
+  const rows = result.items.map((item) => `<tr data-edit-material="${item.id}" tabindex="0" class="${item.used_in ? "" : "material-unused"}" title="${item.used_in ? "" : "Not used in Model BOM Level 1, Level 2 or Level 3 Part BOM"}"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.used_in || "Not used")}</td><td>${esc(item.category)}</td><td>${esc(item.uom)}</td><td>${number(item.stock_on_hand)}</td><td>${number(item.buffer_days, 0)} days</td><td>${canPrice ? money(item.unit_cost, item.currency) : "Restricted"}</td><td><button class="text-button" data-edit-material="${item.id}">Edit</button></td><td><button class="text-button" data-move-material="${item.id}">Move to T2/T3</button></td><td><button class="text-button button-danger" data-delete-material="${item.id}">Delete</button></td></tr>`).join("");
   const size = result.limit;
-  target.innerHTML = `${table(["Material code", "Material name", "Used in", "Category", "Unit", "On hand", "Buffer norm", "Part price", "Edit", "Delete"], rows, search ? "No materials match this search." : "No materials yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}${search ? " (search)" : ""}` : "No materials"}</span><div><button class="button button-small" data-material-page="${Math.max(0, offset - size)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-material-page="${offset + size}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+  target.innerHTML = `${table(["Material code", "Material name", "Used in", "Category", "Unit", "On hand", "Buffer norm", "Part price", "Edit", "Move", "Delete"], rows, search ? "No materials match this search." : "No materials yet.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(offset + 1).toLocaleString()}–${(offset + result.items.length).toLocaleString()} of ${result.total.toLocaleString()}${search ? " (search)" : ""}` : "No materials"}</span><div><button class="button button-small" data-material-page="${Math.max(0, offset - size)}" ${offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-material-page="${offset + size}" ${offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
   const count = $("#materialCount");
   if (count && !search) count.textContent = result.total.toLocaleString();
 }
@@ -2593,6 +2610,8 @@ document.addEventListener("click", async (event) => {
   if (altPage) return loadAlternateCodes(Number(altPage.dataset.altPage));
   const tierPage = event.target.closest("[data-tier-page]");
   if (tierPage) return loadTierMaterialPage(Number(tierPage.dataset.tierPage));
+  const moveMaterial = event.target.closest("[data-move-material]");
+  if (moveMaterial) return openMoveMaterial((state.materialPageItems || []).find((item) => String(item.id) === moveMaterial.dataset.moveMaterial));
   const materialPage = event.target.closest("[data-material-page]");
   if (materialPage) return loadMaterialMasterPage(Number(materialPage.dataset.materialPage));
   const l1Page = event.target.closest("[data-l1-page]");

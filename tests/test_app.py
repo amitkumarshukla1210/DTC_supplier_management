@@ -1407,7 +1407,7 @@ class SupplierHubApiTests(unittest.TestCase):
         # a code in Alternate codes cannot be deleted from T1 (AC-CHIPX has no other use)
         blocked = self.client.delete(f"/api/planning/materials/{chipx}")
         self.assertEqual(blocked.status_code, 409)
-        self.assertIn("Alternate codes", blocked.json()["detail"])
+        self.assertIn("1 alternate code entry", blocked.json()["detail"])
         # deleting a pair gives its SOB back to the main code: direct line 70% main, 0.7x480 + 0.3x520 = 492
         pair_x = next(r["id"] for r in self.client.get("/api/planning/alternate-codes").json()["items"] if r["alternate_code"] == "AC-CHIPX")
         self.assertEqual(self.client.delete(f"/api/planning/alternate-codes/{pair_x}").status_code, 204)
@@ -2013,6 +2013,56 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(list(header[:3]), ["Material code", "Material name", "Used in"])
         values = {r[0]: r[2] for r in sheet.iter_rows(values_only=True) if r and str(r[0]).startswith("UI-")}
         self.assertEqual((values["UI-SPARE"], values["UI-STEEL"], values["UI-IMPORT"], values["UI-NEWIMP"]), ("Not used", "L1 & L2 & L3", "L3 (alternate)", "Not used"))
+
+    def test_t1_code_put_by_mistake_moves_to_t2_and_delete_says_what_uses_it(self):
+        api = self.client
+        adc = api.post("/api/planning/materials", json={"code": "MV-ADC12", "name": "ADC12", "uom": "kg", "unit_cost": 350, "currency": "INR", "category": "Aluminimum"}).json()["id"]
+        sup = lambda name: api.post("/api/suppliers", json={"name": name, "category": "Casting", "country": "India"}).json()["id"]
+        caster, smelter = sup("MV Caster"), sup("MV Smelter")
+        # used by a T1 relationship -> delete and move are refused, naming the use
+        t1 = api.post("/api/planning/supplier-parts", json={"material_id": adc, "supplier_id": caster, "sob_percent": 100, "currency": "INR"}).json()["id"]
+        deleted = api.delete(f"/api/planning/materials/{adc}")
+        self.assertEqual(deleted.status_code, 409)
+        self.assertEqual(deleted.json()["detail"], "MV-ADC12 cannot be deleted: it is used in 1 T1 supplier/material relationship. Remove those first, or use Move to T2/T3 if it belongs there")
+        moved = api.post(f"/api/planning/materials/{adc}/move", params={"tier": "T2"})
+        self.assertEqual(moved.status_code, 409)
+        self.assertIn("used in 1 T1 supplier/material relationship, which need a T1 code", moved.json()["detail"])
+        self.assertEqual(api.post(f"/api/planning/materials/{adc}/move", params={"tier": "T1"}).status_code, 422)
+        # the right setup: the smelter supplies ADC12 to the caster (T2), and the caster keeps it in its material master
+        self.assertEqual(api.delete(f"/api/planning/supplier-parts/{t1}").status_code, 204)
+        t2 = api.post("/api/planning/supplier-parts", json={"material_id": adc, "supplier_id": smelter, "tier": "T2", "parent_supplier_id": caster, "sob_percent": 100, "currency": "INR"}).json()["id"]
+        entry = api.post("/api/planning/supplier-materials", json={"supplier_id": caster, "item_id": adc, "unit_price": 360, "currency": "INR"}).json()["id"]
+        self.assertIn("1 T2/T3 supplier/material relationship, 1 supplier material master entry", api.delete(f"/api/planning/materials/{adc}").json()["detail"])
+        result = api.post(f"/api/planning/materials/{adc}/move", params={"tier": "T2"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual((result.json()["relationships"], result.json()["supplier_materials"]), (1, 1))
+        # now in T2 Material Master with its name, unit, category and price; gone from T1
+        t2_codes = {m["code"]: m for m in api.get("/api/planning/tier-materials", params={"tier": "T2", "search": "MV-"}).json()["items"]}
+        self.assertEqual((t2_codes["MV-ADC12"]["name"], t2_codes["MV-ADC12"]["uom"], t2_codes["MV-ADC12"]["category"], t2_codes["MV-ADC12"]["unit_price"]), ("ADC12", "kg", "Aluminimum", 350))
+        self.assertEqual(api.get("/api/planning/materials", params={"search": "MV-"}).json()["total"], 0)
+        link = next(r for r in api.get("/api/planning/supplier-parts", params={"search": "MV-ADC12"}).json()["items"] if r["id"] == t2)
+        self.assertEqual((link["code_master"], link["material_code"], link["tier"]), ("T2", "MV-ADC12", "T2"))
+        material_entry = next(r for r in api.get("/api/planning/supplier-materials", params={"supplier_id": caster}).json()["items"] if r["id"] == entry)
+        self.assertEqual((material_entry["source"], material_entry["code"], material_entry["unit_price"]), ("T2", "MV-ADC12", 360))
+        # a BOM line blocks the move; an unused code moves to T3
+        bolt = api.post("/api/planning/materials", json={"code": "MV-BOLT", "name": "Bolt", "uom": "PCS"}).json()["id"]
+        model = api.post("/api/planning/models", json={"code": "MV-M", "name": "Move model"}).json()["id"]
+        api.post(f"/api/planning/model-bom/{model}", json={"material_id": bolt, "quantity": 1, "uom": "PCS"})
+        self.assertIn("1 Model BOM Level 1 line", api.post(f"/api/planning/materials/{bolt}/move", params={"tier": "T3"}).json()["detail"])
+        ore = api.post("/api/planning/materials", json={"code": "MV-ORE", "name": "Ore", "uom": "kg"}).json()["id"]
+        self.assertEqual(api.post(f"/api/planning/materials/{ore}/move", params={"tier": "T3"}).status_code, 200)
+        self.assertEqual([m["code"] for m in api.get("/api/planning/tier-materials", params={"tier": "T3", "search": "MV-"}).json()["items"]], ["MV-ORE"])
+        # the install sample's retired material request no longer blocks deleting MAT-101
+        import sqlite3
+        mat101 = next(m["id"] for m in api.get("/api/planning/materials", params={"search": "MAT-101"}).json()["items"])
+        self.assertIn("1 part BOM line, 1 line in its own part BOM", api.delete(f"/api/planning/materials/{mat101}").json()["detail"])  # sample part BOMs (no model)
+        connection = sqlite3.connect(Path(self.temp_dir.name) / "test.db")
+        connection.execute("DELETE FROM bom_components WHERE parent_item_id = ? OR child_item_id = ?", (mat101, mat101))
+        connection.commit()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM material_requests WHERE item_id = ?", (mat101,)).fetchone()[0], 1)
+        connection.close()
+        self.assertEqual(api.delete(f"/api/planning/materials/{mat101}").status_code, 204)
+        self.assertEqual(sqlite3.connect(Path(self.temp_dir.name) / "test.db").execute("SELECT COUNT(*) FROM material_requests WHERE item_id = ?", (mat101,)).fetchone()[0], 0)
 
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
