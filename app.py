@@ -360,7 +360,18 @@ def _seed_inventory_demo(db: Session) -> None:
     db.commit()
 
 
+def _in_use(db: Session) -> bool:
+    """True once the workspace has been set up (an account exists). Sample data is only added to
+    a brand-new database, so suppliers or materials you delete never come back at start-up."""
+    try:
+        return bool(db.execute(text("SELECT COUNT(*) FROM app_users")).scalar())
+    except Exception:
+        return False
+
+
 def _seed(db: Session) -> None:
+    if _in_use(db):
+        return
     if db.scalar(select(func.count(Supplier.id))):
         _seed_inventory_demo(db)
         return

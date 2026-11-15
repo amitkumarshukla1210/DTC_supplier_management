@@ -2585,10 +2585,6 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 ("supplier BOM line", "SELECT COUNT(*) FROM supplier_bom_lines WHERE supplier_id = :id"),
                 ("supplier BOM source", "SELECT COUNT(*) FROM supplier_bom_line_sources WHERE sub_supplier_id = :id"),
                 ("material transfer", "SELECT COUNT(*) FROM material_transfers WHERE from_supplier_id = :id OR to_supplier_id = :id"),
-                ("purchase order", "SELECT COUNT(*) FROM purchase_orders WHERE supplier_id = :id"),
-                ("stock purchase order", "SELECT COUNT(*) FROM stock_purchase_orders WHERE supplier_id = :id"),
-                ("quote / RFQ", "SELECT (SELECT COUNT(*) FROM quotes WHERE supplier_id = :id) + (SELECT COUNT(*) FROM rfq_invitations WHERE supplier_id = :id) + (SELECT COUNT(*) FROM rfqs WHERE awarded_supplier_id = :id)"),
-                ("material with this preferred supplier", "SELECT COUNT(*) FROM items WHERE preferred_supplier_id = :id"),
             ]
             used = []
             for label, query in checks:
@@ -2597,6 +2593,19 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     used.append(f"{count} {label}{'s' if count != 1 and not label.endswith('RFQ') else ''}")
             if used:
                 raise HTTPException(status_code=409, detail=f"{supplier.name} is used: {', '.join(used)}. Remove those first, or set its status to On hold")
+            # Old records of the retired RFQ / purchase-order / material-request screens (the sample
+            # data the app was installed with) are not shown anywhere: remove them with the supplier.
+            for statement in (
+                "DELETE FROM deliveries WHERE po_id IN (SELECT id FROM purchase_orders WHERE supplier_id = :id)",
+                "DELETE FROM purchase_orders WHERE supplier_id = :id",
+                "DELETE FROM stock_deliveries WHERE po_id IN (SELECT id FROM stock_purchase_orders WHERE supplier_id = :id)",
+                "DELETE FROM stock_purchase_orders WHERE supplier_id = :id",
+                "DELETE FROM quotes WHERE supplier_id = :id",
+                "DELETE FROM rfq_invitations WHERE supplier_id = :id",
+                "UPDATE rfqs SET awarded_supplier_id = NULL WHERE awarded_supplier_id = :id",
+                "UPDATE items SET preferred_supplier_id = NULL WHERE preferred_supplier_id = :id",
+            ):
+                db.execute(sa_text(statement), {"id": supplier_id})
             db.delete(supplier)
             db.commit()
             return Response(status_code=204)

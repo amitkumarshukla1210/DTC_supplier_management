@@ -1665,6 +1665,37 @@ class SupplierHubApiTests(unittest.TestCase):
         edited = self.client.patch(f"/api/suppliers/{tata}", json={"name": "SR Tata Steel", "country": "India", "status": "On hold"})
         self.assertEqual((edited.json()["name"], edited.json()["status"]), ("SR Tata Steel", "On hold"))
 
+    def test_sample_suppliers_can_be_deleted_and_do_not_come_back(self):
+        # The install sample (Apex etc.) has old RFQ quotes, purchase orders and preferred-supplier
+        # links from retired screens; those no longer block a delete and go with the supplier.
+        import sqlite3
+        db_file = Path(self.temp_dir.name) / "test.db"
+        apex = next(s_ for s_ in self.client.get("/api/suppliers").json() if s_["name"] == "Apex Precision Works")
+        old = lambda q: sqlite3.connect(db_file).execute(q, (apex["id"],)).fetchone()[0]
+        self.assertGreater(old("SELECT COUNT(*) FROM purchase_orders WHERE supplier_id = ?") + old("SELECT COUNT(*) FROM quotes WHERE supplier_id = ?"), 0)
+        self.assertGreater(old("SELECT COUNT(*) FROM items WHERE preferred_supplier_id = ?"), 0)
+        # still blocked by real use: a supplier/material relationship
+        material = self.client.post("/api/planning/materials", json={"code": "SS-STEEL", "name": "Steel", "uom": "kg"}).json()["id"]
+        link = self.client.post("/api/planning/supplier-parts", json={"material_id": material, "supplier_id": apex["id"], "sob_percent": 100, "currency": "INR"}).json()["id"]
+        blocked = self.client.delete(f"/api/suppliers/{apex['id']}")
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()["detail"], "Apex Precision Works is used: 1 supplier/material relationship. Remove those first, or set its status to On hold")
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-parts/{link}").status_code, 204)
+        self.assertEqual(self.client.delete(f"/api/suppliers/{apex['id']}").status_code, 204)
+        for query in ("SELECT COUNT(*) FROM purchase_orders WHERE supplier_id = ?", "SELECT COUNT(*) FROM quotes WHERE supplier_id = ?",
+                      "SELECT COUNT(*) FROM stock_purchase_orders WHERE supplier_id = ?", "SELECT COUNT(*) FROM items WHERE preferred_supplier_id = ?",
+                      "SELECT COUNT(*) FROM rfqs WHERE awarded_supplier_id = ?"):
+            self.assertEqual(old(query), 0, query)
+        self.assertEqual(old("SELECT COUNT(*) FROM items WHERE code = 'MAT-101' AND ? IS NOT NULL"), 1)  # the material itself stays
+        # delete every other sample supplier, restart the app on the same database: none come back
+        for supplier in self.client.get("/api/suppliers").json():
+            self.assertEqual(self.client.delete(f"/api/suppliers/{supplier['id']}").status_code, 204, supplier["name"])
+        restarted = TestClient(create_app(f"sqlite:///{db_file}"))
+        restarted.__enter__()
+        restarted.post("/api/auth/login", json={"username": "admin", "password": "Secure-test-password-2026!"})
+        self.assertEqual(restarted.get("/api/suppliers").json(), [])
+        restarted.__exit__(None, None, None)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns
