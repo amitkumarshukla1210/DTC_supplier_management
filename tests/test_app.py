@@ -2068,6 +2068,91 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(api.delete(f"/api/planning/materials/{mat101}").status_code, 204)
         self.assertEqual(sqlite3.connect(Path(self.temp_dir.name) / "test.db").execute("SELECT COUNT(*) FROM material_requests WHERE item_id = ?", (mat101,)).fetchone()[0], 0)
 
+    def test_supply_chain_rows_from_users_sheet(self):
+        # The user's sheet: Supangita 40% / Savera 60% supply Base Front Beam; each buys steel
+        # FL001STEEL0.7 from JGI 30% and TATA 70% (T2). Row 2 / 4 leave the T1 block blank.
+        api = self.client
+        mat = lambda code, name, uom="PCS": api.post("/api/planning/materials", json={"code": code, "name": name, "uom": uom}).json()["id"]
+        beam, steel, bracket = mat("CH-BEAM", "Base Front Beam"), mat("CH-STEEL", "STEEL0.7", "kg"), mat("CH-BRKT", "Bracket")
+        ore = api.post("/api/planning/tier-materials", json={"tier": "T3", "code": "CH-ORE", "name": "Iron ore", "uom": "kg"}).json()["id"]
+        sup = lambda name: api.post("/api/suppliers", json={"name": name, "category": "Sheet Metal", "country": "India"}).json()["id"]
+        supangita, savera, jgi, tata, mine = sup("CH Supangita"), sup("CH Savera"), sup("CH JGI Steel"), sup("CH TATA Steel"), sup("CH Mine")
+        block = lambda supplier, part, sob, price=0, key="material_id": {"supplier_id": supplier, key: part, "sob_percent": sob, "unit_price": price}
+        rows = [
+            {"t1": block(supangita, beam, 40, 500), "t2": block(jgi, steel, 30, 70), "lead_time_days": 20, "moq": 1000, "buffer_days": 7, "currency": "INR"},
+            {"t2": block(tata, steel, 70, 68), "lead_time_days": 30, "currency": "INR"},
+            {"t1": block(savera, beam, 60, 520), "t2": block(jgi, steel, 30, 70), "currency": "INR"},
+            {"t2": block(tata, steel, 70, 68), "currency": "INR"},
+        ]
+        saved = api.post("/api/planning/supplier-chain/rows", json={"rows": rows})
+        self.assertEqual((saved.status_code, saved.json()["relationships"]), (201, 6), saved.text)
+        chain = api.get("/api/planning/supplier-chain", params={"search": "CH-"}).json()["items"]
+        flat = [(r["t1"]["supplier_name"], r["t1"]["sob_percent"], r["t2"]["supplier_name"], r["t2"]["material_code"], r["t2"]["sob_percent"]) for r in chain]
+        self.assertEqual(flat, [("CH Savera", 60, "CH JGI Steel", "CH-STEEL", 30), ("CH Savera", 60, "CH TATA Steel", "CH-STEEL", 70),
+                                ("CH Supangita", 40, "CH JGI Steel", "CH-STEEL", 30), ("CH Supangita", 40, "CH TATA Steel", "CH-STEEL", 70)])
+        # terms belong to the last supplier in the row: JGI under Supangita has lead 20, MOQ 1000; Supangita keeps 0
+        jgi_supangita = next(r for r in chain if r["t1"]["supplier_name"] == "CH Supangita" and r["t2"]["supplier_name"] == "CH JGI Steel")
+        self.assertEqual((jgi_supangita["last"]["lead_time_days"], jgi_supangita["last"]["moq"], jgi_supangita["t1"]["lead_time_days"]), (20, 1000, 0))
+        self.assertEqual(jgi_supangita["t2"]["parent_link_id"], jgi_supangita["t1"]["id"])
+        # the row's currency is for every price in it (T1 too); other terms stay with the last supplier
+        self.assertEqual((jgi_supangita["t1"]["currency"], jgi_supangita["t1"]["unit_price"], jgi_supangita["t2"]["currency"]), ("INR", 500, "INR"))
+        # each level can carry its own terms in its block (T1 lead 15, MOQ 50 here; the T2 keeps the row's terms)
+        own = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t1": {**block(supangita, beam, 40, 500), "lead_time_days": 15, "moq": 50, "currency": "USD"}, "t2": block(jgi, steel, 30, 70), "lead_time_days": 20, "moq": 1000, "buffer_days": 7, "currency": "INR"}]})
+        self.assertEqual(own.status_code, 201, own.text)
+        mine_rows = [r for r in api.get("/api/planning/supplier-chain", params={"search": "CH Supangita"}).json()["items"] if r["t2"] and r["t2"]["supplier_name"] == "CH JGI Steel"]
+        self.assertEqual((mine_rows[0]["t1"]["lead_time_days"], mine_rows[0]["t1"]["moq"], mine_rows[0]["t1"]["currency"], mine_rows[0]["t2"]["lead_time_days"], mine_rows[0]["t2"]["moq"]), (15, 50, "USD", 20, 1000))
+        # SOB per parent part: a third steel supplier under Supangita's beam would exceed 100%
+        over = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t1": block(supangita, beam, 40, 500), "t2": block(mine, steel, 10)}]})
+        self.assertEqual(over.status_code, 422)
+        self.assertIn("Row 1: Supplier SOB cannot exceed 100%", over.json()["detail"])
+        no_t1 = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t2": block(tata, steel, 70)}]})
+        self.assertIn("Row 1: fill the T1 supplier", no_t1.json()["detail"])
+        # saving again updates: JGI 20 / TATA 80 under Savera
+        again = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t1": block(savera, beam, 60, 520), "t2": block(jgi, steel, 20, 70)}, {"t2": block(tata, steel, 80, 68)}]})
+        self.assertEqual(again.status_code, 201, again.text)
+        savera_rows = [r for r in api.get("/api/planning/supplier-chain", params={"search": "CH Savera"}).json()["items"]]
+        self.assertEqual([r["t2"]["sob_percent"] for r in savera_rows], [20, 80])
+        self.assertEqual(len(api.get("/api/planning/supplier-parts", params={"search": "CH-"}).json()["items"]), 6)  # updated, not added
+        # the same relationship typed twice in one save keeps the first row's values (Savera stays 60% at 520)
+        twice = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t1": block(savera, beam, 60, 520), "t2": block(jgi, steel, 20, 70)}, {"t1": block(savera, beam, 55, 999), "t2": block(tata, steel, 80, 68)}]})
+        self.assertEqual(twice.status_code, 201, twice.text)
+        savera_t1 = api.get("/api/planning/supplier-chain", params={"search": "CH Savera"}).json()["items"][0]["t1"]
+        self.assertEqual((savera_t1["sob_percent"], savera_t1["unit_price"]), (60, 520))
+        # a T3 under JGI (Supangita's beam) with a T3 Material Master code
+        t3 = api.post("/api/planning/supplier-chain/rows", json={"rows": [{"t1": block(supangita, beam, 40, 500), "t2": block(jgi, steel, 30, 70), "t3": block(mine, ore, 100, 9, "tier_material_id")}]})
+        self.assertEqual(t3.status_code, 201, t3.text)
+        deep = next(r for r in api.get("/api/planning/supplier-chain", params={"search": "CH-ORE"}).json()["items"] if r["t3"])
+        self.assertEqual((deep["t1"]["supplier_name"], deep["t2"]["supplier_name"], deep["t3"]["material_code"], deep["t3"]["code_master"]), ("CH Supangita", "CH JGI Steel", "CH-ORE", "T3"))
+        # a T1 relationship with suppliers under it cannot be deleted
+        self.assertIn("under it", api.delete(f"/api/planning/supplier-parts/{deep['t1']['id']}").json()["detail"])
+        # a T2 saved the old way (parent supplier only) shows under every part of that supplier
+        api.post("/api/planning/supplier-parts", json={"material_id": bracket, "supplier_id": supangita, "sob_percent": 100, "currency": "INR"})
+        legacy = api.post("/api/planning/supplier-parts", json={"material_id": steel, "supplier_id": mine, "tier": "T2", "parent_supplier_id": supangita, "sob_percent": 100, "currency": "INR"})
+        self.assertEqual(legacy.status_code, 201, legacy.text)
+        under = {r["t1"]["material_code"] for r in api.get("/api/planning/supplier-chain", params={"search": "CH Mine"}).json()["items"] if r["t2"] and r["t2"]["id"] == legacy.json()["id"]}
+        self.assertEqual(under, {"CH-BEAM", "CH-BRKT"})
+        # edit: changing the parent supplier drops the old parent part
+        moved = api.patch(f"/api/planning/supplier-parts/{jgi_supangita['t2']['id']}", json={"parent_supplier_id": savera, "sob_percent": 0})
+        self.assertEqual(moved.status_code, 200, moved.text)
+        self.assertIsNone(next(r for r in api.get("/api/planning/supplier-parts", params={"search": "CH-STEEL"}).json()["items"] if r["id"] == jgi_supangita["t2"]["id"])["parent_link_id"])
+        # Savera to 50% so the part's total SOB is not 100 (the part row shows the real total)
+        self.assertEqual(api.patch(f"/api/planning/supplier-parts/{savera_t1['id']}", json={"sob_percent": 50}).status_code, 200)
+        # Excel in the sheet layout: group row, sub-headings, then chain rows
+        sheet = load_workbook(io.BytesIO(api.get("/api/planning/supplier-chain.xlsx", params={"search": "CH-"}).content)).active
+        # tree as on the screen: Level | T1 (part first) | T2 | T3 | terms of the supplier on that row
+        self.assertEqual((sheet["A3"].value, sheet["B3"].value, sheet["F3"].value, sheet["J3"].value, sheet["N3"].value), ("Level", "T1 Supplier", "T2 Supplier", "T3 Supplier", "Terms of the supplier on the row"))
+        self.assertEqual([sheet.cell(4, c).value for c in range(2, 10)], ["Material code", "Material name", "Supplier code", "Supplier name", "Supplier code", "Supplier name", "Material code", "Material name"])
+        self.assertEqual([sheet.cell(4, c).value for c in range(14, 22)], ["SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price status", "Unit price", "Currency"])
+        # first rows, worked out from the chain list: the CH-BEAM part (T1 count, total SOB), its first T1, that T1's first T2
+        listed = api.get("/api/planning/supplier-chain", params={"search": "CH-"}).json()["items"]
+        beam_t1 = {r["t1"]["id"]: r["t1"] for r in listed if r["t1"] and r["t1"]["material_code"] == "CH-BEAM"}
+        first = listed[0]
+        self.assertEqual([sheet.cell(5, c).value for c in (1, 2, 5, 14)], ["Part", "CH-BEAM", f"{len(beam_t1)} T1 suppliers", sum(t["sob_percent"] for t in beam_t1.values())])
+        self.assertEqual([sheet.cell(6, c).value for c in (1, 2, 4, 14, 15)], ["T1", "CH-BEAM", first["t1"]["supplier_code"], first["t1"]["sob_percent"], first["t1"]["lead_time_days"]])
+        self.assertEqual([sheet.cell(7, c).value for c in (1, 6, 8, 14, 15)], ["T2", first["t2"]["supplier_code"], first["t2"]["material_code"], first["t2"]["sob_percent"], first["t2"]["lead_time_days"]])
+        self.assertEqual([sheet.row_dimensions[r].outline_level for r in (5, 6, 7)], [0, 1, 2])
+        self.assertEqual(api.get("/api/planning/supplier-chain.pdf").status_code, 200)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns

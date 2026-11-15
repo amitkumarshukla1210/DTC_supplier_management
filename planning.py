@@ -175,7 +175,7 @@ class SupplierPart(Base):
     a T1 supplier (parent), T3 = supplies a T2 supplier ... A T2/T3 row may use a code from the T2 / T3
     Material Master (tier_material_id) instead of a T1 code (material_id): exactly one is set."""
     __tablename__ = "supplier_parts"
-    __table_args__ = (UniqueConstraint("material_id", "supplier_id", "tier", "parent_supplier_id"),)
+    __table_args__ = (UniqueConstraint("material_id", "tier_material_id", "supplier_id", "tier", "parent_supplier_id", "parent_link_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     material_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=True, index=True)
@@ -183,6 +183,9 @@ class SupplierPart(Base):
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
     tier: Mapped[str] = mapped_column(String(24), default="T1", index=True)
     parent_supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True, index=True)
+    # T2/T3: the parent relationship = the parent supplier's part this material goes into
+    # (e.g. JGI steel T2 -> Supangita's Base Front Beam T1). Empty on rows saved before this.
+    parent_link_id: Mapped[int | None] = mapped_column(ForeignKey("supplier_parts.id"), nullable=True, index=True)
     sob_percent: Mapped[float] = mapped_column(Float, default=100)
     lead_time_days: Mapped[int] = mapped_column(Integer, default=0)
     moq: Mapped[float] = mapped_column(Float, default=0)
@@ -565,6 +568,7 @@ class SupplierPartInput(BaseModel):
     supplier_id: int
     tier: str = Field(default="T1", min_length=2, max_length=24)
     parent_supplier_id: int | None = None
+    parent_link_id: int | None = None  # T2/T3: the parent supplier's relationship (its part)
     sob_percent: float = Field(default=100, ge=0, le=100)
     lead_time_days: int = Field(default=0, ge=0, le=5000)
     moq: float = Field(default=0, ge=0)
@@ -1478,7 +1482,7 @@ def upgrade_supplier_parts(db: Session) -> None:
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     bind = db.get_bind()
     columns = {column["name"]: column for column in sa_inspect(bind).get_columns("supplier_parts")}
-    needs_rebuild = "tier_material_id" not in columns or not columns["material_id"]["nullable"]
+    needs_rebuild = "tier_material_id" not in columns or "parent_link_id" not in columns or not columns["material_id"]["nullable"]
     done = {row.key for row in db.scalars(select(AppSetting)).all()}
     needs_rename = "tiers_t1_is_direct" not in done
     if (needs_rebuild or needs_rename) and db.scalar(select(func.count(SupplierPart.id)) if not needs_rebuild else sa_text("SELECT COUNT(*) FROM supplier_parts")):
@@ -2823,7 +2827,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     "material_name": item.name if item else "", "supplier_id": link.supplier_id,
                     "supplier_code": supplier.code if supplier else "", "supplier_name": supplier.name if supplier else "",
                     "tier": link.tier, "parent_supplier_id": link.parent_supplier_id,
-                    "parent_supplier_name": parent.name if parent else None, "sob_percent": link.sob_percent,
+                    "parent_supplier_name": parent.name if parent else None, "parent_link_id": link.parent_link_id, "sob_percent": link.sob_percent,
                     "lead_time_days": link.lead_time_days, "moq": link.moq, "buffer_days": link.buffer_days,
                     "price_mode": link.price_mode, "price_interval_months": link.price_interval_months,
                     "price_updated_month": link.price_updated_month,
@@ -2841,6 +2845,265 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             db.refresh(link)
             return {"id": link.id, "material_id": link.material_id, "supplier_id": link.supplier_id, "tier": link.tier, "sob_percent": link.sob_percent}
+
+    def chain_link_json(db: Session, link: SupplierPart, can_price: bool, cache: dict) -> dict:
+        key = ("item", link.material_id) if link.material_id else ("tier", link.tier_material_id)
+        if key not in cache:
+            cache[key] = db.get(Item, link.material_id) if link.material_id else db.get(TierMaterial, link.tier_material_id)
+        part = cache[key]
+        if ("supplier", link.supplier_id) not in cache:
+            cache[("supplier", link.supplier_id)] = db.get(Supplier, link.supplier_id)
+        supplier = cache[("supplier", link.supplier_id)]
+        data = {"id": link.id, "tier": link.tier, "supplier_id": link.supplier_id, "supplier_code": supplier.code if supplier else "",
+                "supplier_name": supplier.name if supplier else "", "material_id": link.material_id, "tier_material_id": link.tier_material_id,
+                "material_code": part.code if part else "", "material_name": part.name if part else "",
+                "code_master": "T1" if link.material_id else (part.tier if part else "T2"),
+                "parent_supplier_id": link.parent_supplier_id, "parent_link_id": link.parent_link_id, "sob_percent": link.sob_percent,
+                "lead_time_days": link.lead_time_days, "moq": link.moq, "buffer_days": link.buffer_days, "price_mode": link.price_mode,
+                "price_interval_months": link.price_interval_months, "price_status": _price_status(link, _month_text(date.today()))}
+        if can_price:
+            data.update(unit_price=link.unit_price, currency=link.currency)
+        return data
+
+    def supply_chain_tree(rows: list[dict]) -> list[dict]:
+        """Chain rows as a tree, as on the coverage screen: the part (depth 0, with its T1 supplier count and
+        total SOB), each T1 supplier (1), its T2 (2) and T3 (3). Each node carries its parents and its own link."""
+        by_part: dict[str, dict[int, dict]] = {}
+        for row in rows:
+            if row["t1"]:
+                by_part.setdefault(row["t1"]["material_code"], {})[row["t1"]["id"]] = row["t1"]
+        seen: set = set()
+        nodes: list[dict] = []
+        for row in rows:
+            t1, t2, t3 = row["t1"], row["t2"], row["t3"]
+            if t1 and ("p", t1["material_code"]) not in seen:
+                seen.add(("p", t1["material_code"]))
+                suppliers = list(by_part[t1["material_code"]].values())
+                nodes.append({"depth": 0, "t1": t1, "t2": None, "t3": None, "link": None, "suppliers": len(suppliers),
+                              "total_sob": round(sum(link["sob_percent"] or 0 for link in suppliers), 4)})
+            for depth, key, link in ((1, (1, t1 and t1["id"]), t1), (2, (2, t1 and t1["id"], t2 and t2["id"]), t2),
+                                     (3, (3, t1 and t1["id"], t2 and t2["id"], t3 and t3["id"]), t3)):
+                if link and key not in seen:
+                    seen.add(key)
+                    nodes.append({"depth": depth, "t1": t1, "t2": t2 if depth >= 2 else None, "t3": t3 if depth == 3 else None, "link": link})
+        return nodes
+
+    def supply_chain_rows(db: Session, can_price: bool, search: str = "") -> list[dict]:
+        """Coverage as chains: one row per path T1 -> T2 -> T3 (as in the user's sheet). A T2/T3
+        relationship sits under its parent relationship; rows saved without one sit under every
+        relationship of their parent supplier at the tier above; rows with no parent there are
+        listed on their own."""
+        links = db.scalars(select(SupplierPart)).all()
+        cache: dict = {}
+        by_parent_link: dict[int, list[SupplierPart]] = {}
+        unlinked: dict[tuple[int, str], list[SupplierPart]] = {}
+        for link in links:
+            if link.parent_link_id:
+                by_parent_link.setdefault(link.parent_link_id, []).append(link)
+            elif link.tier != TOP_TIER and link.parent_supplier_id:
+                unlinked.setdefault((link.parent_supplier_id, link.tier), []).append(link)
+        placed: set[int] = set()
+
+        def children(link: SupplierPart) -> list[SupplierPart]:
+            next_tier = f"T{int(link.tier[1:]) + 1}" if re.fullmatch(r"T[1-9]", link.tier or "") else ""
+            found = by_parent_link.get(link.id, []) + unlinked.get((link.supplier_id, next_tier), [])
+            return sorted(found, key=lambda child: (chain_link_json(db, child, False, cache)["material_code"], chain_link_json(db, child, False, cache)["supplier_name"]))
+
+        def paths(link: SupplierPart) -> list[list[SupplierPart]]:
+            placed.add(link.id)
+            below = children(link) if int(link.tier[1:]) < 3 else []
+            if not below:
+                return [[link]]
+            return [[link] + path for child in below for path in paths(child)]
+
+        groups: list[list[list[SupplierPart]]] = []
+        top = sorted([link for link in links if link.tier == TOP_TIER], key=lambda link: (chain_link_json(db, link, False, cache)["material_code"], chain_link_json(db, link, False, cache)["supplier_name"]))
+        for link in top:
+            groups.append(paths(link))
+        for link in sorted(links, key=lambda item: (item.tier, item.id)):  # T2/T3 rows with no parent relationship shown
+            if link.id not in placed and link.tier in ("T2", "T3"):
+                groups.append([[None] * (int(link.tier[1:]) - 1) + path for path in paths(link)])
+        needle = search.strip().casefold()
+        rows = []
+        for group_index, group in enumerate(groups):
+            group_rows = []
+            for path in group:
+                blocks = {}
+                for position, link in enumerate(path):
+                    blocks[f"t{position + 1}"] = chain_link_json(db, link, can_price, cache) if link else None
+                last = next(block for block in reversed([blocks.get(f"t{i}") for i in (1, 2, 3)]) if block)
+                group_rows.append({"group": group_index, "t1": blocks.get("t1"), "t2": blocks.get("t2"), "t3": blocks.get("t3"), "last": last})
+            if needle and not any(needle in " ".join(f"{b['supplier_code']} {b['supplier_name']} {b['material_code']} {b['material_name']}".casefold()
+                                                     for b in (row["t1"], row["t2"], row["t3"]) if b) for row in group_rows):
+                continue
+            rows.extend(group_rows)
+        return rows
+
+    @app.get("/api/planning/supplier-chain")
+    def supplier_chain(request: Request, search: str = ""):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            rows = supply_chain_rows(db, _check_price_access(request), search)
+            return {"total": len(rows), "items": rows}
+
+    @app.get("/api/planning/supplier-chain.{file_format}")
+    def export_supplier_chain(file_format: str, request: Request, search: str = ""):
+        """Coverage in the chain layout: T1 / T2 / T3 Supplier blocks, then the last supplier's terms."""
+        current_user(request)
+        _check_supply_role(request)
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            rows = supply_chain_rows(db, can_price, search)
+        # T1 block starts with your part (Material code, name), then its supplier; T2/T3 start with the supplier
+        # tree as on the screen: Level, T1 block (your part first), T2 / T3 blocks (supplier first), then the
+        # terms of the supplier on that row (each level has its own SOB, lead time, MOQ, buffer, price)
+        t1_heads = ["Material code", "Material name", "Supplier code", "Supplier name"]
+        block_heads = ["Supplier code", "Supplier name", "Material code", "Material name"]
+        terms = ["SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price status"] + (["Unit price", "Currency"] if can_price else [])
+        mode_label = {"spot": "Spot", "fixed_monthly": "Fixed monthly", "every_n_months": "Every N months"}
+
+        def ident(link: dict | None, first: bool = False) -> list:
+            if not link:
+                return [""] * 4
+            supplier, part = [link["supplier_code"], link["supplier_name"]], [link["material_code"], link["material_name"]]
+            return part + supplier if first else supplier + part
+
+        values, depths = [], []
+        for node in supply_chain_tree(rows):
+            link = node["link"]
+            if node["depth"] == 0:
+                t1 = node["t1"]
+                line = ["Part", t1["material_code"], t1["material_name"], "", f'{node["suppliers"]} T1 supplier{"s" if node["suppliers"] != 1 else ""}'] + [""] * 8 + [node["total_sob"]] + [""] * (len(terms) - 1)
+            else:
+                line = [link["tier"]] + ident(node["t1"], True) + ident(node["t2"]) + ident(node["t3"]) + [
+                    link["sob_percent"], link["lead_time_days"], link["moq"], link["buffer_days"], mode_label.get(link["price_mode"], link["price_mode"]), link["price_status"]] + (
+                    [link.get("unit_price"), link.get("currency")] if can_price else [])
+            values.append(line)
+            depths.append(node["depth"])
+        if file_format == "pdf":
+            headers = ["Level"] + [f"T1 {h}" for h in t1_heads] + [f"{tier} {h}" for tier in ("T2", "T3") for h in block_heads] + terms
+            output = _generic_pdf("Supplier/material coverage", headers, values)
+            return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": 'attachment; filename="supplier-material-coverage.pdf"'})
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Coverage"
+        dark = PatternFill("solid", fgColor="12263A")
+        white = Font(bold=True, color="FFFFFF")
+        sheet.append(["Design to Cost · Supplier/material coverage"])
+        sheet.append([])
+        sheet.append(["Level", "T1 Supplier", None, None, None, "T2 Supplier", None, None, None, "T3 Supplier", None, None, None, "Terms of the supplier on the row"] + [None] * (len(terms) - 1))
+        sheet.append([None] + t1_heads + block_heads * 2 + terms)
+        sheet.merge_cells(start_row=3, start_column=1, end_row=4, end_column=1)
+        for index in range(3):
+            sheet.merge_cells(start_row=3, start_column=2 + index * 4, end_row=3, end_column=5 + index * 4)
+        sheet.merge_cells(start_row=3, start_column=14, end_row=3, end_column=13 + len(terms))
+        for row_cells in sheet.iter_rows(min_row=3, max_row=4):
+            for cell in row_cells:
+                cell.fill, cell.font = dark, white
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        part_font = Font(bold=True)
+        for line, depth in zip(values, depths):
+            sheet.append(line)
+            number_row = sheet.max_row
+            if depth == 0:
+                for cell in sheet[number_row]:
+                    cell.font = part_font
+            else:  # + / - in Excel, like the screen
+                sheet.row_dimensions[number_row].outline_level = depth
+        sheet.sheet_properties.outlinePr.summaryBelow = False
+        for column in range(1, 14 + len(terms)):
+            sheet.column_dimensions[__import__("openpyxl").utils.get_column_letter(column)].width = 8 if column == 1 else 16
+        sheet.freeze_panes = "B5"
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": 'attachment; filename="supplier-material-coverage.xlsx"'})
+
+    @app.post("/api/planning/supplier-chain/rows", status_code=201)
+    def save_supplier_chain_rows(payload: dict, request: Request):
+        """Chain rows typed on the relationship page, all or none. Each row: t1 / t2 / t3 blocks
+        {supplier_id, material_id | tier_material_id, sob_percent, unit_price} (a block may be left out:
+        the previous row's T1 / T2 is used, as in the coverage sheet) and the terms of the last
+        supplier in the row. A relationship already there is updated."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = payload.get("rows") or []
+        if not rows:
+            raise HTTPException(status_code=422, detail="Add at least one row")
+        term_keys = ("lead_time_days", "moq", "buffer_days", "currency", "price_mode", "price_interval_months")
+        with open_db() as db:
+            previous: dict[str, SupplierPart | None] = {"t1": None, "t2": None}
+            touched: set[int] = set()
+            saved = 0
+            for index, row in enumerate(rows, start=1):
+                try:
+                    chain: list[SupplierPart] = []
+                    present = [key for key in ("t1", "t2", "t3") if row.get(key)]
+                    if not present:
+                        continue
+                    deepest = present[-1]
+                    for position, key in enumerate(("t1", "t2", "t3")):
+                        block = row.get(key)
+                        tier = f"T{position + 1}"
+                        if not block:
+                            if position < ["t1", "t2", "t3"].index(deepest):
+                                inherited = previous.get(key)
+                                if inherited is None:
+                                    raise HTTPException(status_code=422, detail=f"fill the {tier} supplier (no {tier} in the row above to continue)")
+                                chain.append(inherited)
+                            continue
+                        parent = chain[-1] if chain else None
+                        if position > 0 and parent is None:
+                            raise HTTPException(status_code=422, detail=f"a {tier} supplier needs its T{position} supplier on the left")
+                        values = {"supplier_id": block.get("supplier_id"), "material_id": block.get("material_id") or None,
+                                  "tier_material_id": block.get("tier_material_id") or None, "tier": tier,
+                                  "parent_link_id": parent.id if parent else None, "parent_supplier_id": parent.supplier_id if parent else None,
+                                  "sob_percent": float(block.get("sob_percent") if block.get("sob_percent") not in (None, "") else 100),
+                                  "unit_price": float(block.get("unit_price") or 0)}
+                        if key == deepest:
+                            values.update({term: row[term] for term in term_keys if row.get(term) not in (None, "")})
+                        elif row.get("currency"):
+                            values["currency"] = row["currency"]  # each block's unit price is in the row's currency
+                        # each level can have its own terms (typed in its block)
+                        values.update({term: block[term] for term in term_keys if block.get(term) not in (None, "")})
+                        try:
+                            clean = SupplierPartInput(**values).model_dump()
+                        except Exception as exc:
+                            raise HTTPException(status_code=422, detail=f"check the {tier} values (SOB 0-100, numbers 0 or more)") from exc
+                        part_column = SupplierPart.material_id if clean["material_id"] else SupplierPart.tier_material_id
+                        existing = db.scalar(select(SupplierPart).where(
+                            SupplierPart.supplier_id == clean["supplier_id"], SupplierPart.tier == tier,
+                            part_column == (clean["material_id"] or clean["tier_material_id"]),
+                            (SupplierPart.parent_link_id == clean["parent_link_id"]) if clean["parent_link_id"] else SupplierPart.parent_link_id.is_(None),
+                            (SupplierPart.parent_supplier_id == clean["parent_supplier_id"]) if clean["parent_supplier_id"] else SupplierPart.parent_supplier_id.is_(None)))
+                        if existing and existing.id in touched:
+                            link = existing  # same relationship repeated on a later row: keep the first values
+                        elif existing:
+                            update = {k: v for k, v in clean.items() if k in values or k in ("material_id", "tier_material_id")}
+                            checked = check_supplier_part(db, {**{k: getattr(existing, k) for k in clean}, **update}, request, exclude_id=existing.id)
+                            for field_name, value in checked.items():
+                                setattr(existing, field_name, value)
+                            db.flush()
+                            link = existing
+                        else:
+                            link = SupplierPart(**check_supplier_part(db, clean, request))
+                            db.add(link)
+                            db.flush()
+                            tiers_from_links(db, link)
+                        touched.add(link.id)
+                        chain.append(link)
+                        saved += 1
+                    previous["t1"] = chain[0] if chain else previous["t1"]
+                    previous["t2"] = chain[1] if len(chain) > 1 else (None if row.get("t1") else previous["t2"])
+                except HTTPException as exc:
+                    db.rollback()
+                    raise HTTPException(status_code=exc.status_code, detail=f"Row {index}: {exc.detail}") from exc
+            db.commit()
+            return {"rows": len(rows), "relationships": len(touched)}
 
     @app.post("/api/planning/supplier-parts/rows", status_code=201)
     def add_supplier_part_rows(payload: SupplierPartRows, request: Request):
@@ -2870,6 +3133,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=404, detail="Supplier/material link not found")
             pos = db.scalar(select(func.count()).select_from(PlanningPO).where(PlanningPO.supplier_part_id == link_id)) or 0
             stock = db.scalar(select(func.count()).select_from(SupplierStockSnapshot).where(SupplierStockSnapshot.supplier_part_id == link_id)) or 0
+            children = db.scalar(select(func.count()).select_from(SupplierPart).where(SupplierPart.parent_link_id == link_id)) or 0
+            if children:
+                raise HTTPException(status_code=409, detail=f"This relationship has {children} {'supplier' if children == 1 else 'suppliers'} under it (next tier); delete or move those first")
             if pos or stock:
                 used = ", ".join(text for text in (f"{pos} PO{'s' if pos != 1 else ''}" if pos else "", f"{stock} supplier stock row{'s' if stock != 1 else ''}" if stock else "") if text)
                 raise HTTPException(status_code=409, detail=f"This relationship has {used}; it cannot be deleted. Set its SOB to 0 instead")
@@ -3008,6 +3274,17 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             raise HTTPException(status_code=422, detail=f"A {values['tier']} supplier must have its parent supplier (the supplier it supplies)")
         if values["tier"] == TOP_TIER:
             values["parent_supplier_id"] = None
+            values["parent_link_id"] = None
+        if values.get("parent_link_id"):
+            parent_link = db.get(SupplierPart, values["parent_link_id"])
+            if not parent_link:
+                raise HTTPException(status_code=404, detail="Parent relationship not found")
+            if parent_link.id == exclude_id:
+                raise HTTPException(status_code=422, detail="A relationship cannot be its own parent")
+            expected = f"T{int(parent_link.tier[1:]) + 1}" if re.fullmatch(r"T[1-9]", parent_link.tier or "") else ""
+            if values["tier"] != expected:
+                raise HTTPException(status_code=422, detail=f"Under a {parent_link.tier} relationship the tier must be {expected}")
+            values["parent_supplier_id"] = parent_link.supplier_id
         if not db.get(Supplier, values["supplier_id"]):
             raise HTTPException(status_code=404, detail="Supplier not found")
         if values.get("parent_supplier_id") and not db.get(Supplier, values["parent_supplier_id"]):
@@ -3029,8 +3306,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if values["tier"] == TOP_TIER:
                 raise HTTPException(status_code=422, detail=f"{material.code} is a {material.tier} Material Master code: a T1 supplier needs a T1 code; use tier T2 or T3 for your suppliers' suppliers")
             column = SupplierPart.tier_material_id
+        # SOB group: same part and tier under the same parent relationship (or parent supplier, for rows without one)
         same_route = [column == (material_id or tier_material_id), SupplierPart.tier == values["tier"],
-                      (SupplierPart.parent_supplier_id == values["parent_supplier_id"]) if values.get("parent_supplier_id") else SupplierPart.parent_supplier_id.is_(None)]
+                      (SupplierPart.parent_supplier_id == values["parent_supplier_id"]) if values.get("parent_supplier_id") else SupplierPart.parent_supplier_id.is_(None),
+                      (SupplierPart.parent_link_id == values["parent_link_id"]) if values.get("parent_link_id") else SupplierPart.parent_link_id.is_(None)]
         if exclude_id:
             same_route.append(SupplierPart.id != exclude_id)
         share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(*same_route)) or 0
@@ -4237,7 +4516,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         parent supplier, SOB, lead time, MOQ, buffer, price, currency, price agreement."""
         current_user(request)
         _check_supply_role(request)
-        allowed = {"material_id", "tier_material_id", "supplier_id", "tier", "parent_supplier_id", "sob_percent", "lead_time_days",
+        allowed = {"material_id", "tier_material_id", "supplier_id", "tier", "parent_supplier_id", "parent_link_id", "sob_percent", "lead_time_days",
                    "moq", "buffer_days", "unit_price", "currency", "price_mode", "price_interval_months"}
         if set(payload) - allowed:
             raise HTTPException(status_code=422, detail="Unsupported supplier/material update field")
@@ -4253,6 +4532,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 merged["tier_material_id"] = payload.get("tier_material_id")
             if payload.get("tier_material_id"):
                 merged["material_id"] = payload.get("material_id")
+            # a different parent supplier (or tier) without a new parent relationship drops the old one
+            if ("parent_supplier_id" in payload or "tier" in payload) and "parent_link_id" not in payload and link.parent_link_id:
+                parent_link = db.get(SupplierPart, link.parent_link_id)
+                if not parent_link or parent_link.supplier_id != merged.get("parent_supplier_id") or _normalize_tier(merged.get("tier")) != f"T{int(parent_link.tier[1:]) + 1}":
+                    merged["parent_link_id"] = None
             try:
                 values = SupplierPartInput(**{k: v for k, v in merged.items() if k in SupplierPartInput.model_fields}).model_dump()
             except Exception as exc:
