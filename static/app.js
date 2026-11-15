@@ -1146,64 +1146,102 @@ async function loadSupplierPartPage(offset = 0, search = state.supplierSearch) {
 }
 
 const SUPPLIER_TABS = ["Supplier register", "Supplier/material relationship", "Supplier/material coverage", "Upload supplier stock", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"];
-const RELATIONSHIP_SUBTABS = ["Supplier/material relationship", "Upload supplier/material relationships"];
 
 // ---- Excel-like entry tables (one row per entry, every field a column, + Add row, Save all)
+// Column headings have the same filter as other tables (sort, search, Select all, Clear all);
+// the list of values is made from what is typed in the rows when the filter opens.
 function entryHeading(label) {
-  return `<th><div class="table-heading">${esc(label)}<span class="column-resizer" aria-hidden="true"></span></div></th>`;
+  if (!label) return '<th><div class="table-heading"><span class="column-resizer" aria-hidden="true"></span></div></th>';
+  return `<th><div class="table-heading"><details class="multi-filter table-column-filter entry-column-filter"><summary aria-label="Filter ${esc(label)}">${esc(label)}</summary><div class="multi-popover"><div class="column-sort"><button type="button" class="text-button" data-column-sort="asc">Sort A → Z</button><button type="button" class="text-button" data-column-sort="desc">Sort Z → A</button></div><input class="form-control multi-search" type="search" placeholder="Search ${esc(label.toLowerCase())}" /><div class="column-filter-actions"><button type="button" class="text-button" data-column-select-all>Select all</button><button type="button" class="text-button" data-column-clear>Clear all</button></div><div class="multi-options"></div><button type="button" class="button button-small button-primary column-filter-apply" data-column-apply>Apply</button></div></details><span class="column-resizer" aria-hidden="true"></span></div></th>`;
 }
 function entryTable(id, labels) {
   return `<div class="table-wrap entry-wrap"><table class="entry-table" id="${id}"><thead><tr>${labels.map(entryHeading).join("")}${entryHeading("")}</tr></thead><tbody></tbody></table></div>`;
 }
-// Code and name in their own columns: the code column has the search box and the code list,
-// the name column the same list by name; picking either one fills the other.
+// What a cell shows: typed text, the chosen option, or plain text
+function cellText(cell) {
+  if (!cell) return "";
+  const control = cell.querySelector("input:not([type=hidden]), select");
+  if (!control) return cell.textContent.trim();
+  if (control.tagName === "SELECT") return control.value ? (control.selectedOptions[0]?.textContent || "").trim() : "";
+  return control.value.trim();
+}
+// Code and name in their own columns, each one box: type and pick from the hint list; choosing
+// either the code or the name fills the other. The chosen id is kept in a hidden field.
+let entryListCounter = 0;
+function pickCell(kind, key, part, placeholder) {
+  entryListCounter += 1;
+  const list = `entry-list-${entryListCounter}`;
+  return `<input class="form-control" list="${list}" data-pick="${kind}" data-pick-key="${key}" data-pick-part="${part}" placeholder="${esc(placeholder)}" autocomplete="off" /><datalist id="${list}"></datalist>`;
+}
 function entryMaterialCell() {
-  return `<td class="entry-pick"><input class="form-control" type="search" data-row-material-search placeholder="Search code / name" /><select class="form-control" data-row-material><option value="">Loading…</option></select></td><td class="entry-name"><select class="form-control" data-row-material-name><option value="">Loading…</option></select></td>`;
+  return `<td class="entry-pick">${pickCell("material", "material", "code", "Type part code")}<input type="hidden" data-row-material /></td><td class="entry-name">${pickCell("material", "material", "name", "Type part name")}</td>`;
 }
 function entrySupplierCell(key, optional = false) {
-  const first = optional ? '<option value="">None / Direct</option>' : '<option value="">Select supplier</option>';
-  const codes = state.suppliers.map((supplier) => `<option value="${supplier.id}">${esc(supplier.code)}</option>`).join("");
-  const names = state.suppliers.map((supplier) => `<option value="${supplier.id}" data-code="${esc(supplier.code)}">${esc(supplier.name)}</option>`).join("");
-  return `<td class="entry-pick"><input class="form-control" type="search" data-row-supplier-search placeholder="Search code / name" /><select class="form-control" data-row-supplier="${key}">${first}${codes}</select></td><td class="entry-name"><select class="form-control" data-row-supplier-name="${key}">${first}${names}</select></td>`;
+  return `<td class="entry-pick">${pickCell("supplier", key, "code", optional ? "Type code (blank = Direct)" : "Type supplier code")}<input type="hidden" data-row-supplier="${key}" /></td><td class="entry-name">${pickCell("supplier", key, "name", optional ? "Type name (blank = Direct)" : "Type supplier name")}</td>`;
 }
 const entryRemoveCell = '<td><button type="button" class="text-button button-danger" data-entry-remove>Remove</button></td>';
+function fillHints(row, kind, key, items) {
+  row.pickItems = row.pickItems || {};
+  row.pickItems[`${kind}:${key}`] = items;
+  row.querySelectorAll(`[data-pick="${kind}"][data-pick-key="${key}"]`).forEach((input) => {
+    const byCode = input.dataset.pickPart === "code";
+    input.nextElementSibling.innerHTML = items.map((item) => `<option value="${esc(byCode ? item.code : item.name)}">${esc(byCode ? item.name : item.code)}</option>`).join("");
+  });
+}
 async function loadRowMaterials(row, search = "") {
-  const select = row.querySelector("[data-row-material]");
-  if (!select) return;
+  if (!row.querySelector('[data-pick="material"]')) return;
   try {
     const result = await api(`/api/planning/materials?${new URLSearchParams({ offset: "0", limit: "100", search, purchased: "true" })}`);
-    const keep = select.value;
-    select.innerHTML = `<option value="">Select part code</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.code)}</option>`).join("")}`;
-    const names = row.querySelector("[data-row-material-name]");
-    if (names) names.innerHTML = `<option value="">Select part name</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join("")}`;
-    select.value = result.items.some((item) => String(item.id) === keep) ? keep : (result.items.length === 1 && search ? String(result.items[0].id) : "");
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+    fillHints(row, "material", "material", result.items);
   } catch (error) { toast(error.message, true); }
 }
-// One listener set per entry table: searches, remove row; onChange(row, target) for extra wiring
+// Set the hidden id from the typed code / name (exact match, capitals ignored) and fill the other box
+function resolvePick(row, input) {
+  const { pick: kind, pickKey: key, pickPart: part } = input.dataset;
+  const items = row.pickItems?.[`${kind}:${key}`] || [];
+  const text = input.value.trim().toLowerCase();
+  const found = text ? items.find((item) => String(part === "code" ? item.code : item.name).toLowerCase() === text) : null;
+  const hidden = row.querySelector(kind === "material" ? "[data-row-material]" : `[data-row-supplier="${key}"]`);
+  const other = row.querySelector(`[data-pick="${kind}"][data-pick-key="${key}"][data-pick-part="${part === "code" ? "name" : "code"}"]`);
+  const before = hidden.value;
+  if (found) {
+    hidden.value = String(found.id);
+    const spelled = part === "code" ? found.code : found.name;  // the master's spelling ("st-steel" -> "ST-STEEL")
+    if (input.value !== spelled) input.value = spelled;
+    other.value = part === "code" ? found.name : found.code;
+  } else {
+    hidden.value = "";
+    if (!text) other.value = "";
+  }
+  input.classList.toggle("pick-unknown", Boolean(text) && !found);
+  if (hidden.value !== before) hidden.dispatchEvent(new Event("change", { bubbles: true }));
+}
+// Pick a row's item by id (used by tests and when filling a row from code)
+function setRowPick(row, kind, key, item) {
+  fillHints(row, kind, key, [item, ...(row.pickItems?.[`${kind}:${key}`] || []).filter((other) => other.id !== item.id)]);
+  const input = row.querySelector(`[data-pick="${kind}"][data-pick-key="${key}"][data-pick-part="code"]`);
+  input.value = item.code;
+  resolvePick(row, input);
+}
+// One listener set per entry table: hints, remove row, column filters; onChange(row, target) for extra wiring
 function bindEntryTable(tableId, newRow, onChange = null) {
-  const body = $(`#${tableId} tbody`);
+  const tableNode = $(`#${tableId}`);
+  const body = tableNode.tBodies[0];
   const add = () => {
     body.insertAdjacentHTML("beforeend", newRow());
     const row = body.lastElementChild;
+    row.querySelectorAll('[data-pick="supplier"][data-pick-part="code"]').forEach((input) => fillHints(row, "supplier", input.dataset.pickKey, state.suppliers));
     loadRowMaterials(row);
     return row;
   };
   body.addEventListener("input", (event) => {
-    const row = event.target.closest("tr");
-    if (event.target.matches("[data-row-material-search]")) {
+    const input = event.target.closest("[data-pick]");
+    if (!input) return;
+    const row = input.closest("tr");
+    resolvePick(row, input);
+    if (input.dataset.pick === "material" && !row.querySelector("[data-row-material]").value) {
       clearTimeout(row.searchTimer);
-      row.searchTimer = setTimeout(() => loadRowMaterials(row, event.target.value), 250);
-    }
-    if (event.target.matches("[data-row-supplier-search]")) {
-      const needle = event.target.value.trim().toLowerCase();
-      const select = event.target.nextElementSibling;
-      const nameSelect = row.querySelector(`[data-row-supplier-name="${select.dataset.rowSupplier}"]`);
-      // search matches the code or the name; both lists show the same suppliers
-      const matches = new Set([...nameSelect.options].filter((option) => option.value && (!needle || `${option.dataset.code} ${option.textContent}`.toLowerCase().includes(needle))).map((option) => option.value));
-      [select, nameSelect].forEach((list) => [...list.options].forEach((option) => { option.hidden = Boolean(option.value) && !matches.has(option.value); }));
-      const visible = [...select.options].filter((option) => option.value && !option.hidden);
-      if (needle && visible.length === 1) { select.value = visible[0].value; select.dispatchEvent(new Event("change", { bubbles: true })); }
+      row.searchTimer = setTimeout(async () => { await loadRowMaterials(row, input.value.trim()); resolvePick(row, input); }, 250);
     }
   });
   body.addEventListener("click", (event) => {
@@ -1211,16 +1249,19 @@ function bindEntryTable(tableId, newRow, onChange = null) {
     if (body.rows.length > 1) event.target.closest("tr").remove();
     else toast("Keep at least one row (leave it empty if not needed).", true);
   });
-  // keep each code list and its name list on the same choice
-  body.addEventListener("change", (event) => {
-    const target = event.target;
-    const row = target.closest("tr");
-    if (target.matches("[data-row-material]")) { const names = row.querySelector("[data-row-material-name]"); if (names) names.value = target.value; }
-    if (target.matches("[data-row-supplier]")) { const names = row.querySelector(`[data-row-supplier-name="${target.dataset.rowSupplier}"]`); if (names) names.value = target.value; }
-    if (target.matches("[data-row-material-name]")) { const codes = row.querySelector("[data-row-material]"); codes.value = target.value; codes.dispatchEvent(new Event("change", { bubbles: true })); }
-    if (target.matches("[data-row-supplier-name]")) { const codes = row.querySelector(`[data-row-supplier="${target.dataset.rowSupplierName}"]`); codes.value = target.value; codes.dispatchEvent(new Event("change", { bubbles: true })); }
-  });
-  if (onChange) body.addEventListener("change", (event) => { if (!event.target.matches("[data-row-material-name], [data-row-supplier-name]")) onChange(event.target.closest("tr"), event.target); });
+  if (onChange) body.addEventListener("change", (event) => { if (!event.target.matches("[data-pick]")) onChange(event.target.closest("tr"), event.target); });
+  // column filters: options from the typed values when a filter opens; Apply hides other rows
+  tableNode.querySelectorAll("thead .entry-column-filter").forEach((details) => details.addEventListener("toggle", () => {
+    if (!details.open) return;
+    const column = details.closest("th").cellIndex;
+    const chosen = new Set([...details.querySelectorAll("[data-column-value]:checked")].map((input) => input.value));
+    const values = [...new Set([...body.rows].map((row) => cellText(row.cells[column])).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    details.querySelector(".multi-options").innerHTML = values.length ? values.map((value) => `<label><input type="checkbox" data-column-value="true" value="${esc(value)}" ${chosen.has(value) ? "checked" : ""} />${esc(value)}</label>`).join("") : '<span class="subtle">No values typed yet</span>';
+  }));
+  tableNode.closest(".entry-wrap").applyTableFilters = () => {
+    const selections = [...tableNode.querySelectorAll("thead th")].map((th) => [th.cellIndex, [...th.querySelectorAll("[data-column-value]:checked")].map((input) => input.value)]).filter(([, values]) => values.length);
+    [...body.rows].forEach((row) => { row.hidden = selections.some(([column, values]) => !values.includes(cellText(row.cells[column]))); });
+  };
   add();
   return { add, rows: () => [...body.rows], reset: () => { body.innerHTML = ""; add(); } };
 }
@@ -1573,21 +1614,14 @@ async function renderSupplierControl() {
   const tabs = `<div class="tab-strip">${SUPPLIER_TABS.map((name) => `<button class="tab-button ${tab === name ? "active" : ""}" data-supplier-tab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
   let body = "";
   if (tab === "Supplier/material relationship") {
-    if (!RELATIONSHIP_SUBTABS.includes(state.relSubTab)) state.relSubTab = RELATIONSHIP_SUBTABS[0];
-    const subTabs = `<div class="tab-strip sub-tab-strip">${RELATIONSHIP_SUBTABS.map((name) => `<button class="tab-button ${state.relSubTab === name ? "active" : ""}" data-rel-subtab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
-    const relEntry = `<div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
-        ${entryTable("relEntryTable", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Tier (Direct, T1, T2…)", "Parent supplier code (for T1+)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}`;
-    body = subTabs + (state.relSubTab === RELATIONSHIP_SUBTABS[0]
-      ? `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Type one row per material and supplier, like an Excel sheet; + Add row for more, then Save all (all rows or none). SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier. Saved lines are edited or deleted in Supplier/material coverage.")}
-        ${relEntry}
-      </section>`
-      : `<section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template, or type rows in the table below (+ Add row, Save all). One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file (or all typed rows) is rejected if any row is wrong.")}
+    body = `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Who supplies each part you buy, in what share (SOB), at what price and lead time. Upload your own sheet as it is or the template, or type rows in the table (+ Add row, Save all). One row per part and supplier. Needed: part code and supplier. Optional: Tier (blank = Direct; T1/T2 also need the parent supplier), SOB % (blank = 100), unit price, currency, lead time, MOQ, buffer days. SOB for a part at the same tier and parent is limited to 100%. Only purchased parts (no in-house BOM, no negative BOM quantity). New supplier names in a file join the Supplier register; an existing relationship is updated. The whole file, or all typed rows, is rejected if any row is wrong. Saved lines are edited or deleted in Supplier/material coverage.")}
         <form id="supplierPartUploadForm" class="panel-body inline-upload">
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
         </form>
-        ${relEntry}
-      </section>`);
+        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
+        ${entryTable("relEntryTable", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Tier (Direct, T1, T2…)", "Parent supplier code (for T1+)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
+      </section>`;
   } else if (tab === "Upload supplier stock") {
     body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
@@ -1648,7 +1682,7 @@ async function renderSupplierControl() {
   content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", "")}${tabs}${body}`;
   bindSupplierSearch(content);
 
-  if (tab === "Supplier/material relationship" && $("#relEntryTable")) {
+  if (tab === "Supplier/material relationship") {
     const entries = bindEntryTable("relEntryTable", relationshipEntryRow);
     $("#relAddRow").addEventListener("click", () => entries.add());
     $("#relSaveAll").addEventListener("click", async () => {
@@ -1656,8 +1690,11 @@ async function renderSupplierControl() {
       for (const [index, row] of entries.rows().entries()) {
         const material = Number(cellValue(row, "[data-row-material]"));
         const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
-        if (!material && !supplier) continue;  // empty row
-        if (!material || !supplier) return toast(`Row ${index + 1}: choose the material and the supplier.`, true);
+        const typed = (key, part) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="${part}"]`).trim();
+        if (!material && !supplier && !typed("material", "code") && !typed("supplier", "code")) continue;  // empty row
+        if (!material) return toast(typed("material", "code") ? `Row ${index + 1}: part ${typed("material", "code")} is not a purchased part in T1 Material Master; pick it from the hint list.` : `Row ${index + 1}: type the part code.`, true);
+        if (!supplier) return toast(typed("supplier", "code") ? `Row ${index + 1}: supplier ${typed("supplier", "code")} is not in the Supplier register; pick it from the hint list.` : `Row ${index + 1}: type the supplier.`, true);
+        if (typed("parent", "code") && !Number(cellValue(row, '[data-row-supplier="parent"]'))) return toast(`Row ${index + 1}: parent supplier ${typed("parent", "code")} is not in the Supplier register.`, true);
         const value = (key) => cellValue(row, `[data-f="${key}"]`);
         rows.push({ material_id: material, supplier_id: supplier, tier: value("tier").trim() || "Direct",
           parent_supplier_id: Number(cellValue(row, '[data-row-supplier="parent"]')) || null,
@@ -1673,7 +1710,7 @@ async function renderSupplierControl() {
       } catch (error) { toast(error.message, true); }
     });
   }
-  if (tab === "Supplier/material relationship" && state.relSubTab === RELATIONSHIP_SUBTABS[1]) {
+  if (tab === "Supplier/material relationship") {
     $("#supplierPartUploadForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -2298,7 +2335,7 @@ function openModal(type, record = {}) {
 // "14 days") sort as numbers, text alphabetically. Tree tables keep each parent's lower-level
 // rows directly below it: groups of rows move together.
 function sortValue(cell) {
-  const text = (cell?.textContent || "").trim();
+  const text = cellText(cell);
   const match = text.replace(/^[₹$€£¥]\s*/, "").replace(/,/g, "").match(/^-?\d+(\.\d+)?/);
   return { text, number: match ? Number(match[0]) : null };
 }
@@ -2750,8 +2787,6 @@ document.addEventListener("click", async (event) => {
       return renderPurchaseOrders();
     } catch (error) { toast(error.message, true); }
   }
-  const relSubTab = event.target.closest("[data-rel-subtab]");
-  if (relSubTab) { state.relSubTab = relSubTab.dataset.relSubtab; return renderSupplierControl(); }
   const supplierEdit = event.target.closest("[data-edit-supplier]");
   if (supplierEdit) return openSupplierEdit(state.suppliers.find((supplier) => String(supplier.id) === supplierEdit.dataset.editSupplier));
   const supplierDelete = event.target.closest("[data-delete-supplier]");

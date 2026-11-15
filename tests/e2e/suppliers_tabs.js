@@ -72,36 +72,55 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     check("Upload suppliers in bulk (2 added)", (await toastText()).includes("2 supplier(s) added"), await toastText());
   }
 
-  // Relationship sub-tabs + entry table
+  // Relationship page: one panel (upload row, then + Add row / Save all and the typing table)
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
   await page.waitForSelector("#relEntryTable tbody tr");
-  const subTabs = await page.locator("[data-rel-subtab]").allTextContents();
-  check("Relationship tab has two sub-tabs", JSON.stringify(subTabs) === JSON.stringify(["Supplier/material relationship", "Upload supplier/material relationships"]), JSON.stringify(subTabs));
+  check("No 'Upload supplier/material relationships' sub-tab any more", (await page.locator("[data-rel-subtab]").count()) === 0);
+  check("Upload section on the relationship page: upload row, then + Add row / Save all, then the table", await page.evaluate(() => {
+    const form = document.querySelector("#supplierPartUploadForm"), table = document.querySelector("#relEntryTable"), add = document.querySelector("#relAddRow");
+    return form && form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }) && await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
   check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 16 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
-  const row1 = page.locator("#relEntryTable tbody tr").nth(0);
-  await row1.locator("[data-row-material-search]").fill("ST-");
-  await page.waitForFunction(() => { const t = [...document.querySelectorAll("#relEntryTable tbody tr")[0].querySelectorAll("[data-row-material] option")].map((o) => o.textContent); return t.some((x) => x.includes("ST-PCB")) && t.length <= 4; });
-  const options = (await row1.locator("[data-row-material] option").allTextContents()).filter((t) => t.startsWith("ST-")).map((t) => t.split(" · ")[0]).sort();
-  check("Material list = purchased parts only (no Motor with BOM, no negative-qty Scrap)", JSON.stringify(options) === JSON.stringify(["ST-PCB", "ST-STEEL"]), JSON.stringify(options));
-  await row1.locator("[data-row-material]").selectOption(String(steel));
-  await row1.locator("[data-row-supplier-search]").first().fill("apex");
-  const relHeads = await page.locator("#relEntryTable thead th").allTextContents();
+  const relHeads = await page.locator("#relEntryTable thead th summary").allTextContents();
   check("Code and name in separate columns (part, supplier, parent supplier)", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Parent supplier code (for T1+)", "Parent supplier name"].every((h) => relHeads.includes(h)), JSON.stringify(relHeads.slice(0, 7)));
-  check("Choosing the part code fills the part name", (await row1.locator("[data-row-material-name] option:checked").textContent()) === "Steel 0.8");
-  const visible = await row1.locator('[data-row-supplier-name="supplier"] option').evaluateAll((os) => os.filter((o) => !o.hidden && o.value).map((o) => o.textContent));
-  check("Supplier search filters the row's supplier list (one match is picked)", visible.length === 1 && visible[0].toLowerCase().includes("apex") && (await row1.locator('[data-row-supplier="supplier"]').inputValue()) !== "", JSON.stringify(visible));
-  check("Supplier code column shows the code, name column the name", (await row1.locator('[data-row-supplier="supplier"] option:checked').textContent()).startsWith("SUP-") && (await row1.locator('[data-row-supplier-name="supplier"] option:checked').textContent()).includes("Apex"));
+  check("Column headings have the filter (sort, search, Select all, Clear all)", await page.locator("#relEntryTable thead th").nth(0).evaluate((th) => !!th.querySelector("[data-column-sort]") && !!th.querySelector(".multi-search") && !!th.querySelector("[data-column-select-all]") && !!th.querySelector("[data-column-clear]")));
+  const pick = (row, key, part) => row.locator(`[data-pick-key="${key}"][data-pick-part="${part}"]`);
+  const hints = (row, key, part) => pick(row, key, part).evaluate((input) => [...input.list.options].map((o) => o.value));
+  const row1 = page.locator("#relEntryTable tbody tr").nth(0);
+  // typing gives hints; only purchased parts
+  await pick(row1, "material", "code").fill("ST-");
+  await page.waitForFunction(() => { const input = document.querySelector('#relEntryTable [data-pick-key="material"][data-pick-part="code"]'); const v = [...input.list.options].map((o) => o.value); return v.includes("ST-PCB") && v.length <= 3; });
+  check("Typing a part code shows hints = purchased parts only (no Motor with BOM, no negative-qty Scrap)", JSON.stringify((await hints(row1, "material", "code")).filter((v) => v.startsWith("ST-")).sort()) === JSON.stringify(["ST-PCB", "ST-STEEL"]), JSON.stringify(await hints(row1, "material", "code")));
+  check("Each hint also shows the name", await pick(row1, "material", "code").evaluate((input) => [...input.list.options].some((o) => o.value === "ST-STEEL" && o.textContent === "Steel 0.8")));
+  await pick(row1, "material", "code").fill("st-steel");
+  await page.waitForFunction((id) => document.querySelector("#relEntryTable [data-row-material]").value === String(id), steel);
+  check("Picking the part code (any capitals) fills the part name and shows the master's spelling", (await pick(row1, "material", "name").inputValue()) === "Steel 0.8" && (await pick(row1, "material", "code").inputValue()) === "ST-STEEL");
+  await pick(row1, "supplier", "name").fill("Apex Precision Works");
+  check("Picking the supplier name fills the supplier code", (await pick(row1, "supplier", "code").inputValue()) === "SUP-1001" && (await row1.locator('[data-row-supplier="supplier"]').inputValue()) !== "");
+  check("Supplier hints list code with name", await pick(row1, "supplier", "code").evaluate((input) => [...input.list.options].some((o) => o.value === "SUP-1001" && o.textContent === "Apex Precision Works")));
   await row1.locator('[data-f="sob_percent"]').fill("60");
   await row1.locator('[data-f="unit_price"]').fill("105");
-  // second row: PCB with the same supplier
+  // second row: picked by part name; supplier by code
   await page.click("#relAddRow");
   const row2 = page.locator("#relEntryTable tbody tr").nth(1);
-  await row2.locator("[data-row-material-search]").fill("ST-PCB");
+  await pick(row2, "material", "name").fill("PCB board");
   await page.waitForFunction(() => document.querySelectorAll("#relEntryTable tbody tr")[1].querySelector("[data-row-material]").value !== "");
-  const apexId = await row1.locator('[data-row-supplier="supplier"]').inputValue();
-  await row2.locator('[data-row-supplier-name="supplier"]').selectOption(apexId);
-  check("Choosing the supplier name fills the supplier code", (await row2.locator('[data-row-supplier="supplier"]').inputValue()) === apexId);
+  check("Picking the part name fills the part code", (await pick(row2, "material", "code").inputValue()) === "ST-PCB");
+  await pick(row2, "supplier", "code").fill("SUP-1001");
   await row2.locator('[data-f="unit_price"]').fill("1800");
+  // column filter and sort work on the typed values
+  const partHead = page.locator("#relEntryTable thead th").nth(0);
+  await partHead.locator("summary").click();
+  await page.waitForFunction(() => document.querySelectorAll("#relEntryTable thead th")[0].querySelectorAll("[data-column-value]").length === 2);
+  await partHead.locator('[data-column-value][value="ST-PCB"]').check();
+  await partHead.locator("[data-column-apply]").click();
+  check("Column filter on typed part codes shows only the chosen rows", await row1.isHidden() && await row2.isVisible());
+  await partHead.locator("summary").click();
+  await partHead.locator("[data-column-clear]").click();
+  check("Clear all shows every row again", await row1.isVisible() && await row2.isVisible());
+  await partHead.locator("summary").click();
+  await partHead.locator('[data-column-sort="desc"]').click();
+  check("Sort Z → A on typed part codes", JSON.stringify(await page.locator('#relEntryTable tbody tr [data-pick-key="material"][data-pick-part="code"]').evaluateAll((inputs) => inputs.map((i) => i.value))) === JSON.stringify(["ST-STEEL", "ST-PCB"]));
   // third row left empty: ignored
   await page.click("#relAddRow");
   await clearToast();
@@ -112,34 +131,31 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const links = await api("GET", "/api/planning/supplier-parts?limit=1000&search=ST-");
   const saved = links.items.find((l) => l.material_code === "ST-STEEL");
   check("Saved values (SOB 60, price 105, INR)", saved && saved.sob_percent === 60 && saved.unit_price === 105 && saved.currency === "INR", saved && JSON.stringify([saved.sob_percent, saved.unit_price, saved.currency]));
-  // an error names the row and saves nothing
+  // a code that is not a purchased part is refused before saving
   const r = page.locator("#relEntryTable tbody tr").nth(0);
-  await r.locator("[data-row-material-search]").fill("ST-STEEL");
-  await page.waitForFunction(() => document.querySelectorAll("#relEntryTable tbody tr")[0].querySelector("[data-row-material]").value !== "");
-  await r.locator("[data-row-supplier-search]").first().fill("koyo");
+  await pick(r, "material", "code").fill("NOPE-1");
+  await pick(r, "supplier", "code").fill("SUP-1003");
+  await page.waitForTimeout(400);
+  check("An unknown code is marked while typing", await pick(r, "material", "code").evaluate((input) => input.classList.contains("pick-unknown")));
+  await clearToast();
+  await page.click("#relSaveAll");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
+  check("An unknown part code is refused with the row number", (await toastText()).includes("Row 1: part NOPE-1 is not a purchased part"), await toastText());
+  // an error from the server names the row and saves nothing
+  await pick(r, "material", "code").fill("ST-STEEL");
+  await page.waitForFunction(() => document.querySelector("#relEntryTable [data-row-material]").value !== "");
   await r.locator('[data-f="sob_percent"]').fill("50");
   await clearToast();
   await page.click("#relSaveAll");
   await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
   check("Over 100% SOB is refused with the row number", (await toastText()).includes("Row 1: Supplier SOB cannot exceed 100%"), await toastText());
-
-  await page.click('[data-rel-subtab="Upload supplier/material relationships"]');
-  await page.waitForSelector("#supplierPartUploadForm");
-  check("Upload sub-tab has the upload form and template", await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
-  check("Upload sub-tab: one panel, upload row first, then + Add row / Save all and the table", await page.evaluate(() => {
-    const form = document.querySelector("#supplierPartUploadForm"), table = document.querySelector("#relEntryTable"), add = document.querySelector("#relAddRow");
-    return form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
-  }));
-  check("Upload sub-tab also has the typing table with + Add row and Save all", (await page.locator("#relEntryTable tbody tr").count()) === 1 && await page.locator("#relAddRow").isVisible() && await page.locator("#relSaveAll").isVisible());
-  const u1 = page.locator("#relEntryTable tbody tr").nth(0);
-  await u1.locator("[data-row-material-search]").fill("ST-PCB");
-  await page.waitForFunction(() => document.querySelector("#relEntryTable [data-row-material]").value !== "");
-  await u1.locator("[data-row-supplier-search]").first().fill("koyo");
-  await u1.locator('[data-f="sob_percent"]').fill("0");
+  await pick(r, "material", "code").fill("ST-PCB");
+  await page.waitForFunction(() => document.querySelector("#relEntryTable [data-pick-key='material'][data-pick-part='name']").value === "PCB board");
+  await r.locator('[data-f="sob_percent"]').fill("0");
   await clearToast();
   await page.click("#relSaveAll");
   await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("saved"));
-  check("Save all works on the upload sub-tab", (await toastText()).includes("1 supplier/material relationship saved"), await toastText());
+  check("Save a 0% relationship (Koyo for PCB)", (await toastText()).includes("1 supplier/material relationship saved"), await toastText());
   if (process.env.REL_XLSX && fs.existsSync(process.env.REL_XLSX)) {
     await page.setInputFiles('#supplierPartUploadForm input[type="file"]', process.env.REL_XLSX);
     await page.click('#supplierPartUploadForm button[type="submit"]');
@@ -166,8 +182,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-supplier-tab="Upload supplier stock"]');
   await page.waitForSelector("#stockEntryTable tbody tr");
   const s1 = page.locator("#stockEntryTable tbody tr").nth(0);
-  await s1.locator("[data-row-supplier-search]").fill("apex");
+  await s1.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-1001");
   await page.waitForFunction(() => [...document.querySelectorAll("#stockEntryTable [data-row-link] option")].some((o) => o.textContent.includes("ST-STEEL")));
+  check("Stock row: typing the supplier code fills its name", (await s1.locator('[data-pick-key="supplier"][data-pick-part="name"]').inputValue()) === "Apex Precision Works");
   check("Stock tab: one panel, upload row first, then + Add row / Save all and the table", await page.evaluate(() => {
     const form = document.querySelector("#supplierStockForm"), table = document.querySelector("#stockEntryTable"), add = document.querySelector("#stockAddRow");
     return form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) && !document.body.textContent.includes("Or upload a workbook");
@@ -180,7 +197,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForFunction(() => document.querySelector("#stockListTable")?.textContent.includes("ST-STEEL"));
   const stockCells = await page.locator('#stockListTable tr:has-text("ST-STEEL") td').allTextContents();
   check("Stock saved without Excel and listed for the month", stockCells.includes("500") && stockCells.includes("400"), JSON.stringify(stockCells));
-  await s1.locator("[data-row-supplier-search]").fill("apex");
+  await page.locator("#stockEntryTable tbody tr").nth(0).locator('[data-pick-key="supplier"][data-pick-part="name"]').fill("Apex Precision Works");
   await page.waitForFunction(() => document.querySelector("#stockEntryTable [data-row-link]").value !== "");
   await page.locator("#stockEntryTable tbody tr").nth(0).locator('[data-f="quantity"]').fill("10");
   await page.locator("#stockEntryTable tbody tr").nth(0).locator('[data-f="available_quantity"]').fill("20");
@@ -206,9 +223,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForSelector("#transferEntryTable tbody tr");
   const t1 = page.locator("#transferEntryTable tbody tr").nth(0);
   check("Transfer entry is a table row", (await page.locator("#transferEntryTable thead th").count()) === 10);
-  await t1.locator("[data-row-material-search]").fill("ST-MOTOR");
-  await page.waitForTimeout(800);
-  check("Transfer material list excludes in-house parts", !(await t1.locator("[data-row-material] option").allTextContents()).some((t) => t.includes("ST-MOTOR")));
+  await t1.locator('[data-pick-key="material"][data-pick-part="code"]').fill("ST-");
+  await page.waitForFunction(() => document.querySelector('#transferEntryTable [data-pick-key="material"][data-pick-part="code"]').list.options.length > 0);
+  check("Transfer part hints exclude in-house parts", !(await t1.locator('[data-pick-key="material"][data-pick-part="code"]').evaluate((input) => [...input.list.options].map((o) => o.value))).includes("ST-MOTOR"));
 
   // Column width remembered on the Supplier register tab
   await page.click('[data-supplier-tab="Supplier register"]');
@@ -232,8 +249,6 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Width remembered after changing tab", Math.abs(back[1] - after[1]) <= 3, `${back[1]}px`);
   // entry table columns can be widened too
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
-  await page.click('[data-rel-subtab="Supplier/material relationship"]');
-  await page.waitForSelector('[data-rel-subtab="Supplier/material relationship"].active');
   await page.waitForSelector("#relEntryTable tbody tr");
   await page.waitForTimeout(300);
   const entryHead = page.locator("#relEntryTable thead th").nth(2);

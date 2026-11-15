@@ -527,3 +527,4 @@ th.sorted-desc summary::after { content: " ▼"; font-size: 10px; color: #247ac0
 .subtable-with-add .toolbar-add { margin-left: auto; }
 .entry-table .entry-pick .form-control { width: 200px; }
 .entry-table .entry-name .form-control { width: 240px; }
+.entry-table input.pick-unknown { border-color: #e0a100; background: #fffaf0; }
