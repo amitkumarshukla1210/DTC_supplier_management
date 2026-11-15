@@ -93,6 +93,12 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-bom-tab="Material Master"]');
   await page.waitForSelector("#materialMasterTable table");
   check("T1 Material Master: Add material and Model Master Add line at the right-hand end", await atRight('[data-action="new-material"]') && await atRight('[data-action="new-model"]'));
+  const matHeads = await page.locator("#materialMasterTable thead th summary").allTextContents();
+  check("T1 Material Master: 'Used in' column right after Material name", JSON.stringify(matHeads.slice(0, 3)) === JSON.stringify(["Material code", "Material name", "Used in"]), JSON.stringify(matHeads.slice(0, 3)));
+  const usedRow = page.locator('#materialMasterTable tbody tr:has-text("SB-PART")');
+  const unusedRow = page.locator('#materialMasterTable tbody tr:has-text("MAT-101")');
+  check("A code in a BOM shows where (SB-PART: L1) and is not red", (await usedRow.locator("td").nth(2).textContent()) === "L1" && !(await usedRow.evaluate((tr) => tr.classList.contains("material-unused"))));
+  check("A code in no BOM shows 'Not used' in red", (await unusedRow.locator("td").nth(2).textContent()) === "Not used" && await unusedRow.evaluate((tr) => tr.classList.contains("material-unused") && getComputedStyle(tr.cells[0]).color === "rgb(180, 35, 24)"));
   check("T1 Material Master: Add material above the table", await above('[data-action="new-material"]', "#materialMasterTable table"));
   await page.click('[data-bom-tab="T2 Material Master"]');
   await page.waitForSelector("#tierMaterialTable tbody tr");

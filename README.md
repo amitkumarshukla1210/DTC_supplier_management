@@ -46,6 +46,10 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 
 Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹1,800", "40%" or "14 days" sort as numbers; the sorted column is marked ▲ / ▼; in BOM tree tables each parent keeps its lower-level rows under it). Paged tables sort the rows shown on the page. **Add** buttons (Add supplier, Add line, Add material, Add T2/T3 material, + Add row / Save all) sit right above their table, at the right-hand end. Upload pages use one panel: heading, upload row (workbook, Upload, Download template), then + Add row / Save all and the typing table.
 
+## T1 Material Master: Used in
+
+The **Used in** column (right after Material name, also in the Excel / PDF download) shows the BOM levels a code is a line of: **L1** (Model BOM Level 1), **L2** (a Level 2 Part BOM, under an L1 part), **L3** (a Level 3 Part BOM, under an L2 part), or combinations such as **L1 & L2**, **L2 & L3**, **L1 & L3**, **L1 & L2 & L3**. A code used in no BOM shows **Not used** and its row is red.
+
 ## Category list
 
 **Product Master → Category** holds the one category list used for parts (T1, T2, T3) and suppliers; every category field is a dropdown from it with **+ Add new category**. Add, rename (every part and supplier using it follows) or delete (refused while used). A new category typed in a dropdown or found in an Excel upload is added to the list automatically, written as in the list when only the capitals differ ("steel raw MATERIAL" → "Steel Raw material").

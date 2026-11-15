@@ -1881,6 +1881,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return Response(status_code=204)
 
+    def bom_levels(db: Session) -> dict[int, list[str]]:
+        """Where each T1 code is used: L1 = a line of Model BOM Level 1; L2 = a line of a Level 2
+        Part BOM (under an L1 part); L3 = a line of a Level 3 Part BOM (under an L2 part)."""
+        level1 = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
+        level2 = set(db.scalars(select(BOMComponent.child_item_id).where(BOMComponent.parent_item_id.in_(level1)).distinct()).all()) if level1 else set()
+        level3 = set(db.scalars(select(BOMComponent.child_item_id).where(BOMComponent.parent_item_id.in_(level2)).distinct()).all()) if level2 else set()
+        levels: dict[int, list[str]] = {}
+        for name, ids in (("L1", level1), ("L2", level2), ("L3", level3)):
+            for item_id in ids:
+                levels.setdefault(item_id, []).append(name)
+        return levels
+
     @app.get("/api/planning/materials")
     def materials(request: Request, offset: int = 0, limit: int = 100, search: str = "", purchased: bool = False):
         current_user(request)
@@ -1896,10 +1908,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
             rows = db.scalars(statement.offset(offset).limit(limit)).all()
             can_price = _check_price_access(request)
+            levels = bom_levels(db)
             return {
                 "total": total, "offset": offset, "limit": limit,
                 "items": [{
                     "id": item.id, "code": item.code, "name": item.name, "category": item.category,
+                    "used_in": " & ".join(levels.get(item.id, [])),  # "" = not used in any BOM
                     "uom": item.uom, "stock_on_hand": item.stock_on_hand, "reorder_level": item.reorder_level,
                     "buffer_days": getattr(item, "buffer_days", 0),
                     **({"unit_cost": item.unit_cost, "currency": item.currency} if can_price else {}),
@@ -4965,10 +4979,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             with open_db() as db:
                 materials = db.scalars(select(Item).order_by(Item.code)).all()
                 can_price = _check_price_access(request)
-                headers = ["Material code", "Material name", "Category", "Unit", "On hand", "Buffer days"]
+                headers = ["Material code", "Material name", "Used in", "Category", "Unit", "On hand", "Buffer days"]
                 if can_price:
                     headers += ["Unit cost", "Currency"]
-                rows = [[item.code, item.name, item.category, item.uom, item.stock_on_hand, getattr(item, "buffer_days", 0), *([item.unit_cost, item.currency] if can_price else [])] for item in materials]
+                levels = bom_levels(db)
+                rows = [[item.code, item.name, " & ".join(levels.get(item.id, [])) or "Not used", item.category, item.uom, item.stock_on_hand, getattr(item, "buffer_days", 0), *([item.unit_cost, item.currency] if can_price else [])] for item in materials]
         elif kind == "products":
             with open_db() as db:
                 rows = [[product.code, product.name] for product in db.scalars(select(Product).where(Product.code != MODEL_CATALOG_PRODUCT_CODE).order_by(Product.code)).all()]

@@ -1979,6 +1979,27 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(sqlite3.connect(db_path).execute("SELECT tier FROM supplier_parts ORDER BY id").fetchall(), [("T1",), ("T2",), ("T3",)])
         again.__exit__(None, None, None)
 
+    def test_t1_material_master_used_in_levels(self):
+        # Model UI-M: L1 = MOTOR, STEEL, WIRE, GASKET; MOTOR (L2) = STATOR, STEEL, GASKET, BOLT;
+        # STATOR (L3) = STEEL, COPPER, WIRE, BOLT. SPARE is in no BOM.
+        def material(code):
+            return self.client.post("/api/planning/materials", json={"code": f"UI-{code}", "name": code.title(), "uom": "PCS"}).json()["id"]
+        ids = {code: material(code) for code in ("MOTOR", "STEEL", "WIRE", "GASKET", "STATOR", "BOLT", "COPPER", "SPARE")}
+        model = self.client.post("/api/planning/models", json={"code": "UI-M", "name": "Used-in model"}).json()["id"]
+        for code in ("MOTOR", "STEEL", "WIRE", "GASKET"):
+            self.assertEqual(self.client.post(f"/api/planning/model-bom/{model}", json={"material_id": ids[code], "quantity": 1, "uom": "PCS"}).status_code, 201)
+        lines = lambda codes: [{"child_item_id": ids[c], "quantity": 1} for c in codes]
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{ids['MOTOR']}/new", json={"tab": "Level 2 Part BOM", "lines": lines(["STATOR", "STEEL", "GASKET", "BOLT"])}).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/planning/part-bom/{ids['STATOR']}/new", json={"tab": "Level 3 Part BOM", "lines": lines(["STEEL", "COPPER", "WIRE", "BOLT"])}).status_code, 201)
+        used = {m["code"]: m["used_in"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
+        self.assertEqual(used, {"UI-MOTOR": "L1", "UI-STATOR": "L2", "UI-COPPER": "L3", "UI-GASKET": "L1 & L2", "UI-BOLT": "L2 & L3",
+                                "UI-WIRE": "L1 & L3", "UI-STEEL": "L1 & L2 & L3", "UI-SPARE": ""})
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/tables/materials/xlsx").content)).active
+        header = next(r for r in sheet.iter_rows(values_only=True) if r and r[0] == "Material code")
+        self.assertEqual(list(header[:3]), ["Material code", "Material name", "Used in"])
+        values = {r[0]: r[2] for r in sheet.iter_rows(values_only=True) if r and str(r[0]).startswith("UI-")}
+        self.assertEqual((values["UI-SPARE"], values["UI-STEEL"]), ("Not used", "L1 & L2 & L3"))
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns
