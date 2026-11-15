@@ -1223,7 +1223,7 @@ function transferEntryRow() {
 function openSupplierEdit(supplier) {
   if (!supplier) return;
   $("#modalTitle").textContent = `Edit ${supplier.code} · ${supplier.name}`;
-  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${categoryField(supplier.category)}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
+  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier code", "code", "text", { required: true, maxlength: 24, value: supplier.code })}${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${categoryField(supplier.category)}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
   modalLayer.hidden = false;
   bindCategoryField($("#supplierEditForm"));
   $("#supplierEditForm").addEventListener("submit", async (event) => {
@@ -1559,12 +1559,16 @@ async function renderSupplierControl() {
   if (tab === "Supplier/material relationship") {
     if (!RELATIONSHIP_SUBTABS.includes(state.relSubTab)) state.relSubTab = RELATIONSHIP_SUBTABS[0];
     const subTabs = `<div class="tab-strip sub-tab-strip">${RELATIONSHIP_SUBTABS.map((name) => `<button class="tab-button ${state.relSubTab === name ? "active" : ""}" data-rel-subtab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
+    const relEntry = `${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
+        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>`;
     body = subTabs + (state.relSubTab === RELATIONSHIP_SUBTABS[0]
       ? `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Type one row per material and supplier, like an Excel sheet; + Add row for more, then Save all (all rows or none). SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier. Saved lines are edited or deleted in Supplier/material coverage.")}
-        ${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
-        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
+        ${relEntry}
       </section>`
-      : `<section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template. One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
+      : `<section class="panel table-panel">${panelHeader("Type relationships", "Type one row per material and supplier (+ Add row, Save all; all rows or none), or upload a workbook below.")}
+        ${relEntry}
+      </section>
+      <section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template. One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
         <form id="supplierPartUploadForm" class="panel-body inline-upload">
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
@@ -1591,7 +1595,9 @@ async function renderSupplierControl() {
     </section>`;
   } else if (tab === "Supplier register") {
     const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
-    body = `<section class="panel table-panel">${panelHeader("Supplier register")}<div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
+    body = `<section class="panel table-panel">${panelHeader("Supplier register", "Add one supplier with Add supplier, or many at once with an Excel upload (your own headings are fine). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.")}
+      <form id="supplierUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier list workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload suppliers</button><a class="button" href="/api/planning/templates/suppliers.xlsx">Download template</a></form>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
   } else if (tab === "Supplier-to-supplier material transfer") {
     body = `<section class="panel table-panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus, one row per transfer; + Add row for more, then Save all. The receiving supplier is credited in projected coverage in the transfer month. Saved transfers are listed in Transfer schedule.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
@@ -1630,7 +1636,7 @@ async function renderSupplierControl() {
   content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", `<button class="button" data-action="new-supplier">Add supplier</button>`)}${tabs}${body}`;
   bindSupplierSearch(content);
 
-  if (tab === "Supplier/material relationship" && state.relSubTab === RELATIONSHIP_SUBTABS[0]) {
+  if (tab === "Supplier/material relationship" && $("#relEntryTable")) {
     const entries = bindEntryTable("relEntryTable", relationshipEntryRow);
     $("#relAddRow").addEventListener("click", () => entries.add());
     $("#relSaveAll").addEventListener("click", async () => {
@@ -1733,6 +1739,17 @@ async function renderSupplierControl() {
     });
   }
   if (tab === "Supplier register") {
+    $("#supplierUploadForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      try {
+        const result = await uploadExcel("/api/suppliers/upload", new FormData(form).get("workbook"));
+        toast(`${result.rows} row(s): ${result.added} supplier(s) added, ${result.updated} updated`);
+        form.reset();
+        await reloadCategories();
+        renderSupplierControl();
+      } catch (error) { toast(error.message, true); }
+    });
     setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Category", index: 2 }, { title: "Approval", index: 7 }]);
     $("#supplierSearch").addEventListener("input", applyTableSearch);
   }

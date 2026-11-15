@@ -695,6 +695,16 @@ TIER_MATERIAL_COLUMN_ALIASES = {
     "reference_price": "unit_price", "currency": "currency",
 }
 
+SUPPLIER_COLUMN_ALIASES = {
+    "supplier_code": "code", "code": "code", "vendor_code": "code", "supplier_id": "code", "vendor_id": "code",
+    "supplier_name": "name", "supplier": "name", "name": "name", "vendor_name": "name", "vendor": "name",
+    "category": "category", "supplier_category": "category", "commodity": "category",
+    "country": "country", "contact": "contact_name", "contact_person": "contact_name", "contact_name": "contact_name",
+    "email": "email", "e-mail": "email", "email_id": "email", "mail": "email",
+    "phone": "phone", "mobile": "phone", "phone_number": "phone", "contact_number": "phone", "mobile_number": "phone",
+    "approval": "status", "status": "status", "approval_status": "status",
+}
+
 ALTERNATE_CODE_COLUMN_ALIASES = {
     "main_code": "main_code", "main_part_code": "main_code", "part_code": "main_code", "material_code": "main_code",
     "main_material_code": "main_code", "original_code": "main_code", "code": "main_code",
@@ -2672,6 +2682,78 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return Response(status_code=204)
 
+    @app.post("/api/suppliers/upload", status_code=201)
+    async def upload_suppliers(request: Request):
+        """Supplier register from Excel, all rows or none (heading row found automatically; your own
+        headings are fine). Needed: Supplier name. Optional: Supplier code (blank = next free SUP-
+        code), Category (new ones are added to the list), Country, Contact person, Email, Phone,
+        Approval (Approved / Pending review / On hold; new suppliers default to Approved). A row
+        whose code (or, without a code, name) is already in the register updates that supplier."""
+        current_user(request)
+        _check_supply_role(request)
+        rows = _read_flexible_sheet(await request.body(), SUPPLIER_COLUMN_ALIASES, {"name"})
+        statuses = {"approved": "Approved", "pending review": "Pending review", "pending": "Pending review", "on hold": "On hold", "hold": "On hold"}
+        cell = lambda row, key: " ".join(str(row.get(key) if row.get(key) is not None else "").split())
+        with open_db() as db:
+            suppliers = db.scalars(select(Supplier)).all()
+            by_code = {supplier.code.lower(): supplier for supplier in suppliers}
+            by_name = {supplier.name.lower(): supplier for supplier in suppliers}
+            used_codes = {supplier.code.lower() for supplier in suppliers}
+            next_number = len(suppliers) + 1001
+            seen_codes: set[str] = set()
+            seen_names: set[str] = set()
+            added = updated = 0
+            for row in rows:
+                number = row["_excel_row"]
+                name, code = cell(row, "name"), cell(row, "code")
+                if len(name) < 2:
+                    raise HTTPException(status_code=422, detail=f"Row {number}: supplier name is required (at least 2 characters)")
+                if code.lower() in seen_codes and code:
+                    raise HTTPException(status_code=422, detail=f"Row {number}: supplier code {code} is repeated in the file")
+                if name.lower() in seen_names:
+                    raise HTTPException(status_code=422, detail=f"Row {number}: supplier {name} is repeated in the file")
+                seen_names.add(name.lower())
+                if code:
+                    seen_codes.add(code.lower())
+                status_text = cell(row, "status").lower()
+                if status_text and status_text not in statuses:
+                    raise HTTPException(status_code=422, detail=f"Row {number}: approval must be Approved, Pending review or On hold")
+                supplier = by_code.get(code.lower()) if code else by_name.get(name.lower())
+                if supplier is None and code and name.lower() in by_name:
+                    raise HTTPException(status_code=422, detail=f"Row {number}: {name} is already in the register as {by_name[name.lower()].code}; use that code to update it")
+                category_text = cell(row, "category")
+                if supplier:
+                    other = by_name.get(name.lower())
+                    if other and other.id != supplier.id:
+                        raise HTTPException(status_code=422, detail=f"Row {number}: the name {name} is already used by {other.code}")
+                    by_name.pop(supplier.name.lower(), None)
+                    supplier.name = name
+                    by_name[name.lower()] = supplier
+                    if category_text:
+                        supplier.category = _ensure_category(db, category_text)
+                    for key in ("country", "contact_name", "email", "phone"):
+                        if cell(row, key):
+                            setattr(supplier, key, cell(row, key))
+                    if status_text:
+                        supplier.status = statuses[status_text]
+                    updated += 1
+                else:
+                    if not code:
+                        while f"sup-{next_number:04d}" in used_codes:
+                            next_number += 1
+                        code = f"SUP-{next_number:04d}"
+                    supplier = Supplier(code=code, name=name, category=_ensure_category(db, category_text or "Raw material"),
+                                        country=cell(row, "country") or "-", contact_name=cell(row, "contact_name"), email=cell(row, "email"),
+                                        phone=cell(row, "phone"), status=statuses.get(status_text, "Approved"), risk="Medium")
+                    db.add(supplier)
+                    db.flush()
+                    used_codes.add(code.lower())
+                    by_code[code.lower()] = supplier
+                    by_name[name.lower()] = supplier
+                    added += 1
+            db.commit()
+            return {"rows": len(rows), "added": added, "updated": updated}
+
     @app.delete("/api/suppliers/{supplier_id}", status_code=204)
     def delete_supplier(supplier_id: int, request: Request):
         """Delete a supplier from the register; refused (with where it is used) while anything uses it."""
@@ -4319,6 +4401,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             "own-stock": ["material_code", "quantity"],
             "supplier-stock": ["supplier_code", "material_code", "tier", "parent_supplier_code", "quantity", "available_quantity", "arrival_month"],
             "alternate-codes": ["main_code", "alternate_code"],
+            "suppliers": ["supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval"],
             "supplier-parts": ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency",
                                "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months"],
         }

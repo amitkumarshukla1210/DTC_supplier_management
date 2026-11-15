@@ -51,6 +51,26 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click("#supplierEditForm button");
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("ST Spare Supplier Two"));
   check("Edit a supplier (name, approval)", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two")').textContent()).includes("On hold"));
+  // change the supplier code; a used code is refused
+  await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-edit-supplier]').click();
+  await page.fill('#supplierEditForm [name="code"]', "SUP-1001");
+  await clearToast();
+  await page.click("#supplierEditForm button");
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("already used"));
+  check("A supplier code already used is refused", (await toastText()).includes("Apex Precision Works"), await toastText());
+  await page.fill('#supplierEditForm [name="code"]', "SPARE-01");
+  await page.click("#supplierEditForm button");
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("SPARE-01"));
+  check("Change a supplier code", true);
+  // bulk upload of suppliers + template
+  check("Register has supplier upload and template", await page.locator('#supplierUploadForm a[href="/api/planning/templates/suppliers.xlsx"]').isVisible());
+  if (process.env.SUP_XLSX && fs.existsSync(process.env.SUP_XLSX)) {
+    await page.setInputFiles('#supplierUploadForm input[type="file"]', process.env.SUP_XLSX);
+    await clearToast();
+    await page.click('#supplierUploadForm button[type="submit"]');
+    await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("Bulk Harness Co"));
+    check("Upload suppliers in bulk (2 added)", (await toastText()).includes("2 supplier(s) added"), await toastText());
+  }
 
   // Relationship sub-tabs + entry table
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
@@ -100,6 +120,16 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-rel-subtab="Upload supplier/material relationships"]');
   await page.waitForSelector("#supplierPartUploadForm");
   check("Upload sub-tab has the upload form and template", await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
+  check("Upload sub-tab also has the typing table with + Add row and Save all", (await page.locator("#relEntryTable tbody tr").count()) === 1 && await page.locator("#relAddRow").isVisible() && await page.locator("#relSaveAll").isVisible());
+  const u1 = page.locator("#relEntryTable tbody tr").nth(0);
+  await u1.locator("[data-row-material-search]").fill("ST-PCB");
+  await page.waitForFunction(() => document.querySelector("#relEntryTable [data-row-material]").value !== "");
+  await u1.locator("[data-row-supplier-search]").first().fill("koyo");
+  await u1.locator('[data-f="sob_percent"]').fill("0");
+  await clearToast();
+  await page.click("#relSaveAll");
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("saved"));
+  check("Save all works on the upload sub-tab", (await toastText()).includes("1 supplier/material relationship saved"), await toastText());
   if (process.env.REL_XLSX && fs.existsSync(process.env.REL_XLSX)) {
     await page.setInputFiles('#supplierPartUploadForm input[type="file"]', process.env.REL_XLSX);
     await page.click('#supplierPartUploadForm button[type="submit"]');
@@ -189,7 +219,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // entry table columns can be widened too
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
   await page.click('[data-rel-subtab="Supplier/material relationship"]');
+  await page.waitForSelector('[data-rel-subtab="Supplier/material relationship"].active');
   await page.waitForSelector("#relEntryTable tbody tr");
+  await page.waitForTimeout(300);
   const entryHead = page.locator("#relEntryTable thead th").nth(2);
   const eb0 = Math.round((await entryHead.boundingBox()).width);
   await entryHead.hover();

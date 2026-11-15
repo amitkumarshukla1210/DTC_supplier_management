@@ -251,6 +251,7 @@ class SupplierCreate(BaseModel):
 class SupplierUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    code: str | None = Field(default=None, min_length=1, max_length=24)
     name: str | None = Field(default=None, min_length=2, max_length=160)
     category: str | None = Field(default=None, min_length=2, max_length=80)
     country: str | None = Field(default=None, min_length=2, max_length=80)
@@ -604,6 +605,13 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
             if value is not None:
                 if key == "category":
                     value = _ensure_category(db, value)
+                if key == "code":
+                    value = value.strip()
+                    if not value:
+                        raise HTTPException(status_code=422, detail="Supplier code cannot be empty")
+                    taken = db.scalar(select(Supplier.name).where(func.lower(Supplier.code) == value.lower(), Supplier.id != supplier_id))
+                    if taken:
+                        raise HTTPException(status_code=409, detail=f"Supplier code {value} is already used by {taken}")
                 setattr(supplier, key, value.strip() if isinstance(value, str) else value)
         _record_activity(db, f"{supplier.name} supplier profile updated")
         db.commit()

@@ -1785,6 +1785,61 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(next(s_ for s_ in restarted.get("/api/suppliers").json() if s_["name"] == "Metro Polymer Group")["category"], "Plastics")
         restarted.__exit__(None, None, None)
 
+    def test_supplier_code_edit_and_bulk_supplier_upload(self):
+        suppliers = lambda: {s_["code"]: s_ for s_ in self.client.get("/api/suppliers").json()}
+        apex = suppliers()["SUP-1001"]
+        # change a supplier code; a code already used is refused
+        self.assertIn("already used by Northstar Components", self.client.patch(f"/api/suppliers/{apex['id']}", json={"code": "sup-1002"}).json()["detail"])
+        self.assertIn("already used by Northstar Components", self.client.patch(f"/api/suppliers/{apex['id']}", json={"code": " sup-1002 "}).json()["detail"])
+        self.assertEqual(self.client.patch(f"/api/suppliers/{apex['id']}", json={"code": "  APX-01 "}).json()["code"], "APX-01")
+        self.assertIn("APX-01", suppliers())
+
+        def sheet(rows, heading=("Vendor Code", "Supplier Name", "Category", "Country", "Contact Person", "E-mail", "Mobile", "Status")):
+            workbook = Workbook()
+            ws = workbook.active
+            ws.append(["Supplier list 2026"])
+            ws.append(list(heading))
+            for row in rows:
+                ws.append(list(row))
+            buffer = io.BytesIO()
+            workbook.save(buffer)
+            return buffer.getvalue()
+        upload = lambda rows, **kw: self.client.post("/api/suppliers/upload", content=sheet(rows, **kw))
+        # all rows or none: row 5 has a wrong approval
+        bad = upload([("ILN-01", "ILIN Electronic", "Electronic PCB Assy", "India", "Amit", "", "", "Approved"),
+                      ("", "Tata Steel", "steel raw material", "India", "", "", "", ""),
+                      ("", "Bad Co", "", "", "", "", "", "Maybe")])
+        self.assertEqual(bad.status_code, 422)
+        self.assertIn("Row 5: approval must be", bad.json()["detail"])
+        self.assertNotIn("ILN-01", suppliers())
+        self.assertIn("Row 4: supplier tata steel is repeated", upload([("", "Tata Steel", "", "", "", "", "", ""), ("", "tata steel", "", "", "", "", "", "")]).json()["detail"])
+        self.assertIn("Row 3: supplier name is required", upload([("X-1", "", "Casting", "", "", "", "", "")]).json()["detail"])
+        self.assertIn("already in the register as SUP-1003", upload([("NEW-9", "Koyo Industrial Supply", "", "", "", "", "", "")]).json()["detail"])
+
+        ok = upload([("ILN-01", "ILIN Electronic", "Electronic PCB Assy", "India", "Amit", "amit@ilin.example", "+91 99", "Approved"),
+                     ("", "Tata Steel", "steel raw material", "India", "", "", "", ""),
+                     ("", "Gear Castings", "Gear Casting", "India", "", "", "", "pending"),
+                     ("SUP-1003", "Koyo Industrial Supply", "Electronic Child Part", "", "", "", "", "On hold"),
+                     ("", "Northstar Components", "", "", "Jordan L.", "", "", "")])
+        self.assertEqual(ok.status_code, 201, ok.text)
+        self.assertEqual((ok.json()["added"], ok.json()["updated"]), (3, 2))
+        now = suppliers()
+        self.assertEqual((now["ILN-01"]["name"], now["ILN-01"]["category"], now["ILN-01"]["email"], now["ILN-01"]["status"]),
+                         ("ILIN Electronic", "Electronic PCB Assy", "amit@ilin.example", "Approved"))
+        auto = {s_["name"]: s_ for s_ in now.values()}
+        self.assertEqual((auto["Tata Steel"]["category"], auto["Tata Steel"]["status"]), ("Steel Raw material", "Approved"))
+        self.assertEqual(auto["Gear Castings"]["status"], "Pending review")
+        self.assertIn("Gear Casting", self.client.get("/api/planning/material-categories").json()["items"])  # new category added
+        self.assertTrue(auto["Tata Steel"]["code"].startswith("SUP-") and auto["Tata Steel"]["code"] != auto["Gear Castings"]["code"])
+        self.assertEqual((now["SUP-1003"]["category"], now["SUP-1003"]["status"], now["SUP-1003"]["country"]), ("Electronic Child Part", "On hold", "Japan"))
+        self.assertEqual(now["SUP-1002"]["contact_name"], "Jordan L.")  # matched by name, blank cells keep old values
+        self.assertEqual(len(now), len({s_["code"].lower() for s_ in now.values()}))
+        template = load_workbook(io.BytesIO(self.client.get("/api/planning/templates/suppliers.xlsx").content)).active
+        self.assertEqual([c.value for c in template[1]], ["supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval"])
+        # the template itself uploads
+        self.assertEqual(upload([("TPL-1", "Template Supplier", "Casting", "India", "A", "a@b.example", "1", "Approved")],
+                                heading=("supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval")).status_code, 201)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns
