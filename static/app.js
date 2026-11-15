@@ -23,7 +23,7 @@ const state = {
   bomParentOptions: [],
   bomParentAll: [],
   materialCategories: [],
-  supplierTab: "Supplier/material relationship",
+  supplierTab: "Supplier register",
   smSupplier: "",
   sbSupplier: "",
   sbProduct: "",
@@ -1061,13 +1061,15 @@ async function loadMaterialMasterPage(offset = 0) {
 
 function renderSupplierPartsTable(result) {
   const canEditPrices = state.user.can_view_prices || state.user.role === "Admin";
-  const rows = result.items.map((link) => `<tr><td>${esc(link.material_code)} · ${esc(link.material_name)}</td><td>${esc(link.supplier_code)} · ${esc(link.supplier_name)}</td><td>${esc(link.tier)}${link.parent_supplier_name ? ` via ${esc(link.parent_supplier_name)}` : ""}</td><td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${link.unit_price === undefined ? "Restricted" : `${money(link.unit_price, link.currency)} · ${esc(link.price_mode)}`}</td><td>${esc(link.price_status)}</td><td>${canEditPrices && link.unit_price !== undefined ? `<button class="text-button" data-update-price="${link.id}" data-current-price="${link.unit_price}">Update price</button>` : ""}</td></tr>`).join("");
+  void canEditPrices;
+  const modeLabel = { spot: "Spot", fixed_monthly: "Fixed monthly", every_n_months: "Every N months" };
+  const rows = result.items.map((link) => `<tr><td>${esc(link.material_code)}</td><td>${esc(link.material_name)}</td><td>${esc(link.supplier_code)}</td><td>${esc(link.supplier_name)}</td><td>${esc(link.tier)}</td><td>${esc(link.parent_supplier_name || "—")}</td><td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${link.unit_price === undefined ? "Restricted" : money(link.unit_price, link.currency)}</td><td>${esc(link.currency || "")}</td><td>${esc(modeLabel[link.price_mode] || link.price_mode)}</td><td>${esc(link.price_status)}</td><td><button class="text-button" data-edit-supplier-part="${link.id}">Edit</button><button class="text-button button-danger" data-delete-supplier-part="${link.id}">Delete</button></td></tr>`).join("");
   const pageSize = result.limit;
-  const markup = `${table(["Material", "Supplier", "Tier / route", "SOB", "Lead time", "MOQ", "Buffer", "Price", "Price status", "Action"], rows, "No supplier/material relationships configured.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(result.offset + 1).toLocaleString()}–${Math.min(result.offset + result.items.length, result.total).toLocaleString()} of ${result.total.toLocaleString()}` : "No supplier/material relationships"}</span><div><button class="button button-small" data-supplier-page="${Math.max(0, result.offset - pageSize)}" ${result.offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-supplier-page="${result.offset + pageSize}" ${result.offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+  const markup = `${table(["Material code", "Material name", "Supplier code", "Supplier name", "Tier", "Parent supplier", "SOB", "Lead time", "MOQ", "Buffer", "Unit price", "Currency", "Price agreement", "Price status", "Action"], rows, "No supplier/material relationships configured.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(result.offset + 1).toLocaleString()}–${Math.min(result.offset + result.items.length, result.total).toLocaleString()} of ${result.total.toLocaleString()}` : "No supplier/material relationships"}</span><div><button class="button button-small" data-supplier-page="${Math.max(0, result.offset - pageSize)}" ${result.offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-supplier-page="${result.offset + pageSize}" ${result.offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
   const target = $("#supplierPartTable");
   if (target) {
     target.innerHTML = markup;
-    setupTableFilters("#supplierPartTable", "#supplierPartFilters", null, [{ title: "Supplier", index: 1 }, { title: "Tier", index: 2 }, { title: "Price status", index: 8 }]);
+    setupTableFilters("#supplierPartTable", "#supplierPartFilters", null, [{ title: "Supplier", index: 3 }, { title: "Tier", index: 4 }, { title: "Price status", index: 13 }]);
   }
   return markup;
 }
@@ -1082,7 +1084,117 @@ async function loadSupplierPartPage(offset = 0, search = state.supplierSearch) {
   if ($("#supplierPartTable")) renderSupplierPartsTable(result);
 }
 
-const SUPPLIER_TABS = ["Supplier/material relationship", "Upload supplier stock", "Supplier/material coverage", "Supplier register", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"];
+const SUPPLIER_TABS = ["Supplier register", "Supplier/material relationship", "Supplier/material coverage", "Upload supplier stock", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"];
+const RELATIONSHIP_SUBTABS = ["Supplier/material relationship", "Upload supplier/material relationships"];
+
+// ---- Excel-like entry tables (one row per entry, every field a column, + Add row, Save all)
+function entryHeading(label) {
+  return `<th><div class="table-heading">${esc(label)}<span class="column-resizer" aria-hidden="true"></span></div></th>`;
+}
+function entryTable(id, labels) {
+  return `<div class="table-wrap entry-wrap"><table class="entry-table" id="${id}"><thead><tr>${labels.map(entryHeading).join("")}${entryHeading("")}</tr></thead><tbody></tbody></table></div>`;
+}
+function entryMaterialCell() {
+  return `<td class="entry-pick"><input class="form-control" type="search" data-row-material-search placeholder="Search code / name" /><select class="form-control" data-row-material><option value="">Loading…</option></select></td>`;
+}
+function entrySupplierCell(key, optional = false) {
+  const options = state.suppliers.map((supplier) => `<option value="${supplier.id}">${esc(supplier.code)} · ${esc(supplier.name)}</option>`).join("");
+  return `<td class="entry-pick"><input class="form-control" type="search" data-row-supplier-search placeholder="Search supplier" /><select class="form-control" data-row-supplier="${key}">${optional ? '<option value="">None / Direct</option>' : '<option value="">Select supplier</option>'}${options}</select></td>`;
+}
+const entryRemoveCell = '<td><button type="button" class="text-button button-danger" data-entry-remove>Remove</button></td>';
+async function loadRowMaterials(row, search = "") {
+  const select = row.querySelector("[data-row-material]");
+  if (!select) return;
+  try {
+    const result = await api(`/api/planning/materials?${new URLSearchParams({ offset: "0", limit: "100", search, purchased: "true" })}`);
+    const keep = select.value;
+    select.innerHTML = `<option value="">Select part code</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.code)} · ${esc(item.name)}</option>`).join("")}`;
+    select.value = result.items.some((item) => String(item.id) === keep) ? keep : (result.items.length === 1 && search ? String(result.items[0].id) : "");
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  } catch (error) { toast(error.message, true); }
+}
+// One listener set per entry table: searches, remove row; onChange(row, target) for extra wiring
+function bindEntryTable(tableId, newRow, onChange = null) {
+  const body = $(`#${tableId} tbody`);
+  const add = () => {
+    body.insertAdjacentHTML("beforeend", newRow());
+    const row = body.lastElementChild;
+    loadRowMaterials(row);
+    return row;
+  };
+  body.addEventListener("input", (event) => {
+    const row = event.target.closest("tr");
+    if (event.target.matches("[data-row-material-search]")) {
+      clearTimeout(row.searchTimer);
+      row.searchTimer = setTimeout(() => loadRowMaterials(row, event.target.value), 250);
+    }
+    if (event.target.matches("[data-row-supplier-search]")) {
+      const needle = event.target.value.trim().toLowerCase();
+      const select = event.target.nextElementSibling;
+      const visible = [...select.options].filter((option) => {
+        option.hidden = Boolean(option.value) && Boolean(needle) && !option.textContent.toLowerCase().includes(needle);
+        return option.value && !option.hidden;
+      });
+      if (needle && visible.length === 1) { select.value = visible[0].value; select.dispatchEvent(new Event("change", { bubbles: true })); }
+    }
+  });
+  body.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-entry-remove]")) return;
+    if (body.rows.length > 1) event.target.closest("tr").remove();
+    else toast("Keep at least one row (leave it empty if not needed).", true);
+  });
+  if (onChange) body.addEventListener("change", (event) => onChange(event.target.closest("tr"), event.target));
+  add();
+  return { add, rows: () => [...body.rows], reset: () => { body.innerHTML = ""; add(); } };
+}
+const cellValue = (row, selector) => row.querySelector(selector)?.value ?? "";
+
+function relationshipEntryRow() {
+  const priced = canSeePrices();
+  return `<tr>${entryMaterialCell()}${entrySupplierCell("supplier")}<td><input class="form-control" data-f="tier" value="Direct" /></td>${entrySupplierCell("parent", true)}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" value="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" value="14" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" value="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" value="0" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" value="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td>${entryRemoveCell}</tr>`;
+}
+function stockEntryRow() {
+  return `<tr>${entrySupplierCell("supplier")}<td><select class="form-control" data-row-link><option value="">Choose supplier first</option></select></td><td><input class="form-control" type="number" min="0" step="any" data-f="quantity" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="available_quantity" placeholder="= quantity" /></td><td><input class="form-control" type="month" data-f="arrival_month" /></td>${entryRemoveCell}</tr>`;
+}
+function transferEntryRow() {
+  return `<tr>${entryMaterialCell()}${entrySupplierCell("from")}${entrySupplierCell("to")}<td><input class="form-control" type="number" min="0.001" step="any" data-f="quantity" /></td><td><input class="form-control" type="month" data-f="transfer_month" value="${monthOffset(monthNow(), 1)}" /></td><td><input class="form-control" data-f="note" /></td>${entryRemoveCell}</tr>`;
+}
+
+function openSupplierEdit(supplier) {
+  if (!supplier) return;
+  $("#modalTitle").textContent = `Edit ${supplier.code} · ${supplier.name}`;
+  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${field("Category", "category", "text", { required: true, value: supplier.category })}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
+  modalLayer.hidden = false;
+  $("#supplierEditForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      await api(`/api/suppliers/${supplier.id}`, { method: "PATCH", body: JSON.stringify(values) });
+      modalLayer.hidden = true;
+      toast("Supplier saved");
+      renderSupplierControl();
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
+function openSupplierPartEdit(link) {
+  if (!link) return;
+  const priced = canSeePrices() && link.unit_price !== undefined;
+  $("#modalTitle").textContent = `Edit ${link.material_code} · ${link.supplier_name} (${link.tier})`;
+  $("#modalBody").innerHTML = `<form id="supplierPartEditForm" class="form-grid">${field("Supplier SOB (%)", "sob_percent", "number", { required: true, min: 0, step: "0.01", value: link.sob_percent })}${field("End-to-end lead time (days)", "lead_time_days", "number", { required: true, min: 0, value: link.lead_time_days })}${field("MOQ", "moq", "number", { required: true, min: 0, step: "any", value: link.moq })}${field("Supplier buffer (days)", "buffer_days", "number", { required: true, min: 0, value: link.buffer_days })}${priced ? `${field("Current unit price", "unit_price", "number", { required: true, min: 0, step: "0.0001", value: link.unit_price })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === link.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<label class="field"><span>Price agreement</span><select class="form-control" name="price_mode">${[["spot", "Spot"], ["fixed_monthly", "Fixed monthly"], ["every_n_months", "Every N months"]].map(([value, label]) => `<option value="${value}" ${value === link.price_mode ? "selected" : ""}>${label}</option>`).join("")}</select></label>${field("Price interval (months)", "price_interval_months", "number", { required: true, min: 1, value: link.price_interval_months })}<p class="subtle field full">Material, supplier, tier and parent cannot change here: delete the line and add it again.</p><div class="modal-footer field full"><button class="button button-primary">Save relationship</button></div></form>`;
+  modalLayer.hidden = false;
+  $("#supplierPartEditForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    for (const key of ["sob_percent", "lead_time_days", "moq", "buffer_days", "unit_price", "price_interval_months"]) if (key in values) values[key] = Number(values[key]);
+    try {
+      await api(`/api/planning/supplier-parts/${link.id}`, { method: "PATCH", body: JSON.stringify(values) });
+      modalLayer.hidden = true;
+      toast("Relationship saved");
+      loadSupplierPartPage(state.supplierOffset || 0);
+    } catch (error) { toast(error.message, true); }
+  });
+}
 
 // Material picker for supplier forms: type-to-search on the server, purchased parts only
 // (no in-house BOM, never a negative BOM quantity), so it works with 10,000+ codes.
@@ -1383,34 +1495,29 @@ async function renderSupplierControl() {
   const tabs = `<div class="tab-strip">${SUPPLIER_TABS.map((name) => `<button class="tab-button ${tab === name ? "active" : ""}" data-supplier-tab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
   let body = "";
   if (tab === "Supplier/material relationship") {
-    body = `<section class="panel">${panelHeader("Supplier/material relationship", "SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier.")}
-      <form id="supplierPartForm" class="panel-body form-grid">
-        ${purchasedMaterialPicker("supplier")}
-        ${supplierPicker("supplier_id", "Supplier")}
-        ${field("Tier (Direct, T1, T2…)", "tier", "text", { required: true, value: "Direct" })}
-        ${supplierPicker("parent_supplier_id", "Parent customer supplier (for T1+)", true)}
-        ${field("Supplier SOB (%)", "sob_percent", "number", { required: true, min: 0, step: "0.01", value: 100 })}
-        ${field("End-to-end lead time (days)", "lead_time_days", "number", { required: true, min: 0, value: 14 })}
-        ${field("MOQ", "moq", "number", { required: true, min: 0, step: "any", value: 0 })}
-        ${field("Supplier buffer (days)", "buffer_days", "number", { required: true, min: 0, value: 0 })}
-        ${field("Current unit price", "unit_price", "number", { required: true, min: 0, step: "0.0001", value: 0 })}
-        <label class="field"><span>Currency</span><select class="form-control" name="currency"><option>INR</option><option>USD</option><option>EUR</option><option>GBP</option><option>JPY</option></select></label>
-        <label class="field"><span>Price agreement</span><select class="form-control" name="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Changes every N months</option></select></label>
-        ${field("Price interval (months)", "price_interval_months", "number", { required: true, min: 1, value: 1 })}
-        <button class="button button-primary" type="submit">Save supplier/material</button>
-      </form>
-    </section>
-    <section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template. One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
-      <form id="supplierPartUploadForm" class="panel-body inline-upload">
-        <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
-        <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
-      </form>
-    </section>`;
+    if (!RELATIONSHIP_SUBTABS.includes(state.relSubTab)) state.relSubTab = RELATIONSHIP_SUBTABS[0];
+    const subTabs = `<div class="tab-strip sub-tab-strip">${RELATIONSHIP_SUBTABS.map((name) => `<button class="tab-button ${state.relSubTab === name ? "active" : ""}" data-rel-subtab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
+    body = subTabs + (state.relSubTab === RELATIONSHIP_SUBTABS[0]
+      ? `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Type one row per material and supplier, like an Excel sheet; + Add row for more, then Save all (all rows or none). SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier. Saved lines are edited or deleted in Supplier/material coverage.")}
+        ${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
+        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
+      </section>`
+      : `<section class="panel table-panel">${panelHeader("Upload supplier/material relationships", "Upload your own sheet as it is, or the template. One row per material and supplier. Needed: Material code and Supplier name. Optional: Tier (blank = Direct), Parent supplier (for T1/T2), SOB % (blank = 100), Unit cost / Unit price, Currency, Lead time, MOQ, Buffer days. Title rows above the heading row and other columns (Material name, Category, Unit, On hand …) are ignored. New supplier names are added to the Supplier register; an existing relationship is updated. The whole file is rejected if any row is wrong.")}
+        <form id="supplierPartUploadForm" class="panel-body inline-upload">
+          <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
+          <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
+        </form>
+      </section>`);
   } else if (tab === "Upload supplier stock") {
-    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month. Tier and parent identify the exact relationship when the same supplier/material exists at multiple levels.")}
+    body = `<section class="panel table-panel">${panelHeader("Supplier stock", "Type each supplier's stock for the month in the table (no Excel needed), or upload a workbook below. One row per supplier and material (its relationship); a row already reported for the month is updated.")}
+      <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
+      ${entryTable("stockEntryTable", ["Supplier", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
+      <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="stockAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="stockSaveAll">Save all</button></div>
+      <h3 class="subtable-heading">Stock entered for the month</h3>
+      <div id="stockListTable"></div>
+      <h3 class="subtable-heading">Or upload a workbook</h3>
+      <p class="subtle panel-body">Columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month. Tier and parent identify the exact relationship when the same supplier/material exists at multiple levels.</p>
       <form id="supplierStockForm" class="panel-body inline-upload">
-        <label class="field"><span>Report month</span><input class="form-control" type="month" name="report_month" required value="${monthNow()}" /></label>
-        <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
         <label class="field"><span>Supplier stock workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
         <button class="button button-primary" type="submit">Upload supplier stock</button><a class="button" href="/api/planning/templates/supplier-stock.xlsx">Download template</a>
       </form>
@@ -1421,20 +1528,13 @@ async function renderSupplierControl() {
       <div id="supplierPartTable"></div>
     </section>`;
   } else if (tab === "Supplier register") {
-    const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}</td></tr>`).join("");
-    body = `<section class="panel table-panel">${panelHeader("Supplier register")}<div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
+    const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
+    body = `<section class="panel table-panel">${panelHeader("Supplier register")}<div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
   } else if (tab === "Supplier-to-supplier material transfer") {
-    body = `<section class="panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus. The receiving supplier is credited in projected coverage in the transfer month.")}
-      <form id="transferForm" class="panel-body form-grid">
-        ${purchasedMaterialPicker("transfer")}
-        ${supplierPicker("from_supplier_id", "From supplier")}
-        ${supplierPicker("to_supplier_id", "To supplier")}
-        ${field("Transfer quantity", "quantity", "number", { required: true, min: 0.001, step: "any" })}
-        ${field("Transfer/arrival month", "transfer_month", "month", { required: true, value: monthOffset(monthNow(), 1) })}
-        <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
-        ${field("Transfer note", "note", "text")}
-        <button class="button button-primary" type="submit">Record transfer</button>
-      </form>
+    body = `<section class="panel table-panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus, one row per transfer; + Add row for more, then Save all. The receiving supplier is credited in projected coverage in the transfer month. Saved transfers are listed in Transfer schedule.")}
+      <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
+      ${entryTable("transferEntryTable", ["Material (purchased part)", "From supplier", "To supplier", "Transfer quantity", "Transfer / arrival month", "Transfer note"])}
+      <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="transferAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="transferSaveAll">Save all</button></div>
     </section>`;
   } else if (tab === "Supplier materials") {
     body = `<section class="panel table-panel">${panelHeader("Supplier materials", "Each supplier's own material codes (e.g. solder wire, paste, connector). They are used only in that supplier's BOMs for cost breakdown.")}
@@ -1468,19 +1568,32 @@ async function renderSupplierControl() {
   content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", `<button class="button" data-action="new-supplier">Add supplier</button>`)}${tabs}${body}`;
   bindSupplierSearch(content);
 
-  if (tab === "Supplier/material relationship") {
-    bindMaterialSearch("supplierMaterialSearch", "supplierMaterialSelect", null, { purchased: true, loadNow: true });
-    $("#supplierPartForm").addEventListener("submit", async (event) => {
-      event.preventDefault();
+  if (tab === "Supplier/material relationship" && state.relSubTab === RELATIONSHIP_SUBTABS[0]) {
+    const entries = bindEntryTable("relEntryTable", relationshipEntryRow);
+    $("#relAddRow").addEventListener("click", () => entries.add());
+    $("#relSaveAll").addEventListener("click", async () => {
+      const rows = [];
+      for (const [index, row] of entries.rows().entries()) {
+        const material = Number(cellValue(row, "[data-row-material]"));
+        const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
+        if (!material && !supplier) continue;  // empty row
+        if (!material || !supplier) return toast(`Row ${index + 1}: choose the material and the supplier.`, true);
+        const value = (key) => cellValue(row, `[data-f="${key}"]`);
+        rows.push({ material_id: material, supplier_id: supplier, tier: value("tier").trim() || "Direct",
+          parent_supplier_id: Number(cellValue(row, '[data-row-supplier="parent"]')) || null,
+          sob_percent: Number(value("sob_percent")), lead_time_days: Number(value("lead_time_days")), moq: Number(value("moq")),
+          buffer_days: Number(value("buffer_days")), unit_price: Number(value("unit_price") || 0), currency: value("currency"),
+          price_mode: value("price_mode"), price_interval_months: Number(value("price_interval_months") || 1) });
+      }
+      if (!rows.length) return toast("Fill in at least one row.", true);
       try {
-        const values = Object.fromEntries(new FormData(event.currentTarget).entries());
-        for (const key of ["material_id", "supplier_id", "sob_percent", "lead_time_days", "moq", "buffer_days", "unit_price", "price_interval_months"]) values[key] = Number(values[key]);
-        values.parent_supplier_id = values.parent_supplier_id ? Number(values.parent_supplier_id) : null;
-        const result = await api("/api/planning/supplier-parts", { method: "POST", body: JSON.stringify(values) });
-        toast(`Supplier link saved for ${result.tier}`);
-        await renderSupplierControl();
+        const result = await api("/api/planning/supplier-parts/rows", { method: "POST", body: JSON.stringify({ rows }) });
+        toast(`${result.rows} supplier/material relationship${result.rows === 1 ? "" : "s"} saved`);
+        entries.reset();
       } catch (error) { toast(error.message, true); }
     });
+  }
+  if (tab === "Supplier/material relationship" && state.relSubTab === RELATIONSHIP_SUBTABS[1]) {
     $("#supplierPartUploadForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -1492,15 +1605,62 @@ async function renderSupplierControl() {
     });
   }
   if (tab === "Upload supplier stock") {
-    $("#supplierStockForm").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const data = new FormData(event.currentTarget);
-      state.workspace = data.get("workspace");
+    const workspaceOf = () => content.querySelector('select[name="workspace"]')?.value || state.workspace;
+    const loadStockList = async () => {
       try {
-        const result = await uploadExcel(`/api/planning/supplier-stock/${data.get("report_month")}/upload?workspace=${state.workspace}`, data.get("workbook"));
-        toast(`${result.rows} supplier stock row(s) uploaded`);
+        const result = await api(`/api/planning/supplier-stock/${$("#stockMonth").value}?workspace=${workspaceOf()}`);
+        $("#stockListTable").innerHTML = table(["Supplier code", "Supplier name", "Material code", "Material name", "Tier", "Stock quantity", "Available quantity", "Unit", "Arrival month"],
+          result.items.map((r) => `<tr><td>${esc(r.supplier_code)}</td><td>${esc(r.supplier_name)}</td><td>${esc(r.material_code)}</td><td>${esc(r.material_name)}</td><td>${esc(r.tier)}</td><td>${number(r.quantity)}</td><td>${number(r.available_quantity)}</td><td>${esc(r.uom)}</td><td>${r.arrival_month ? esc(monthLabel(r.arrival_month)) : "—"}</td></tr>`).join(""),
+          `No supplier stock entered for ${monthLabel($("#stockMonth").value)}.`);
+      } catch (error) { toast(error.message, true); }
+    };
+    const entries = bindEntryTable("stockEntryTable", stockEntryRow, async (row, target) => {
+      if (!target.matches('[data-row-supplier="supplier"]')) return;
+      const linkSelect = row.querySelector("[data-row-link]");
+      if (!target.value) { linkSelect.innerHTML = '<option value="">Choose supplier first</option>'; return; }
+      try {
+        const result = await api(`/api/planning/supplier-parts?${new URLSearchParams({ supplier_id: target.value, limit: "1000" })}`);
+        linkSelect.innerHTML = result.items.length
+          ? `<option value="">Select material</option>${result.items.map((link) => `<option value="${link.id}">${esc(link.material_code)} · ${esc(link.material_name)} · ${esc(link.tier)}${link.parent_supplier_name ? ` via ${esc(link.parent_supplier_name)}` : ""}</option>`).join("")}`
+          : '<option value="">No relationships for this supplier</option>';
+        if (result.items.length === 1) linkSelect.value = String(result.items[0].id);
       } catch (error) { toast(error.message, true); }
     });
+    $("#stockAddRow").addEventListener("click", () => entries.add());
+    $("#stockMonth").addEventListener("change", loadStockList);
+    content.querySelector('select[name="workspace"]')?.addEventListener("change", loadStockList);
+    $("#stockSaveAll").addEventListener("click", async () => {
+      const rows = [];
+      for (const [index, row] of entries.rows().entries()) {
+        const link = Number(cellValue(row, "[data-row-link]"));
+        const quantity = cellValue(row, '[data-f="quantity"]');
+        if (!link && !quantity) continue;
+        if (!link) return toast(`Row ${index + 1}: choose the supplier and its material.`, true);
+        if (quantity === "") return toast(`Row ${index + 1}: enter the stock quantity.`, true);
+        const available = cellValue(row, '[data-f="available_quantity"]');
+        rows.push({ supplier_part_id: link, quantity: Number(quantity), available_quantity: available === "" ? null : Number(available), arrival_month: cellValue(row, '[data-f="arrival_month"]') || null });
+      }
+      if (!rows.length) return toast("Fill in at least one row.", true);
+      state.workspace = workspaceOf();
+      try {
+        const result = await api(`/api/planning/supplier-stock/${$("#stockMonth").value}?workspace=${state.workspace}`, { method: "POST", body: JSON.stringify({ rows }) });
+        toast(`${result.rows} supplier stock row${result.rows === 1 ? "" : "s"} saved for ${monthLabel(result.report_month)}`);
+        entries.reset();
+        loadStockList();
+      } catch (error) { toast(error.message, true); }
+    });
+    $("#supplierStockForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      state.workspace = workspaceOf();
+      try {
+        const result = await uploadExcel(`/api/planning/supplier-stock/${$("#stockMonth").value}/upload?workspace=${state.workspace}`, new FormData(form).get("workbook"));
+        toast(`${result.rows} supplier stock row(s) uploaded`);
+        form.reset();
+        loadStockList();
+      } catch (error) { toast(error.message, true); }
+    });
+    loadStockList();
   }
   if (tab === "Supplier/material coverage") {
     state.supplierSearch = "";
@@ -1511,23 +1671,41 @@ async function renderSupplierControl() {
     });
   }
   if (tab === "Supplier register") {
-    setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Category", index: 2 }, { title: "Approval", index: 3 }]);
+    setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Category", index: 2 }, { title: "Approval", index: 7 }]);
     $("#supplierSearch").addEventListener("input", applyTableSearch);
   }
   if (tab === "Supplier-to-supplier material transfer") {
-    bindMaterialSearch("transferMaterialSearch", "transferMaterialSelect", null, { purchased: true, loadNow: true });
-    $("#transferForm").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const values = Object.fromEntries(new FormData(event.currentTarget).entries());
-      for (const key of ["material_id", "from_supplier_id", "to_supplier_id"]) values[key] = Number(values[key]);
-      values.quantity = Number(values.quantity);
-      state.workspace = values.workspace;
-      try {
-        await api("/api/planning/transfers", { method: "POST", body: JSON.stringify(values) });
-        toast("Supplier-to-supplier transfer saved");
-        state.supplierTab = "Transfer schedule";
-        renderSupplierControl();
-      } catch (error) { toast(error.message, true); }
+    const entries = bindEntryTable("transferEntryTable", transferEntryRow);
+    $("#transferAddRow").addEventListener("click", () => entries.add());
+    $("#transferSaveAll").addEventListener("click", async () => {
+      const workspace = content.querySelector('select[name="workspace"]')?.value || state.workspace;
+      const filled = entries.rows().filter((row) => cellValue(row, "[data-row-material]") || cellValue(row, '[data-f="quantity"]'));
+      if (!filled.length) return toast("Fill in at least one row.", true);
+      for (const [index, row] of entries.rows().entries()) {
+        if (!filled.includes(row)) continue;
+        const values = { material_id: Number(cellValue(row, "[data-row-material]")), from_supplier_id: Number(cellValue(row, '[data-row-supplier="from"]')),
+          to_supplier_id: Number(cellValue(row, '[data-row-supplier="to"]')), quantity: Number(cellValue(row, '[data-f="quantity"]')),
+          transfer_month: cellValue(row, '[data-f="transfer_month"]'), note: cellValue(row, '[data-f="note"]'), workspace };
+        if (!values.material_id || !values.from_supplier_id || !values.to_supplier_id || !values.quantity || !values.transfer_month) return toast(`Row ${index + 1}: fill in material, both suppliers, quantity and month.`, true);
+      }
+      state.workspace = workspace;
+      let saved = 0;
+      for (const row of filled) {
+        const values = { material_id: Number(cellValue(row, "[data-row-material]")), from_supplier_id: Number(cellValue(row, '[data-row-supplier="from"]')),
+          to_supplier_id: Number(cellValue(row, '[data-row-supplier="to"]')), quantity: Number(cellValue(row, '[data-f="quantity"]')),
+          transfer_month: cellValue(row, '[data-f="transfer_month"]'), note: cellValue(row, '[data-f="note"]'), workspace };
+        try {
+          await api("/api/planning/transfers", { method: "POST", body: JSON.stringify(values) });
+          saved += 1;
+          row.remove();  // saved rows leave the table; a failing row stays to be fixed
+        } catch (error) {
+          toast(`${saved} saved; row with error: ${error.message}`, true);
+          return;
+        }
+      }
+      toast(`${saved} supplier-to-supplier transfer${saved === 1 ? "" : "s"} saved`);
+      state.supplierTab = "Transfer schedule";
+      renderSupplierControl();
     });
   }
   if (tab === "Supplier materials") initSupplierMaterialsTab();
@@ -2429,6 +2607,25 @@ document.addEventListener("click", async (event) => {
       toast("PO receipt recorded and company stock updated");
       return renderPurchaseOrders();
     } catch (error) { toast(error.message, true); }
+  }
+  const relSubTab = event.target.closest("[data-rel-subtab]");
+  if (relSubTab) { state.relSubTab = relSubTab.dataset.relSubtab; return renderSupplierControl(); }
+  const supplierEdit = event.target.closest("[data-edit-supplier]");
+  if (supplierEdit) return openSupplierEdit(state.suppliers.find((supplier) => String(supplier.id) === supplierEdit.dataset.editSupplier));
+  const supplierDelete = event.target.closest("[data-delete-supplier]");
+  if (supplierDelete) {
+    const supplier = state.suppliers.find((item) => String(item.id) === supplierDelete.dataset.deleteSupplier);
+    if (!window.confirm(`Delete supplier ${supplier?.name || ""}? This cannot be undone.`)) return;
+    try { await api(`/api/suppliers/${supplierDelete.dataset.deleteSupplier}`, { method: "DELETE" }); toast("Supplier deleted"); return renderSupplierControl(); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const partEdit = event.target.closest("[data-edit-supplier-part]");
+  if (partEdit) return openSupplierPartEdit((state.supplierParts || []).find((link) => String(link.id) === partEdit.dataset.editSupplierPart));
+  const partDelete = event.target.closest("[data-delete-supplier-part]");
+  if (partDelete) {
+    if (!window.confirm("Delete this supplier/material relationship?")) return;
+    try { await api(`/api/planning/supplier-parts/${partDelete.dataset.deleteSupplierPart}`, { method: "DELETE" }); toast("Relationship deleted"); return loadSupplierPartPage(state.supplierOffset || 0); }
+    catch (error) { toast(error.message, true); return; }
   }
   const priceUpdate = event.target.closest("[data-update-price]");
   if (priceUpdate) {

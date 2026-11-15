@@ -1612,6 +1612,59 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("Start (all months)", [r[6] for r in rows])
         self.assertEqual(self.client.get("/api/planning/sob-change-log.pdf").status_code, 200)
 
+    def test_supplier_rows_entry_stock_entry_and_safe_deletes(self):
+        def material(code):
+            return self.client.post("/api/planning/materials", json={"code": code, "name": code.title(), "uom": "kg"}).json()["id"]
+        steel, copper = material("SR-STEEL"), material("SR-COPPER")
+        sup = lambda name: self.client.post("/api/suppliers", json={"name": name, "category": "Steel", "country": "India"}).json()["id"]
+        tata, jsw, spare = sup("SR Tata"), sup("SR JSW"), sup("SR Spare")
+        row = lambda m, s_, sob, price=0: {"material_id": m, "supplier_id": s_, "tier": "Direct", "sob_percent": sob, "unit_price": price, "currency": "INR"}
+        # all rows or none: row 3 takes steel over 100% (60 + 40 + 10) -> nothing saved
+        bad = self.client.post("/api/planning/supplier-parts/rows", json={"rows": [row(steel, tata, 60), row(steel, jsw, 40), row(steel, spare, 10)]})
+        self.assertEqual(bad.status_code, 422)
+        self.assertIn("Row 3: Supplier SOB cannot exceed 100%", bad.json()["detail"])
+        self.assertEqual(self.client.get("/api/planning/supplier-parts", params={"search": "SR-"}).json()["total"], 0)
+        dup = self.client.post("/api/planning/supplier-parts/rows", json={"rows": [row(steel, tata, 50), row(steel, tata, 50)]})
+        self.assertIn("Row 2: SR-STEEL with this supplier, tier and parent already exists", dup.json()["detail"])
+        self.assertEqual(self.client.post("/api/planning/supplier-parts/rows", json={"rows": []}).status_code, 422)
+        ok = self.client.post("/api/planning/supplier-parts/rows", json={"rows": [row(steel, tata, 60, 70), row(steel, jsw, 40, 74), row(copper, tata, 100, 700)]})
+        self.assertEqual((ok.status_code, ok.json()["rows"]), (201, 3), ok.text)
+        tata_links = self.client.get("/api/planning/supplier-parts", params={"supplier_id": tata}).json()["items"]
+        self.assertEqual(sorted(l["material_code"] for l in tata_links), ["SR-COPPER", "SR-STEEL"])
+        steel_tata = next(l["id"] for l in tata_links if l["material_code"] == "SR-STEEL")
+        copper_tata = next(l["id"] for l in tata_links if l["material_code"] == "SR-COPPER")
+
+        # supplier stock typed in (no Excel): save, then update the same row; errors name the row
+        url = "/api/planning/supplier-stock/2026-11"
+        self.assertIn("Row 2: Available quantity", self.client.post(url, json={"rows": [{"supplier_part_id": steel_tata, "quantity": 10}, {"supplier_part_id": copper_tata, "quantity": 5, "available_quantity": 6}]}).json()["detail"])
+        self.assertIn("Row 2: this supplier and material is entered twice", self.client.post(url, json={"rows": [{"supplier_part_id": steel_tata, "quantity": 1}, {"supplier_part_id": steel_tata, "quantity": 2}]}).json()["detail"])
+        self.assertIn("Row 1: choose", self.client.post(url, json={"rows": [{"supplier_part_id": 999999, "quantity": 1}]}).json()["detail"])
+        self.assertEqual(self.client.get(url).json()["items"], [])  # nothing saved by the failed tries
+        saved = self.client.post(url, json={"rows": [{"supplier_part_id": steel_tata, "quantity": 500, "available_quantity": 400, "arrival_month": "Dec-2026"}, {"supplier_part_id": copper_tata, "quantity": 20}]})
+        self.assertEqual((saved.status_code, saved.json()["rows"]), (201, 2), saved.text)
+        first = {r["material_code"]: r["arrival_month"] for r in self.client.get(url).json()["items"]}
+        self.assertEqual(first["SR-STEEL"], "2026-12")  # "Dec-2026" stored as YYYY-MM (planning compares months)
+        self.assertEqual(self.client.post(url, json={"rows": [{"supplier_part_id": steel_tata, "quantity": 450, "available_quantity": 450}]}).status_code, 201)
+        stock = {r["material_code"]: (r["quantity"], r["available_quantity"], r["arrival_month"]) for r in self.client.get(url).json()["items"]}
+        self.assertEqual(stock, {"SR-STEEL": (450, 450, None), "SR-COPPER": (20, 20, None)})
+
+        # deletes are refused while in use, with the reason
+        blocked = self.client.delete(f"/api/planning/supplier-parts/{steel_tata}")
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("1 supplier stock row", blocked.json()["detail"])
+        jsw_link = next(l["id"] for l in self.client.get("/api/planning/supplier-parts", params={"supplier_id": jsw}).json()["items"])
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-parts/{jsw_link}").status_code, 204)
+        self.assertEqual(self.client.delete(f"/api/planning/supplier-parts/{jsw_link}").status_code, 404)
+        used = self.client.delete(f"/api/suppliers/{tata}")
+        self.assertEqual(used.status_code, 409)
+        self.assertIn("2 supplier/material relationships", used.json()["detail"])
+        self.assertEqual(self.client.delete(f"/api/suppliers/{jsw}").status_code, 204)  # its only link was deleted
+        self.assertEqual(self.client.delete(f"/api/suppliers/{spare}").status_code, 204)
+        self.assertNotIn(spare, [s_["id"] for s_ in self.client.get("/api/suppliers").json()])
+        # supplier edit (Supplier register)
+        edited = self.client.patch(f"/api/suppliers/{tata}", json={"name": "SR Tata Steel", "country": "India", "status": "On hold"})
+        self.assertEqual((edited.json()["name"], edited.json()["status"]), ("SR Tata Steel", "On hold"))
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns

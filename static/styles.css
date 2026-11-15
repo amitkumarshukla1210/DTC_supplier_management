@@ -497,3 +497,21 @@ small.sob-up { display: block; color: #067647; }
 .sob-uses th, .sob-uses td { padding: 6px 8px; border-bottom: 1px solid #e4ebf0; text-align: left; vertical-align: top; }
 .sob-history-cell { color: #6a7f92; font-size: 12px; }
 .modal:has(#sobForm) { width: min(1100px, 100%); max-height: 92vh; }
+
+/* Excel-like entry tables (Suppliers): one row per entry, every field a column */
+.entry-wrap { overflow-x: auto; }
+.entry-table { width: max-content; border-collapse: collapse; }
+.entry-table th { position: relative; text-align: left; white-space: nowrap; padding: 10px 8px; }
+.entry-table td { padding: 6px 8px; vertical-align: top; border-bottom: 1px solid #e4ebf0; }
+.entry-table .form-control { width: 120px; min-width: 0; }
+.entry-table input[type="month"] { width: 170px; }
+.entry-table select[data-f="price_mode"] { width: 160px; }
+.entry-table select[data-row-link] { width: 320px; }
+.entry-table input[data-f="note"] { width: 220px; }
+.entry-table .entry-pick .form-control { width: 260px; }
+.entry-table .entry-pick .form-control + .form-control { margin-top: 4px; }
+.entry-actions { display: flex; gap: 8px; padding: 12px 16px; }
+.sub-tab-strip { margin-top: -6px; }
+.sub-tab-strip .tab-button { font-size: 12px; }
+#pageContent[data-view="suppliers"] td .text-button + .text-button { margin-left: 12px; }
+#supplierStockForm.inline-upload { max-width: 900px; }

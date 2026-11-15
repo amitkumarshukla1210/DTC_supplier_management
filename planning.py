@@ -547,6 +547,21 @@ class SupplierPartInput(BaseModel):
     price_interval_months: int = Field(default=1, ge=1, le=120)
 
 
+class SupplierPartRows(BaseModel):
+    rows: list[SupplierPartInput]
+
+
+class SupplierStockRow(BaseModel):
+    supplier_part_id: int
+    quantity: float = Field(ge=0)
+    available_quantity: float | None = Field(default=None, ge=0)
+    arrival_month: str | None = None
+
+
+class SupplierStockRows(BaseModel):
+    rows: list[SupplierStockRow]
+
+
 class PlanUpload(BaseModel):
     issue_month: str
     workspace: str = "trial"
@@ -2468,7 +2483,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return {"model_id": model_id, "model_code": model.code, "tab": tab, "rows": len(parsed)}
 
     @app.get("/api/planning/supplier-parts")
-    def list_supplier_parts(request: Request, material_id: int | None = None, offset: int = 0, limit: int = 500, search: str = ""):
+    def list_supplier_parts(request: Request, material_id: int | None = None, offset: int = 0, limit: int = 500, search: str = "", supplier_id: int | None = None):
         current_user(request)
         _check_supply_role(request)
         if limit < 1 or limit > 1000 or offset < 0:
@@ -2479,6 +2494,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             ).order_by(SupplierPart.material_id, SupplierPart.tier, SupplierPart.id)
             if material_id:
                 statement = statement.where(SupplierPart.material_id == material_id)
+            if supplier_id:
+                statement = statement.where(SupplierPart.supplier_id == supplier_id)
             if search.strip():
                 like = f"%{search.strip()}%"
                 statement = statement.where(or_(
@@ -2511,40 +2528,112 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     def add_supplier_part(payload: SupplierPartInput, request: Request):
         current_user(request)
         _check_supply_role(request)
-        if payload.unit_price and not _check_price_access(request):
-            raise HTTPException(status_code=403, detail="Price access is required to set a part price")
-        _month(_month_text(date.today()))
-        if payload.tier != "Direct" and payload.parent_supplier_id is None:
-            raise HTTPException(status_code=422, detail="T1/T2 supplier links must identify the customer supplier they serve")
         with open_db() as db:
-            material = db.get(Item, payload.material_id)
-            if not material or not db.get(Supplier, payload.supplier_id):
-                raise HTTPException(status_code=404, detail="Material or supplier not found")
-            reason = not_purchased_reason(db, material.id)
-            if reason:
-                raise HTTPException(status_code=422, detail=f"{material.code} {reason}, so it cannot have a supplier")
-            share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(
-                SupplierPart.material_id == payload.material_id,
-                SupplierPart.tier == payload.tier,
-                SupplierPart.parent_supplier_id == payload.parent_supplier_id,
-            )) or 0
-            if share_total + payload.sob_percent > 100:
-                raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
-            if payload.parent_supplier_id and not db.get(Supplier, payload.parent_supplier_id):
-                raise HTTPException(status_code=404, detail="Parent supplier not found")
-            existing = db.scalar(select(SupplierPart).where(
-                SupplierPart.material_id == payload.material_id,
-                SupplierPart.supplier_id == payload.supplier_id,
-                SupplierPart.tier == payload.tier,
-                SupplierPart.parent_supplier_id == payload.parent_supplier_id,
-            ))
-            if existing:
-                raise HTTPException(status_code=409, detail="This supplier/material/tier relationship already exists")
-            link = SupplierPart(**payload.model_dump())
-            db.add(link)
+            link = new_supplier_part(db, payload, request)
             db.commit()
             db.refresh(link)
             return {"id": link.id, "material_id": link.material_id, "supplier_id": link.supplier_id, "tier": link.tier, "sob_percent": link.sob_percent}
+
+    @app.post("/api/planning/supplier-parts/rows", status_code=201)
+    def add_supplier_part_rows(payload: SupplierPartRows, request: Request):
+        """Several relationships typed in the entry table: all rows are saved, or none."""
+        current_user(request)
+        _check_supply_role(request)
+        if not payload.rows:
+            raise HTTPException(status_code=422, detail="Add at least one row")
+        with open_db() as db:
+            for index, row in enumerate(payload.rows, start=1):
+                try:
+                    new_supplier_part(db, row, request)
+                except HTTPException as exc:
+                    db.rollback()
+                    raise HTTPException(status_code=exc.status_code, detail=f"Row {index}: {exc.detail}") from exc
+            db.commit()
+            return {"rows": len(payload.rows)}
+
+    @app.delete("/api/planning/supplier-parts/{link_id}", status_code=204)
+    def delete_supplier_part(link_id: int, request: Request):
+        """Delete a supplier/material relationship; refused while it has POs or supplier stock."""
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            link = db.get(SupplierPart, link_id)
+            if not link:
+                raise HTTPException(status_code=404, detail="Supplier/material link not found")
+            pos = db.scalar(select(func.count()).select_from(PlanningPO).where(PlanningPO.supplier_part_id == link_id)) or 0
+            stock = db.scalar(select(func.count()).select_from(SupplierStockSnapshot).where(SupplierStockSnapshot.supplier_part_id == link_id)) or 0
+            if pos or stock:
+                used = ", ".join(text for text in (f"{pos} PO{'s' if pos != 1 else ''}" if pos else "", f"{stock} supplier stock row{'s' if stock != 1 else ''}" if stock else "") if text)
+                raise HTTPException(status_code=409, detail=f"This relationship has {used}; it cannot be deleted. Set its SOB to 0 instead")
+            db.delete(link)
+            db.commit()
+            return Response(status_code=204)
+
+    @app.delete("/api/suppliers/{supplier_id}", status_code=204)
+    def delete_supplier(supplier_id: int, request: Request):
+        """Delete a supplier from the register; refused (with where it is used) while anything uses it."""
+        current_user(request)
+        _check_supply_role(request)
+        from sqlalchemy import text as sa_text
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id)
+            if not supplier:
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            checks = [
+                ("supplier/material relationship", "SELECT COUNT(*) FROM supplier_parts WHERE supplier_id = :id OR parent_supplier_id = :id"),
+                ("supplier material", "SELECT COUNT(*) FROM supplier_materials WHERE supplier_id = :id"),
+                ("supplier BOM line", "SELECT COUNT(*) FROM supplier_bom_lines WHERE supplier_id = :id"),
+                ("supplier BOM source", "SELECT COUNT(*) FROM supplier_bom_line_sources WHERE sub_supplier_id = :id"),
+                ("material transfer", "SELECT COUNT(*) FROM material_transfers WHERE from_supplier_id = :id OR to_supplier_id = :id"),
+                ("purchase order", "SELECT COUNT(*) FROM purchase_orders WHERE supplier_id = :id"),
+                ("stock purchase order", "SELECT COUNT(*) FROM stock_purchase_orders WHERE supplier_id = :id"),
+                ("quote / RFQ", "SELECT (SELECT COUNT(*) FROM quotes WHERE supplier_id = :id) + (SELECT COUNT(*) FROM rfq_invitations WHERE supplier_id = :id) + (SELECT COUNT(*) FROM rfqs WHERE awarded_supplier_id = :id)"),
+                ("material with this preferred supplier", "SELECT COUNT(*) FROM items WHERE preferred_supplier_id = :id"),
+            ]
+            used = []
+            for label, query in checks:
+                count = db.execute(sa_text(query), {"id": supplier_id}).scalar() or 0
+                if count:
+                    used.append(f"{count} {label}{'s' if count != 1 and not label.endswith('RFQ') else ''}")
+            if used:
+                raise HTTPException(status_code=409, detail=f"{supplier.name} is used: {', '.join(used)}. Remove those first, or set its status to On hold")
+            db.delete(supplier)
+            db.commit()
+            return Response(status_code=204)
+
+    def new_supplier_part(db: Session, payload: SupplierPartInput, request: Request) -> SupplierPart:
+        """Check and add one supplier/material relationship (flushed, not committed)."""
+        if payload.unit_price and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a part price")
+        if payload.tier != "Direct" and payload.parent_supplier_id is None:
+            raise HTTPException(status_code=422, detail="T1/T2 supplier links must identify the customer supplier they serve")
+        material = db.get(Item, payload.material_id)
+        if not material or not db.get(Supplier, payload.supplier_id):
+            raise HTTPException(status_code=404, detail="Material or supplier not found")
+        reason = not_purchased_reason(db, material.id)
+        if reason:
+            raise HTTPException(status_code=422, detail=f"{material.code} {reason}, so it cannot have a supplier")
+        share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(
+            SupplierPart.material_id == payload.material_id,
+            SupplierPart.tier == payload.tier,
+            SupplierPart.parent_supplier_id == payload.parent_supplier_id,
+        )) or 0
+        if share_total + payload.sob_percent > 100:
+            raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
+        if payload.parent_supplier_id and not db.get(Supplier, payload.parent_supplier_id):
+            raise HTTPException(status_code=404, detail="Parent supplier not found")
+        existing = db.scalar(select(SupplierPart).where(
+            SupplierPart.material_id == payload.material_id,
+            SupplierPart.supplier_id == payload.supplier_id,
+            SupplierPart.tier == payload.tier,
+            SupplierPart.parent_supplier_id == payload.parent_supplier_id,
+        ))
+        if existing:
+            raise HTTPException(status_code=409, detail=f"{material.code} with this supplier, tier and parent already exists")
+        link = SupplierPart(**payload.model_dump())
+        db.add(link)
+        db.flush()  # later rows of the same batch see it (SOB total, duplicates)
+        return link
 
     @app.post("/api/planning/supplier-parts/upload", status_code=201)
     async def upload_supplier_parts(request: Request):
@@ -3973,6 +4062,66 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"workspace": payload.workspace, "period": payload.period, "rows": saved}
 
+    def save_stock(db: Session, workspace: str, report_month: str, link: SupplierPart, quantity: float, available: float | None, arrival: str | None) -> None:
+        available = quantity if available is None else available
+        if min(quantity, available) < 0 or available > quantity:
+            raise HTTPException(status_code=422, detail="Available quantity must be between zero and reported supplier stock")
+        arrival = (arrival or "").strip() or None
+        if arrival:
+            arrival = _month_text(_month(arrival))
+        existing = db.scalar(select(SupplierStockSnapshot).where(SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == report_month, SupplierStockSnapshot.supplier_part_id == link.id))
+        if existing:
+            existing.quantity, existing.available_quantity, existing.arrival_month = quantity, available, arrival
+        else:
+            db.add(SupplierStockSnapshot(workspace=workspace, report_month=report_month, supplier_part_id=link.id, quantity=quantity, available_quantity=available, arrival_month=arrival))
+            db.flush()
+
+    @app.post("/api/planning/supplier-stock/{report_month}", status_code=201)
+    def save_supplier_stock_rows(report_month: str, payload: SupplierStockRows, request: Request, workspace: str = "trial"):
+        """Supplier stock typed in the entry table (no Excel): one row per relationship. All rows or none;
+        a relationship already reported for the month is updated."""
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        report_month = _month_text(_month(report_month))
+        if not payload.rows:
+            raise HTTPException(status_code=422, detail="Add at least one row")
+        with open_db() as db:
+            seen: set[int] = set()
+            for index, row in enumerate(payload.rows, start=1):
+                link = db.get(SupplierPart, row.supplier_part_id)
+                if not link:
+                    raise HTTPException(status_code=422, detail=f"Row {index}: choose the supplier's material")
+                if row.supplier_part_id in seen:
+                    raise HTTPException(status_code=422, detail=f"Row {index}: this supplier and material is entered twice")
+                seen.add(row.supplier_part_id)
+                try:
+                    save_stock(db, workspace, report_month, link, row.quantity, row.available_quantity, row.arrival_month)
+                except HTTPException as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=f"Row {index}: {exc.detail}") from exc
+            db.commit()
+            return {"workspace": workspace, "report_month": report_month, "rows": len(payload.rows)}
+
+    @app.get("/api/planning/supplier-stock/{report_month}")
+    def list_supplier_stock(report_month: str, request: Request, workspace: str = "trial"):
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        report_month = _month_text(_month(report_month))
+        with open_db() as db:
+            rows = db.execute(
+                select(SupplierStockSnapshot, SupplierPart, Item, Supplier)
+                .join(SupplierPart, SupplierPart.id == SupplierStockSnapshot.supplier_part_id)
+                .join(Item, Item.id == SupplierPart.material_id).join(Supplier, Supplier.id == SupplierPart.supplier_id)
+                .where(SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == report_month)
+                .order_by(Supplier.name, Item.code)
+            ).all()
+            return {"report_month": report_month, "items": [
+                {"id": stock.id, "supplier_part_id": link.id, "supplier_code": supplier.code, "supplier_name": supplier.name,
+                 "material_code": item.code, "material_name": item.name, "uom": item.uom, "tier": link.tier,
+                 "quantity": stock.quantity, "available_quantity": stock.available_quantity, "arrival_month": stock.arrival_month}
+                for stock, link, item, supplier in rows]}
+
     @app.post("/api/planning/supplier-stock/{report_month}/upload", status_code=201)
     async def upload_supplier_stock_excel(report_month: str, request: Request, workspace: str = "trial"):
         current_user(request)
@@ -4013,17 +4162,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     raise HTTPException(status_code=422, detail=f"Supplier/material relationship is ambiguous for {supplier.code} and {item.code}; include tier and parent_supplier_code")
                 link = candidates[0]
                 quantity = float(row.get("quantity") or 0)
-                available = float(row.get("available_quantity") if row.get("available_quantity") is not None else quantity)
-                if min(quantity, available) < 0 or available > quantity:
-                    raise HTTPException(status_code=422, detail="Available quantity must be between zero and reported supplier stock")
-                arrival = str(row.get("arrival_month") or "").strip() or None
-                if arrival:
-                    _month(arrival)
-                existing = db.scalar(select(SupplierStockSnapshot).where(SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == report_month, SupplierStockSnapshot.supplier_part_id == link.id))
-                if existing:
-                    existing.quantity, existing.available_quantity, existing.arrival_month = quantity, available, arrival
-                else:
-                    db.add(SupplierStockSnapshot(workspace=workspace, report_month=report_month, supplier_part_id=link.id, quantity=quantity, available_quantity=available, arrival_month=arrival))
+                available = float(row.get("available_quantity")) if row.get("available_quantity") is not None else None
+                save_stock(db, workspace, report_month, link, quantity, available, str(row.get("arrival_month") or ""))
                 saved += 1
             db.commit()
             return {"workspace": workspace, "report_month": report_month, "rows": saved}

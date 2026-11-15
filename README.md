@@ -60,6 +60,16 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 
 Rules: both codes are in T1 Material Master, are bought parts and use the same unit; an alternate belongs to one main code and has no alternates of its own; a line's alternates add up to at most 100%. Deleting a pair or a BOM line removes its SOB. A code in Alternate codes cannot be deleted from T1 Material Master.
 
+## Suppliers page
+
+Tabs, in order: **Supplier register** (first), Supplier/material relationship, Supplier/material coverage, Upload supplier stock, Supplier-to-supplier material transfer, Transfer schedule, Supplier materials, Supplier BOM. Every table's column widths can be dragged and are remembered per tab.
+
+- **Supplier register:** code, name, category, country, contact, email, phone, approval; Action = Approve (pending), **Edit**, **Delete**. Delete is refused while the supplier is used (relationships, supplier materials / BOM, transfers, POs, RFQs …) and the message says where; set it On hold instead.
+- **Supplier/material relationship** has two sub-tabs: an **Excel-like entry table** (one row per material + supplier, every field a column, + Add row, **Save all**; all rows or none, errors name the row; empty rows are skipped) and **Upload supplier/material relationships** (Excel upload + template).
+- **Supplier/material coverage:** one value per column (material code / name, supplier code / name, tier, parent, SOB, lead time, MOQ, buffer, unit price, currency, price agreement, price status); Action = **Edit** (SOB, lead time, MOQ, buffer, price, currency, agreement) and **Delete** (refused while the relationship has POs or supplier stock).
+- **Upload supplier stock:** type stock in an entry table (supplier → its material relationships, stock quantity, available quantity, arrival month; Save all) or upload a workbook; the month's saved stock is listed below.
+- **Supplier-to-supplier material transfer:** entry table, one row per transfer, Save all.
+
 ## Supplier materials and supplier BOM (cost breakdown)
 
 - **Supplier materials** tab: each supplier's material master. An entry is either picked from your T1, T2 or T3 Material Master (code and name follow your master) or the supplier's own code. Each entry carries the supplier's own price (may differ from yours), lead time and buffer stock. Excel upload links codes found in T1/T2/T3 automatically; other codes become the supplier's own. Supplier BOM lines and alternate codes use only codes from that supplier's material master.
