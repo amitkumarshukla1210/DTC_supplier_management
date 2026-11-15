@@ -44,7 +44,7 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 
 ## Tables
 
-Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹1,800", "40%" or "14 days" sort as numbers; the sorted column is marked ▲ / ▼; in BOM tree tables each parent keeps its lower-level rows under it). Paged tables sort the rows shown on the page. **Add** buttons (Add supplier, Add line, Add material, Add T2/T3 material, + Add row) sit right above their table.
+Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹1,800", "40%" or "14 days" sort as numbers; the sorted column is marked ▲ / ▼; in BOM tree tables each parent keeps its lower-level rows under it). Paged tables sort the rows shown on the page. **Add** buttons (Add supplier, Add line, Add material, Add T2/T3 material, + Add row / Save all) sit right above their table, at the right-hand end. Upload pages use one panel: heading, upload row (workbook, Upload, Download template), then + Add row / Save all and the typing table.
 
 ## Category list
 

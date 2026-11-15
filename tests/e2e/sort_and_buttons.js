@@ -26,6 +26,14 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     await th.locator(`[data-column-sort="${direction}"]`).click();
   };
   const columnTexts = (tableSel, column) => page.locator(`${tableSel} tbody tr`).evaluateAll((rows, c) => rows.map((r) => r.cells[c]?.textContent.trim() || ""), column);
+  // the button's right edge is at the right-hand end of its toolbar / heading row
+  const atRight = (selector) => page.evaluate((sel) => {
+    const button = document.querySelector(sel);
+    const bar = button.closest(".table-toolbar, .entry-actions, .subtable-heading, .new-bom-actions");
+    const b = button.getBoundingClientRect(), r = bar.getBoundingClientRect();
+    const padding = parseFloat(getComputedStyle(bar).paddingRight) || 0;
+    return Math.abs(r.right - padding - b.right) <= 4 || [...bar.querySelectorAll("button, a")].every((el) => el.getBoundingClientRect().right <= b.right + 1);
+  }, selector);
   const above = (first, second) => page.evaluate(([a, b]) => !!(document.querySelector(a).compareDocumentPosition(document.querySelector(b)) & Node.DOCUMENT_POSITION_FOLLOWING), [first, second]);
 
   await page.goto(BASE);
@@ -42,6 +50,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-page="suppliers"]');
   await page.waitForSelector("#supplierRegisterTable tbody tr");
   check("No Add button in the page heading", (await page.locator(".page-heading [data-action]").count()) === 0);
+  check("Add supplier is at the right-hand end", await atRight('[data-action="new-supplier"]'));
   check("Add supplier sits right above the register table", await page.locator('.table-toolbar [data-action="new-supplier"]').isVisible() && await above('[data-action="new-supplier"]', "#supplierRegisterTable table"));
   await sortBy("#supplierRegisterTable", 1, "desc");
   let names = await columnTexts("#supplierRegisterTable", 1);
@@ -67,6 +76,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // entry tables: + Add row / Save all above the table
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
   await page.waitForSelector("#relEntryTable");
+  check("+ Add row / Save all are at the right-hand end", await atRight("#relSaveAll") && await page.evaluate(() => { const add = document.querySelector("#relAddRow").getBoundingClientRect(); const save = document.querySelector("#relSaveAll").getBoundingClientRect(); return add.right <= save.left && save.left - add.right < 20; }));
   check("+ Add row and Save all sit above the relationship table", await above("#relAddRow", "#relEntryTable") && await above("#relSaveAll", "#relEntryTable"));
   await page.click('[data-supplier-tab="Upload supplier stock"]');
   await page.waitForSelector("#stockEntryTable");
@@ -78,12 +88,15 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // Product Master: Add buttons above their tables; numbers sort as numbers
   await page.click('[data-page="master"]');
   await page.waitForSelector("#productMasterTable tbody tr");
+  check("Product Master: Add line at the right-hand end", await atRight('[data-action="new-product"]'));
   check("Product Master: Add line above the table", await above('[data-action="new-product"]', "#productMasterTable table") && (await page.locator(".page-heading [data-action]").count()) === 0);
   await page.click('[data-bom-tab="Material Master"]');
   await page.waitForSelector("#materialMasterTable table");
+  check("T1 Material Master: Add material and Model Master Add line at the right-hand end", await atRight('[data-action="new-material"]') && await atRight('[data-action="new-model"]'));
   check("T1 Material Master: Add material above the table", await above('[data-action="new-material"]', "#materialMasterTable table"));
   await page.click('[data-bom-tab="T2 Material Master"]');
   await page.waitForSelector("#tierMaterialTable tbody tr");
+  check("T2 Material Master: Add T2 material at the right-hand end", await atRight('[data-action="new-tier-material"]'));
   check("T2 Material Master: Add T2 material above the table", await above('[data-action="new-tier-material"]', "#tierMaterialTable table"));
   await sortBy("#tierMaterialTable", 4, "asc");
   const prices = await columnTexts("#tierMaterialTable", 4);
@@ -102,6 +115,13 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const mb = order.findIndex((t) => t.startsWith("0:SB-MB"));
   check("Tree sort: models Z → A, Model A's part stays right under it", mb < ma && order[ma + 1]?.startsWith("1:") && order[ma + 1].endsWith("SB-PART"), JSON.stringify(order));
   await page.screenshot({ path: __dirname + "/sort_and_buttons.png" });
+  await page.click('[data-bom-tab="Material Master"]');
+  await page.waitForSelector("#materialMasterTable table");
+  await page.screenshot({ path: __dirname + "/buttons_material.png" });
+  await page.click('[data-page="suppliers"]');
+  await page.click('[data-supplier-tab="Supplier/material relationship"]');
+  await page.waitForSelector("#relEntryTable");
+  await page.screenshot({ path: __dirname + "/buttons_relationship.png" });
 
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();

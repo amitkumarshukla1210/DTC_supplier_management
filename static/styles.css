@@ -518,3 +518,10 @@ small.sob-up { display: block; color: #067647; }
 .column-sort { display: flex; gap: 12px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid #e4ebf0; }
 th.sorted-asc summary::after { content: " ▲"; font-size: 10px; color: #247ac0; }
 th.sorted-desc summary::after { content: " ▼"; font-size: 10px; color: #247ac0; }
+/* Add buttons (Add supplier, Add line, Add material, + Add row …) always at the right-hand end */
+.table-toolbar .toolbar-add { order: 99; display: flex; gap: 8px; margin-left: auto; }
+.entry-actions, .new-bom-actions { justify-content: flex-end; }
+.subtable-with-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.subtable-with-add .toolbar-add { margin-left: auto; }
+.subtable-with-add .button { margin-left: 0; }
+.subtable-with-add .toolbar-add { margin-left: auto; }

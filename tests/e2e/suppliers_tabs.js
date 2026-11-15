@@ -120,6 +120,10 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-rel-subtab="Upload supplier/material relationships"]');
   await page.waitForSelector("#supplierPartUploadForm");
   check("Upload sub-tab has the upload form and template", await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
+  check("Upload sub-tab: one panel, upload row first, then + Add row / Save all and the table", await page.evaluate(() => {
+    const form = document.querySelector("#supplierPartUploadForm"), table = document.querySelector("#relEntryTable"), add = document.querySelector("#relAddRow");
+    return form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }));
   check("Upload sub-tab also has the typing table with + Add row and Save all", (await page.locator("#relEntryTable tbody tr").count()) === 1 && await page.locator("#relAddRow").isVisible() && await page.locator("#relSaveAll").isVisible());
   const u1 = page.locator("#relEntryTable tbody tr").nth(0);
   await u1.locator("[data-row-material-search]").fill("ST-PCB");
@@ -158,6 +162,10 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const s1 = page.locator("#stockEntryTable tbody tr").nth(0);
   await s1.locator("[data-row-supplier-search]").fill("apex");
   await page.waitForFunction(() => [...document.querySelectorAll("#stockEntryTable [data-row-link] option")].some((o) => o.textContent.includes("ST-STEEL")));
+  check("Stock tab: one panel, upload row first, then + Add row / Save all and the table", await page.evaluate(() => {
+    const form = document.querySelector("#supplierStockForm"), table = document.querySelector("#stockEntryTable"), add = document.querySelector("#stockAddRow");
+    return form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) && !document.body.textContent.includes("Or upload a workbook");
+  }));
   check("Material list shows the chosen supplier's relationships", (await s1.locator("[data-row-link]").inputValue()) !== "");
   await s1.locator('[data-f="quantity"]').fill("500");
   await s1.locator('[data-f="available_quantity"]').fill("400");
