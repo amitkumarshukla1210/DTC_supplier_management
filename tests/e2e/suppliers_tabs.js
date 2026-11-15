@@ -168,6 +168,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-supplier-tab="Supplier/material coverage"]');
   await page.waitForSelector('#supplierPartTable tbody tr:has-text("ST-STEEL")');
   const coverHeads = await page.locator("#supplierPartTable thead th summary").allTextContents();
+  check("Coverage: Supplier code and Supplier name are the 1st and 2nd columns", JSON.stringify(coverHeads.slice(0, 4)) === JSON.stringify(["Supplier code", "Supplier name", "Material code", "Material name"]), JSON.stringify(coverHeads.slice(0, 4)));
+  check("Coverage row values follow the headings", await page.locator('#supplierPartTable tbody tr:has-text("ST-STEEL")').evaluate((tr) => tr.cells[0].textContent.startsWith("SUP-") && tr.cells[2].textContent === "ST-STEEL"));
   check("Coverage shows code and name in separate columns", ["Material code", "Material name", "Supplier code", "Supplier name", "Parent supplier", "Unit price", "Currency", "Price agreement", "Action"].every((h) => coverHeads.includes(h)), JSON.stringify(coverHeads));
   await page.locator('#supplierPartTable tbody tr:has-text("ST-STEEL") [data-edit-supplier-part]').click();
   await page.fill('#supplierPartEditForm [name="sob_percent"]', "70");

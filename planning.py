@@ -4871,10 +4871,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 offset += len(page["items"])
                 if offset >= page["total"]:
                     break
-            headers = ["Material code", "Material name", "Supplier code", "Supplier", "Tier", "Parent supplier", "SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price status"]
+            headers = ["Supplier code", "Supplier name", "Material code", "Material name", "Tier", "Parent supplier", "SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price status"]
             if _check_price_access(request):
                 headers += ["Unit price", "Currency"]
-            rows = [[row["material_code"], row["material_name"], row["supplier_code"], row["supplier_name"], row["tier"], row.get("parent_supplier_name") or "", row["sob_percent"], row["lead_time_days"], row["moq"], row["buffer_days"], row["price_mode"], row["price_status"], *([row.get("unit_price"), row.get("currency")] if _check_price_access(request) else [])] for row in part_rows]
+            rows = [[row["supplier_code"], row["supplier_name"], row["material_code"], row["material_name"], row["tier"], row.get("parent_supplier_name") or "", row["sob_percent"], row["lead_time_days"], row["moq"], row["buffer_days"], row["price_mode"], row["price_status"], *([row.get("unit_price"), row.get("currency")] if _check_price_access(request) else [])] for row in part_rows]
         elif kind == "suppliers":
             with open_db() as db:
                 suppliers = db.scalars(select(Supplier).order_by(Supplier.code)).all()

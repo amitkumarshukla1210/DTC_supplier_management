@@ -1629,6 +1629,9 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/planning/supplier-parts/rows", json={"rows": []}).status_code, 422)
         ok = self.client.post("/api/planning/supplier-parts/rows", json={"rows": [row(steel, tata, 60, 70), row(steel, jsw, 40, 74), row(copper, tata, 100, 700)]})
         self.assertEqual((ok.status_code, ok.json()["rows"]), (201, 3), ok.text)
+        sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/tables/supplier-parts/xlsx").content)).active
+        header = next(r for r in sheet.iter_rows(values_only=True) if r and r[0] == "Supplier code")
+        self.assertEqual(list(header[:4]), ["Supplier code", "Supplier name", "Material code", "Material name"])
         tata_links = self.client.get("/api/planning/supplier-parts", params={"supplier_id": tata}).json()["items"]
         self.assertEqual(sorted(l["material_code"] for l in tata_links), ["SR-COPPER", "SR-STEEL"])
         steel_tata = next(l["id"] for l in tata_links if l["material_code"] == "SR-STEEL")
