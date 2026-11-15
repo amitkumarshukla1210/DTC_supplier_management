@@ -82,6 +82,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   }) && await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
   check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 16 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
   const relHeads = await page.locator("#relEntryTable thead th summary").allTextContents();
+  check("Supplier code and supplier name are the first two columns", JSON.stringify(relHeads.slice(0, 4)) === JSON.stringify(["Supplier code", "Supplier name", "Part code (purchased part)", "Part name"]), JSON.stringify(relHeads.slice(0, 4)));
   check("Code and name in separate columns (part, supplier, parent supplier)", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Parent supplier code (for T1+)", "Parent supplier name"].every((h) => relHeads.includes(h)), JSON.stringify(relHeads.slice(0, 7)));
   check("Column headings have the filter (sort, search, Select all, Clear all)", await page.locator("#relEntryTable thead th").nth(0).evaluate((th) => !!th.querySelector("[data-column-sort]") && !!th.querySelector(".multi-search") && !!th.querySelector("[data-column-select-all]") && !!th.querySelector("[data-column-clear]")));
   const pick = (row, key, part) => row.locator(`[data-pick-key="${key}"][data-pick-part="${part}"]`);
@@ -109,9 +110,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await pick(row2, "supplier", "code").fill("SUP-1001");
   await row2.locator('[data-f="unit_price"]').fill("1800");
   // column filter and sort work on the typed values
-  const partHead = page.locator("#relEntryTable thead th").nth(0);
+  const partHead = page.locator("#relEntryTable thead th").nth(2);
   await partHead.locator("summary").click();
-  await page.waitForFunction(() => document.querySelectorAll("#relEntryTable thead th")[0].querySelectorAll("[data-column-value]").length === 2);
+  await page.waitForFunction(() => document.querySelectorAll("#relEntryTable thead th")[2].querySelectorAll("[data-column-value]").length === 2);
   await partHead.locator('[data-column-value][value="ST-PCB"]').check();
   await partHead.locator("[data-column-apply]").click();
   check("Column filter on typed part codes shows only the chosen rows", await row1.isHidden() && await row2.isVisible());
