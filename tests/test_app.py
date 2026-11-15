@@ -1793,6 +1793,11 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("already used by Northstar Components", self.client.patch(f"/api/suppliers/{apex['id']}", json={"code": " sup-1002 "}).json()["detail"])
         self.assertEqual(self.client.patch(f"/api/suppliers/{apex['id']}", json={"code": "  APX-01 "}).json()["code"], "APX-01")
         self.assertIn("APX-01", suppliers())
+        # Add supplier with your own code; blank code = next free SUP- code; a used code is refused
+        own = self.client.post("/api/suppliers", json={"code": " ILN-02 ", "name": "ILIN Two", "category": "Casting", "country": "India"})
+        self.assertEqual((own.status_code, own.json()["code"]), (201, "ILN-02"))
+        self.assertIn("already used by ILIN Two", self.client.post("/api/suppliers", json={"code": "iln-02", "name": "Other", "category": "Casting", "country": "India"}).json()["detail"])
+        self.assertTrue(self.client.post("/api/suppliers", json={"name": "No Code Co", "category": "Casting", "country": "India"}).json()["code"].startswith("SUP-"))
 
         def sheet(rows, heading=("Vendor Code", "Supplier Name", "Category", "Country", "Contact Person", "E-mail", "Mobile", "Status")):
             workbook = Workbook()

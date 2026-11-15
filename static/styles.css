@@ -515,3 +515,6 @@ small.sob-up { display: block; color: #067647; }
 .sub-tab-strip .tab-button { font-size: 12px; }
 #pageContent[data-view="suppliers"] td .text-button + .text-button { margin-left: 12px; }
 #supplierStockForm.inline-upload { max-width: 900px; }
+.column-sort { display: flex; gap: 12px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid #e4ebf0; }
+th.sorted-asc summary::after { content: " ▲"; font-size: 10px; color: #247ac0; }
+th.sorted-desc summary::after { content: " ▼"; font-size: 10px; color: #247ac0; }

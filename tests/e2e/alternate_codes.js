@@ -131,6 +131,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.evaluate(() => { document.querySelector("#toast").textContent = ""; });
   await page.click('#sobForm button[type="submit"]');
   await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("on 1 use"));
+  await page.waitForFunction(() => document.querySelector('#sobForm [data-sob-level="L1"] tbody tr')?.textContent.includes("30% / 70%"));  // window refreshed
   await page.evaluate(() => { document.querySelector("#modalLayer").hidden = true; });
   await page.click('[data-bom-tab="Model BOM Level 1"]');
   await page.waitForFunction(() => [...document.querySelectorAll("#masterTable tr.tree-alternate")].some((tr) => tr.textContent.includes("alternate 30%")));
@@ -172,6 +173,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.evaluate(() => { document.querySelector("#toast").textContent = ""; });
   await page.click("#sobRemove");
   await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("removed from 1 use"));
+  await page.waitForFunction(() => { const row = document.querySelector('#sobForm [data-sob-level="L2"] tbody tr'); return row && !row.textContent.includes("2099"); });  // window refreshed
   await page.evaluate(() => { document.querySelector("#modalLayer").hidden = true; });
   mainRow = await openMotor();
   check("Motor line no longer shows the removed change", !(await mainRow.textContent()).includes("2099"));

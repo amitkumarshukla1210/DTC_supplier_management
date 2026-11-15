@@ -131,7 +131,7 @@ function table(headers, rows, empty = "No data found.") {
     if (!header) return '<th class="tree-column-heading"><span class="column-resizer" aria-hidden="true"></span></th>';
     const values = [...new Set(dataRows.map((row) => row.cells[index]?.textContent.trim() || "").filter(Boolean))].sort((a, b) => a.localeCompare(b));
     const options = values.map((value) => `<label><input type="checkbox" data-column-value="true" value="${esc(value)}" />${esc(value)}</label>`).join("");
-    return `<th><div class="table-heading"><details class="multi-filter table-column-filter"><summary aria-label="Filter ${esc(header)}">${esc(header)}</summary><div class="multi-popover"><input class="form-control multi-search" type="search" placeholder="Search ${esc(header.toLowerCase())}" /><div class="column-filter-actions"><button type="button" class="text-button" data-column-select-all>Select all</button><button type="button" class="text-button" data-column-clear>Clear all</button></div><div class="multi-options">${options || '<span class="subtle">No values</span>'}</div><button type="button" class="button button-small button-primary column-filter-apply" data-column-apply>Apply</button></div></details><span class="column-resizer" aria-hidden="true"></span></div></th>`;
+    return `<th><div class="table-heading"><details class="multi-filter table-column-filter"><summary aria-label="Filter ${esc(header)}">${esc(header)}</summary><div class="multi-popover"><div class="column-sort"><button type="button" class="text-button" data-column-sort="asc">Sort A → Z</button><button type="button" class="text-button" data-column-sort="desc">Sort Z → A</button></div><input class="form-control multi-search" type="search" placeholder="Search ${esc(header.toLowerCase())}" /><div class="column-filter-actions"><button type="button" class="text-button" data-column-select-all>Select all</button><button type="button" class="text-button" data-column-clear>Clear all</button></div><div class="multi-options">${options || '<span class="subtle">No values</span>'}</div><button type="button" class="button button-small button-primary column-filter-apply" data-column-apply>Apply</button></div></details><span class="column-resizer" aria-hidden="true"></span></div></th>`;
   }).join("");
   return `<div class="table-wrap"><table><thead><tr>${headings}</tr></thead><tbody>${rows || `<tr><td class="table-empty" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
 }
@@ -184,7 +184,7 @@ function field(label, name, type = "text", options = {}) {
 function categoryField(selected) {
   const names = [...state.materialCategories];
   const outside = selected && !names.some((name) => name.toLowerCase() === String(selected).toLowerCase());
-  return `<label class="field"><span>Category</span><select class="form-control" name="category_choice" id="categorySelect" required>${outside ? `<option value="" selected disabled>${esc(selected)} (not in list: choose one)</option>` : ""}${names.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(selected).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control category-new" id="categoryNew" name="category_new" placeholder="Type new category name" minlength="2" maxlength="80" hidden /></label>`;
+  return `<label class="field"><span>Category</span><select class="form-control" name="category_choice" id="categorySelect" required>${!selected ? '<option value="" selected disabled>Select category</option>' : ""}${outside ? `<option value="" selected disabled>${esc(selected)} (not in list: choose one)</option>` : ""}${names.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(selected).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control category-new" id="categoryNew" name="category_new" placeholder="Type new category name" minlength="2" maxlength="80" hidden /></label>`;
 }
 
 // Category dropdown (the one list from Product Master → Category) with "+ Add new category".
@@ -560,14 +560,15 @@ async function renderMaster() {
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search main or alternate code / name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/alternate-codes.xlsx">Template</a><a class="button button-small" href="/api/planning/alternate-codes.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/alternate-codes.pdf">Download PDF</a><a class="button button-small" href="/api/planning/sob-change-log.xlsx">Download SOB history</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="altUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload alternate codes (Main code, Alternate code; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
       <div id="altTable"></div></section>`;
-  content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", actions)}
+  void actions;  // the Add buttons sit in each panel, right above its table
+  content.innerHTML = `${heading("Supply Chain Management", "Build products from model codes in T1 Material Master, define units once, and manage each model’s BOM by level.", "")}
     <div class="tab-strip">${tabs.map((tab) => `<button class="tab-button ${state.bomTab === tab ? "active" : ""}" data-bom-tab="${esc(tab)}">${esc(tab === "Material Master" ? "T1 Material Master" : tab)}</button>`).join("")}</div>
     ${state.bomTab === "Product Master" ? `<section class="panel table-panel">${panelHeader("Product Master")}
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${bomTreeExportLinks()}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div class="table-toolbar"><button class="button button-small button-primary" data-action="new-product">Add line</button><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search product or model" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button>${bomTreeExportLinks()}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="productMasterTable">${table(treeHeaders("Product Master"), productRows, "No products yet.")}</div></section>`
     : state.bomTab === "Material Master" ? `<section class="panel table-panel">${panelHeader("T1 Material Master", "Codes your company uses directly or indirectly and buys from T1 suppliers. Define each code once; the unit selected here is used throughout its BOM and supply chain records. A code can be in only one of T1, T2 or T3.")}
       <div class="master-summaries"><article class="mini-stat"><span>Materials</span><strong id="materialCount">…</strong></article><article class="mini-stat"><span>Models</span><strong>${state.models.length}</strong></article><article class="mini-stat"><span>Products</span><strong>${state.products.length}</strong></article></div>
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search material code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/own-stock.xlsx">Stock template</a>${tableExportLinks("materials")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div class="table-toolbar"><button class="button button-small button-primary" data-action="new-material">Add material</button><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search material code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/templates/own-stock.xlsx">Stock template</a>${tableExportLinks("materials")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="materialMasterTable"></div>
       <h3 class="subtable-heading">Model Master <button class="button button-small button-primary" data-action="new-model">Add line</button>${tableExportLinks("models")}</h3>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="modelMasterSearch" type="search" placeholder="Search model code or name" /></label><button class="button button-small" type="button" data-execute-model-search>Execute</button><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
@@ -576,7 +577,7 @@ async function renderMaster() {
     : logTab ? logSection
     : categoryTab ? categorySection
     : tierTab ? `<section class="panel table-panel">${panelHeader(`${tierTab} Material Master`, `Codes used further down the supply chain (${tierTab === "T2" ? "by your T1 suppliers' suppliers" : "by your T2 suppliers' suppliers"}). Not part of your planning; suppliers pick them into their own material master. A code can be in only one of T1, T2 or T3.`)}
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
+      <div class="table-toolbar"><button class="button button-small button-primary" data-action="new-tier-material">Add ${tierTab} material</button><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="tierUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload ${tierTab} Material Master (Code, Name, Category, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
       <div id="tierMaterialTable"></div></section>`
     : `<section class="panel table-panel ${state.bomTab === "Model BOM Level 1" ? "" : "part-bom-page"}">${panelHeader(state.bomTab)}
@@ -862,7 +863,7 @@ function openNewBomEditor() {
   const candidates = state.bomParentAll.filter((item) => !item.has_bom);
   const levelName = state.bomTab === "Level 2 Part BOM" ? "Level 1" : "Level 2";
   if (!candidates.length) return toast(`Every ${levelName} part already has a BOM. Add lines to an existing BOM instead.`, true);
-  holder.innerHTML = `<div class="new-bom-editor"><div class="new-bom-head"><label class="field"><span>Parent part (${levelName} part without BOM)</span><select class="form-control" id="newBomParent"><option value="">Select parent part</option>${candidates.map((item) => `<option value="${item.id}">${esc(item.code)} · ${esc(item.name)}</option>`).join("")}</select></label><p class="subtle">Parts come from Material Master only. Use a negative quantity for scrap or a by-product; zero is not allowed.</p></div><div class="table-wrap"><table class="new-bom-lines"><thead><tr><th>Search</th><th>Part code</th><th>Part name</th><th>Quantity per parent</th><th>Unit</th><th></th></tr></thead><tbody id="newBomLines">${newBomLineRow()}</tbody></table></div><div class="new-bom-actions"><button type="button" class="button button-small" data-new-bom-add>+ Add line</button><button type="button" class="button button-small button-primary" data-new-bom-save>Save BOM</button><button type="button" class="button button-small" data-new-bom-cancel>Cancel</button></div></div>`;
+  holder.innerHTML = `<div class="new-bom-editor"><div class="new-bom-head"><label class="field"><span>Parent part (${levelName} part without BOM)</span><select class="form-control" id="newBomParent"><option value="">Select parent part</option>${candidates.map((item) => `<option value="${item.id}">${esc(item.code)} · ${esc(item.name)}</option>`).join("")}</select></label><p class="subtle">Parts come from Material Master only. Use a negative quantity for scrap or a by-product; zero is not allowed.</p></div><div class="new-bom-actions"><button type="button" class="button button-small" data-new-bom-add>+ Add line</button><button type="button" class="button button-small button-primary" data-new-bom-save>Save BOM</button><button type="button" class="button button-small" data-new-bom-cancel>Cancel</button></div><div class="table-wrap"><table class="new-bom-lines"><thead><tr><th>Search</th><th>Part code</th><th>Part name</th><th>Quantity per parent</th><th>Unit</th><th></th></tr></thead><tbody id="newBomLines">${newBomLineRow()}</tbody></table></div></div>`;
   const lines = $("#newBomLines");
   const syncLine = (row, id) => {
     row.querySelector("[data-line-code]").value = id;
@@ -1515,8 +1516,7 @@ function sourceRow(source = {}) {
 
 function openSupplierBomSources(line) {
   $("#modalTitle").textContent = `Sources of ${line.component.code}: sub-suppliers / alternate codes`;
-  $("#modalBody").innerHTML = `<div class="sb-sources-editor"><p class="subtle">Unit price of this line = Σ (price × SOB) ÷ Σ SOB. SOB in total at most 100%. Sub-suppliers come from your Supplier register; an alternate code comes from the supplier's material master.</p><div class="table-wrap"><table><thead><tr><th>Sub-supplier</th><th>Alternate code</th><th>Unit price</th><th>Currency</th><th>SOB %</th><th></th></tr></thead><tbody id="sbSourceRows">${(line.sources.length ? line.sources : [{}]).map(sourceRow).join("")}</tbody></table></div>
-    <div class="new-bom-actions"><button type="button" class="button button-small" id="sbAddSource">+ Add source</button><button type="button" class="button button-small button-primary" id="sbSaveSources">Save sources</button></div></div>`;
+  $("#modalBody").innerHTML = `<div class="sb-sources-editor"><p class="subtle">Unit price of this line = Σ (price × SOB) ÷ Σ SOB. SOB in total at most 100%. Sub-suppliers come from your Supplier register; an alternate code comes from the supplier's material master.</p><div class="new-bom-actions"><button type="button" class="button button-small" id="sbAddSource">+ Add source</button><button type="button" class="button button-small button-primary" id="sbSaveSources">Save sources</button></div><div class="table-wrap"><table><thead><tr><th>Sub-supplier</th><th>Alternate code</th><th>Unit price</th><th>Currency</th><th>SOB %</th><th></th></tr></thead><tbody id="sbSourceRows">${(line.sources.length ? line.sources : [{}]).map(sourceRow).join("")}</tbody></table></div></div>`;
   modalLayer.hidden = false;
   const body = $("#sbSourceRows");
   const wire = () => {
@@ -1559,8 +1559,8 @@ async function renderSupplierControl() {
   if (tab === "Supplier/material relationship") {
     if (!RELATIONSHIP_SUBTABS.includes(state.relSubTab)) state.relSubTab = RELATIONSHIP_SUBTABS[0];
     const subTabs = `<div class="tab-strip sub-tab-strip">${RELATIONSHIP_SUBTABS.map((name) => `<button class="tab-button ${state.relSubTab === name ? "active" : ""}" data-rel-subtab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
-    const relEntry = `${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
-        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>`;
+    const relEntry = `<div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
+        ${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}`;
     body = subTabs + (state.relSubTab === RELATIONSHIP_SUBTABS[0]
       ? `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Type one row per material and supplier, like an Excel sheet; + Add row for more, then Save all (all rows or none). SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier. Saved lines are edited or deleted in Supplier/material coverage.")}
         ${relEntry}
@@ -1577,8 +1577,8 @@ async function renderSupplierControl() {
   } else if (tab === "Upload supplier stock") {
     body = `<section class="panel table-panel">${panelHeader("Supplier stock", "Type each supplier's stock for the month in the table (no Excel needed), or upload a workbook below. One row per supplier and material (its relationship); a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
-      ${entryTable("stockEntryTable", ["Supplier", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
       <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="stockAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="stockSaveAll">Save all</button></div>
+      ${entryTable("stockEntryTable", ["Supplier", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
       <h3 class="subtable-heading">Stock entered for the month</h3>
       <div id="stockListTable"></div>
       <h3 class="subtable-heading">Or upload a workbook</h3>
@@ -1597,12 +1597,12 @@ async function renderSupplierControl() {
     const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
     body = `<section class="panel table-panel">${panelHeader("Supplier register", "Add one supplier with Add supplier, or many at once with an Excel upload (your own headings are fine). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.")}
       <form id="supplierUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier list workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload suppliers</button><a class="button" href="/api/planning/templates/suppliers.xlsx">Download template</a></form>
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
+      <div class="table-toolbar"><button class="button button-small button-primary" data-action="new-supplier">Add supplier</button><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
   } else if (tab === "Supplier-to-supplier material transfer") {
     body = `<section class="panel table-panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus, one row per transfer; + Add row for more, then Save all. The receiving supplier is credited in projected coverage in the transfer month. Saved transfers are listed in Transfer schedule.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
-      ${entryTable("transferEntryTable", ["Material (purchased part)", "From supplier", "To supplier", "Transfer quantity", "Transfer / arrival month", "Transfer note"])}
       <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="transferAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="transferSaveAll">Save all</button></div>
+      ${entryTable("transferEntryTable", ["Material (purchased part)", "From supplier", "To supplier", "Transfer quantity", "Transfer / arrival month", "Transfer note"])}
     </section>`;
   } else if (tab === "Supplier materials") {
     body = `<section class="panel table-panel">${panelHeader("Supplier materials", "Each supplier's own material codes (e.g. solder wire, paste, connector). They are used only in that supplier's BOMs for cost breakdown.")}
@@ -1633,7 +1633,7 @@ async function renderSupplierControl() {
   } else {
     body = `<section id="transferTable" class="panel table-panel">${panelHeader("Transfer schedule")}<div class="tree-loading">Loading…</div></section>`;
   }
-  content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", `<button class="button" data-action="new-supplier">Add supplier</button>`)}${tabs}${body}`;
+  content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", "")}${tabs}${body}`;
   bindSupplierSearch(content);
 
   if (tab === "Supplier/material relationship" && $("#relEntryTable")) {
@@ -2186,7 +2186,7 @@ function openModal(type, record = {}) {
     form = `<form id="modalForm" class="form-grid"><label class="field full"><span>Parent part</span><select class="form-control" name="parent_item_id" required ${record.parent_item_id ? "disabled" : ""}>${parents}</select>${record.parent_item_id ? `<input type="hidden" name="parent_item_id" value="${record.parent_item_id}" />` : ""}</label><label class="field full"><span>Search Material Master by code or name</span><input class="form-control" id="modalMaterialSearch" type="search" placeholder="Type a material code or name" /></label><label class="field"><span>Part code from Material Master</span><select class="form-control" name="child_item_id" id="modalMaterialSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.code)}</option>`).join("")}</select></label><label class="field"><span>Part name from Material Master</span><select class="form-control" id="modalMaterialNameSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.name)}</option>`).join("")}</select></label><label class="field"><span>Unit from Material Master</span><input class="form-control" id="modalMaterialUnit" value="${esc(selectedMaterial?.uom || "")}" readonly /></label>${field("Quantity per parent", "quantity", "number", { required: true, min: -1000000000, max: 1000000000, step: "any", value: record.quantity ?? 1 })}<div class="score-explainer field full">${parent ? `Adding parts to ${esc(parent.code)} · ${esc(parent.name)}. Choose each purchased or in-house-made child part from Material Master; repeat at the next level for further operations.` : "Choose the child part from Material Master. Repeat at the next level for further in-house operations."} Use a negative quantity for scrap or a by-product. Quantity cannot be zero.</div><div class="modal-footer field full"><button class="button button-primary">Save BOM line</button></div></form>`;
   } else if (type === "supplier") {
     title = "Add supplier";
-    form = `<form id="modalForm" class="form-grid">${field("Supplier name", "name", "text", { required: true })}${categoryField("")}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
+    form = `<form id="modalForm" class="form-grid">${field("Supplier code (blank = next free SUP- code)", "code", "text", { maxlength: 24, placeholder: "e.g. ILN-01" })}${field("Supplier name", "name", "text", { required: true })}${categoryField("")}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
   }
   // Alternate code SOB on this BOM line: shown here, changed only in Alternate codes → Manage SOB
   const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
@@ -2282,7 +2282,45 @@ function openModal(type, record = {}) {
   });
 }
 
+// Sort a table by a column (from the column's filter pop-up). Numbers (also "₹1,800", "40%",
+// "14 days") sort as numbers, text alphabetically. Tree tables keep each parent's lower-level
+// rows directly below it: groups of rows move together.
+function sortValue(cell) {
+  const text = (cell?.textContent || "").trim();
+  const match = text.replace(/^[₹$€£¥]\s*/, "").replace(/,/g, "").match(/^-?\d+(\.\d+)?/);
+  return { text, number: match ? Number(match[0]) : null };
+}
+function sortTableByColumn(tableNode, column, direction) {
+  const body = tableNode.tBodies[0];
+  if (!body) return;
+  const rows = [...body.rows].filter((row) => !row.querySelector(".table-empty"));
+  const depth = (row) => Number(row.dataset.treeDepth || 0);
+  const groups = [];
+  rows.forEach((row) => {
+    if (!groups.length || depth(row) <= depth(groups[groups.length - 1][0])) groups.push([row]);
+    else groups[groups.length - 1].push(row);
+  });
+  const sign = direction === "desc" ? -1 : 1;
+  groups.sort((a, b) => {
+    const x = sortValue(a[0].cells[column]);
+    const y = sortValue(b[0].cells[column]);
+    if (x.number !== null && y.number !== null && x.number !== y.number) return sign * (x.number - y.number);
+    if (!x.text !== !y.text) return x.text ? -1 : 1;  // blanks last
+    return sign * x.text.localeCompare(y.text, undefined, { numeric: true, sensitivity: "base" });
+  });
+  groups.flat().forEach((row) => body.appendChild(row));
+  tableNode.querySelectorAll("thead th").forEach((th) => th.classList.remove("sorted-asc", "sorted-desc"));
+  tableNode.tHead.rows[0].cells[column]?.classList.add(direction === "desc" ? "sorted-desc" : "sorted-asc");
+}
+
 document.addEventListener("click", async (event) => {
+  const sortButton = event.target.closest("[data-column-sort]");
+  if (sortButton) {
+    const header = sortButton.closest("th");
+    sortTableByColumn(header.closest("table"), header.cellIndex, sortButton.dataset.columnSort);
+    sortButton.closest("details")?.removeAttribute("open");
+    return;
+  }
   const columnAction = event.target.closest("[data-column-select-all], [data-column-clear], [data-column-apply]");
   if (columnAction) {
     const filter = columnAction.closest(".table-column-filter");

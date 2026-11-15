@@ -240,6 +240,7 @@ class QuoteDecision(BaseModel):
 
 
 class SupplierCreate(BaseModel):
+    code: str = Field(default="", max_length=24)  # blank = next free SUP- code
     name: str = Field(min_length=2, max_length=160)
     category: str = Field(min_length=2, max_length=80)
     country: str = Field(min_length=2, max_length=80)
@@ -579,8 +580,13 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
         sequence = int(db.scalar(select(func.count(Supplier.id))) or 0) + 1001
         while f"SUP-{sequence:04d}" in used_codes:
             sequence += 1
+        code = payload.code.strip()
+        if code:
+            taken = db.scalar(select(Supplier.name).where(func.lower(Supplier.code) == code.lower()))
+            if taken:
+                raise HTTPException(status_code=409, detail=f"Supplier code {code} is already used by {taken}")
         supplier = Supplier(
-            code=f"SUP-{sequence:04d}",
+            code=code or f"SUP-{sequence:04d}",
             name=payload.name.strip(),
             category=_ensure_category(db, payload.category),
             country=payload.country.strip(),

@@ -42,6 +42,10 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 - **T2 / T3 Material Master** tabs: codes used further down the supply chain (by your suppliers' suppliers): code, name, category, unit, reference price. Form, edit/delete, search, Excel upload/download.
 - A code can be in only one of T1, T2 or T3 (checked on every save and upload, case-insensitive).
 
+## Tables
+
+Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹1,800", "40%" or "14 days" sort as numbers; the sorted column is marked ▲ / ▼; in BOM tree tables each parent keeps its lower-level rows under it). Paged tables sort the rows shown on the page. **Add** buttons (Add supplier, Add line, Add material, Add T2/T3 material, + Add row) sit right above their table.
+
 ## Category list
 
 **Product Master → Category** holds the one category list used for parts (T1, T2, T3) and suppliers; every category field is a dropdown from it with **+ Add new category**. Add, rename (every part and supplier using it follows) or delete (refused while used). A new category typed in a dropdown or found in an Excel upload is added to the list automatically, written as in the list when only the capitals differ ("steel raw MATERIAL" → "Steel Raw material").
