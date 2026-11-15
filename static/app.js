@@ -1155,12 +1155,16 @@ function entryHeading(label) {
 function entryTable(id, labels) {
   return `<div class="table-wrap entry-wrap"><table class="entry-table" id="${id}"><thead><tr>${labels.map(entryHeading).join("")}${entryHeading("")}</tr></thead><tbody></tbody></table></div>`;
 }
+// Code and name in their own columns: the code column has the search box and the code list,
+// the name column the same list by name; picking either one fills the other.
 function entryMaterialCell() {
-  return `<td class="entry-pick"><input class="form-control" type="search" data-row-material-search placeholder="Search code / name" /><select class="form-control" data-row-material><option value="">Loading…</option></select></td>`;
+  return `<td class="entry-pick"><input class="form-control" type="search" data-row-material-search placeholder="Search code / name" /><select class="form-control" data-row-material><option value="">Loading…</option></select></td><td class="entry-name"><select class="form-control" data-row-material-name><option value="">Loading…</option></select></td>`;
 }
 function entrySupplierCell(key, optional = false) {
-  const options = state.suppliers.map((supplier) => `<option value="${supplier.id}">${esc(supplier.code)} · ${esc(supplier.name)}</option>`).join("");
-  return `<td class="entry-pick"><input class="form-control" type="search" data-row-supplier-search placeholder="Search supplier" /><select class="form-control" data-row-supplier="${key}">${optional ? '<option value="">None / Direct</option>' : '<option value="">Select supplier</option>'}${options}</select></td>`;
+  const first = optional ? '<option value="">None / Direct</option>' : '<option value="">Select supplier</option>';
+  const codes = state.suppliers.map((supplier) => `<option value="${supplier.id}">${esc(supplier.code)}</option>`).join("");
+  const names = state.suppliers.map((supplier) => `<option value="${supplier.id}" data-code="${esc(supplier.code)}">${esc(supplier.name)}</option>`).join("");
+  return `<td class="entry-pick"><input class="form-control" type="search" data-row-supplier-search placeholder="Search code / name" /><select class="form-control" data-row-supplier="${key}">${first}${codes}</select></td><td class="entry-name"><select class="form-control" data-row-supplier-name="${key}">${first}${names}</select></td>`;
 }
 const entryRemoveCell = '<td><button type="button" class="text-button button-danger" data-entry-remove>Remove</button></td>';
 async function loadRowMaterials(row, search = "") {
@@ -1169,7 +1173,9 @@ async function loadRowMaterials(row, search = "") {
   try {
     const result = await api(`/api/planning/materials?${new URLSearchParams({ offset: "0", limit: "100", search, purchased: "true" })}`);
     const keep = select.value;
-    select.innerHTML = `<option value="">Select part code</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.code)} · ${esc(item.name)}</option>`).join("")}`;
+    select.innerHTML = `<option value="">Select part code</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.code)}</option>`).join("")}`;
+    const names = row.querySelector("[data-row-material-name]");
+    if (names) names.innerHTML = `<option value="">Select part name</option>${result.items.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join("")}`;
     select.value = result.items.some((item) => String(item.id) === keep) ? keep : (result.items.length === 1 && search ? String(result.items[0].id) : "");
     select.dispatchEvent(new Event("change", { bubbles: true }));
   } catch (error) { toast(error.message, true); }
@@ -1192,10 +1198,11 @@ function bindEntryTable(tableId, newRow, onChange = null) {
     if (event.target.matches("[data-row-supplier-search]")) {
       const needle = event.target.value.trim().toLowerCase();
       const select = event.target.nextElementSibling;
-      const visible = [...select.options].filter((option) => {
-        option.hidden = Boolean(option.value) && Boolean(needle) && !option.textContent.toLowerCase().includes(needle);
-        return option.value && !option.hidden;
-      });
+      const nameSelect = row.querySelector(`[data-row-supplier-name="${select.dataset.rowSupplier}"]`);
+      // search matches the code or the name; both lists show the same suppliers
+      const matches = new Set([...nameSelect.options].filter((option) => option.value && (!needle || `${option.dataset.code} ${option.textContent}`.toLowerCase().includes(needle))).map((option) => option.value));
+      [select, nameSelect].forEach((list) => [...list.options].forEach((option) => { option.hidden = Boolean(option.value) && !matches.has(option.value); }));
+      const visible = [...select.options].filter((option) => option.value && !option.hidden);
       if (needle && visible.length === 1) { select.value = visible[0].value; select.dispatchEvent(new Event("change", { bubbles: true })); }
     }
   });
@@ -1204,7 +1211,16 @@ function bindEntryTable(tableId, newRow, onChange = null) {
     if (body.rows.length > 1) event.target.closest("tr").remove();
     else toast("Keep at least one row (leave it empty if not needed).", true);
   });
-  if (onChange) body.addEventListener("change", (event) => onChange(event.target.closest("tr"), event.target));
+  // keep each code list and its name list on the same choice
+  body.addEventListener("change", (event) => {
+    const target = event.target;
+    const row = target.closest("tr");
+    if (target.matches("[data-row-material]")) { const names = row.querySelector("[data-row-material-name]"); if (names) names.value = target.value; }
+    if (target.matches("[data-row-supplier]")) { const names = row.querySelector(`[data-row-supplier-name="${target.dataset.rowSupplier}"]`); if (names) names.value = target.value; }
+    if (target.matches("[data-row-material-name]")) { const codes = row.querySelector("[data-row-material]"); codes.value = target.value; codes.dispatchEvent(new Event("change", { bubbles: true })); }
+    if (target.matches("[data-row-supplier-name]")) { const codes = row.querySelector(`[data-row-supplier="${target.dataset.rowSupplierName}"]`); codes.value = target.value; codes.dispatchEvent(new Event("change", { bubbles: true })); }
+  });
+  if (onChange) body.addEventListener("change", (event) => { if (!event.target.matches("[data-row-material-name], [data-row-supplier-name]")) onChange(event.target.closest("tr"), event.target); });
   add();
   return { add, rows: () => [...body.rows], reset: () => { body.innerHTML = ""; add(); } };
 }
@@ -1560,7 +1576,7 @@ async function renderSupplierControl() {
     if (!RELATIONSHIP_SUBTABS.includes(state.relSubTab)) state.relSubTab = RELATIONSHIP_SUBTABS[0];
     const subTabs = `<div class="tab-strip sub-tab-strip">${RELATIONSHIP_SUBTABS.map((name) => `<button class="tab-button ${state.relSubTab === name ? "active" : ""}" data-rel-subtab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
     const relEntry = `<div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
-        ${entryTable("relEntryTable", ["Material (purchased part)", "Supplier", "Tier (Direct, T1, T2…)", "Parent supplier (for T1+)", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}`;
+        ${entryTable("relEntryTable", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Tier (Direct, T1, T2…)", "Parent supplier code (for T1+)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}`;
     body = subTabs + (state.relSubTab === RELATIONSHIP_SUBTABS[0]
       ? `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Type one row per material and supplier, like an Excel sheet; + Add row for more, then Save all (all rows or none). SOB applies within a material, tier and parent-supplier route; each group is limited to 100%. Only purchased parts are listed: parts with an in-house BOM or a negative BOM quantity cannot have a supplier. Saved lines are edited or deleted in Supplier/material coverage.")}
         ${relEntry}
@@ -1580,7 +1596,7 @@ async function renderSupplierControl() {
         <button class="button button-primary" type="submit">Upload supplier stock</button><a class="button" href="/api/planning/templates/supplier-stock.xlsx">Download template</a>
       </form>
       <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="stockAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="stockSaveAll">Save all</button></div>
-      ${entryTable("stockEntryTable", ["Supplier", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
+      ${entryTable("stockEntryTable", ["Supplier code", "Supplier name", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
       <h3 class="subtable-heading">Stock entered for the month</h3>
       <div id="stockListTable"></div>
     </section>`;
@@ -1598,7 +1614,7 @@ async function renderSupplierControl() {
     body = `<section class="panel table-panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus, one row per transfer; + Add row for more, then Save all. The receiving supplier is credited in projected coverage in the transfer month. Saved transfers are listed in Transfer schedule.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
       <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="transferAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="transferSaveAll">Save all</button></div>
-      ${entryTable("transferEntryTable", ["Material (purchased part)", "From supplier", "To supplier", "Transfer quantity", "Transfer / arrival month", "Transfer note"])}
+      ${entryTable("transferEntryTable", ["Part code (purchased part)", "Part name", "From supplier code", "From supplier name", "To supplier code", "To supplier name", "Transfer quantity", "Transfer / arrival month", "Transfer note"])}
     </section>`;
   } else if (tab === "Supplier materials") {
     body = `<section class="panel table-panel">${panelHeader("Supplier materials", "Each supplier's own material codes (e.g. solder wire, paste, connector). They are used only in that supplier's BOMs for cost breakdown.")}

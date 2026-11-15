@@ -70,7 +70,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.selectOption("#modalForm #categorySelect", "Casting");
   await page.fill('#modalForm [name="country"]', "India");
   await page.click("#modalForm .modal-footer button");
-  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("ZZ-01"));
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ZZ-01"));
   check("Supplier added with your own code", (await page.locator('#supplierRegisterTable tbody tr:has-text("Zeta Castings") td').first().textContent()) === "ZZ-01");
 
   // entry tables: + Add row / Save all above the table

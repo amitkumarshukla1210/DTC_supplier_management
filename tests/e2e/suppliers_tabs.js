@@ -49,18 +49,18 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.fill('#supplierEditForm [name="name"]', "ST Spare Supplier Two");
   await page.selectOption('#supplierEditForm [name="status"]', "On hold");
   await page.click("#supplierEditForm button");
-  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("ST Spare Supplier Two"));
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Spare Supplier Two"));
   check("Edit a supplier (name, approval)", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two")').textContent()).includes("On hold"));
   // change the supplier code; a used code is refused
   await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-edit-supplier]').click();
   await page.fill('#supplierEditForm [name="code"]', "SUP-1001");
   await clearToast();
   await page.click("#supplierEditForm button");
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("already used"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("already used"));
   check("A supplier code already used is refused", (await toastText()).includes("Apex Precision Works"), await toastText());
   await page.fill('#supplierEditForm [name="code"]', "SPARE-01");
   await page.click("#supplierEditForm button");
-  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("SPARE-01"));
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("SPARE-01"));
   check("Change a supplier code", true);
   // bulk upload of suppliers + template
   check("Register has supplier upload and template", await page.locator('#supplierUploadForm a[href="/api/planning/templates/suppliers.xlsx"]').isVisible());
@@ -68,7 +68,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     await page.setInputFiles('#supplierUploadForm input[type="file"]', process.env.SUP_XLSX);
     await clearToast();
     await page.click('#supplierUploadForm button[type="submit"]');
-    await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("Bulk Harness Co"));
+    await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("Bulk Harness Co"));
     check("Upload suppliers in bulk (2 added)", (await toastText()).includes("2 supplier(s) added"), await toastText());
   }
 
@@ -77,7 +77,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForSelector("#relEntryTable tbody tr");
   const subTabs = await page.locator("[data-rel-subtab]").allTextContents();
   check("Relationship tab has two sub-tabs", JSON.stringify(subTabs) === JSON.stringify(["Supplier/material relationship", "Upload supplier/material relationships"]), JSON.stringify(subTabs));
-  check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 13 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
+  check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 16 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
   const row1 = page.locator("#relEntryTable tbody tr").nth(0);
   await row1.locator("[data-row-material-search]").fill("ST-");
   await page.waitForFunction(() => { const t = [...document.querySelectorAll("#relEntryTable tbody tr")[0].querySelectorAll("[data-row-material] option")].map((o) => o.textContent); return t.some((x) => x.includes("ST-PCB")) && t.length <= 4; });
@@ -85,8 +85,12 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Material list = purchased parts only (no Motor with BOM, no negative-qty Scrap)", JSON.stringify(options) === JSON.stringify(["ST-PCB", "ST-STEEL"]), JSON.stringify(options));
   await row1.locator("[data-row-material]").selectOption(String(steel));
   await row1.locator("[data-row-supplier-search]").first().fill("apex");
-  const visible = await row1.locator('[data-row-supplier="supplier"] option').evaluateAll((os) => os.filter((o) => !o.hidden && o.value).map((o) => o.textContent));
+  const relHeads = await page.locator("#relEntryTable thead th").allTextContents();
+  check("Code and name in separate columns (part, supplier, parent supplier)", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Parent supplier code (for T1+)", "Parent supplier name"].every((h) => relHeads.includes(h)), JSON.stringify(relHeads.slice(0, 7)));
+  check("Choosing the part code fills the part name", (await row1.locator("[data-row-material-name] option:checked").textContent()) === "Steel 0.8");
+  const visible = await row1.locator('[data-row-supplier-name="supplier"] option').evaluateAll((os) => os.filter((o) => !o.hidden && o.value).map((o) => o.textContent));
   check("Supplier search filters the row's supplier list (one match is picked)", visible.length === 1 && visible[0].toLowerCase().includes("apex") && (await row1.locator('[data-row-supplier="supplier"]').inputValue()) !== "", JSON.stringify(visible));
+  check("Supplier code column shows the code, name column the name", (await row1.locator('[data-row-supplier="supplier"] option:checked').textContent()).startsWith("SUP-") && (await row1.locator('[data-row-supplier-name="supplier"] option:checked').textContent()).includes("Apex"));
   await row1.locator('[data-f="sob_percent"]').fill("60");
   await row1.locator('[data-f="unit_price"]').fill("105");
   // second row: PCB with the same supplier
@@ -94,13 +98,15 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const row2 = page.locator("#relEntryTable tbody tr").nth(1);
   await row2.locator("[data-row-material-search]").fill("ST-PCB");
   await page.waitForFunction(() => document.querySelectorAll("#relEntryTable tbody tr")[1].querySelector("[data-row-material]").value !== "");
-  await row2.locator("[data-row-supplier-search]").first().fill("apex");
+  const apexId = await row1.locator('[data-row-supplier="supplier"]').inputValue();
+  await row2.locator('[data-row-supplier-name="supplier"]').selectOption(apexId);
+  check("Choosing the supplier name fills the supplier code", (await row2.locator('[data-row-supplier="supplier"]').inputValue()) === apexId);
   await row2.locator('[data-f="unit_price"]').fill("1800");
   // third row left empty: ignored
   await page.click("#relAddRow");
   await clearToast();
   await page.click("#relSaveAll");
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("saved"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("saved"));
   check("Save all saves the filled rows and skips the empty one", (await toastText()).includes("2 supplier/material relationships saved"), await toastText());
   check("Entry table is cleared after saving", (await page.locator("#relEntryTable tbody tr").count()) === 1);
   const links = await api("GET", "/api/planning/supplier-parts?limit=1000&search=ST-");
@@ -114,7 +120,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await r.locator('[data-f="sob_percent"]').fill("50");
   await clearToast();
   await page.click("#relSaveAll");
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Row 1"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
   check("Over 100% SOB is refused with the row number", (await toastText()).includes("Row 1: Supplier SOB cannot exceed 100%"), await toastText());
 
   await page.click('[data-rel-subtab="Upload supplier/material relationships"]');
@@ -132,7 +138,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await u1.locator('[data-f="sob_percent"]').fill("0");
   await clearToast();
   await page.click("#relSaveAll");
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("saved"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("saved"));
   check("Save all works on the upload sub-tab", (await toastText()).includes("1 supplier/material relationship saved"), await toastText());
   if (process.env.REL_XLSX && fs.existsSync(process.env.REL_XLSX)) {
     await page.setInputFiles('#supplierPartUploadForm input[type="file"]', process.env.REL_XLSX);
@@ -171,7 +177,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await s1.locator('[data-f="available_quantity"]').fill("400");
   await clearToast();
   await page.click("#stockSaveAll");
-  await page.waitForFunction(() => document.querySelector("#stockListTable").textContent.includes("ST-STEEL"));
+  await page.waitForFunction(() => document.querySelector("#stockListTable")?.textContent.includes("ST-STEEL"));
   const stockCells = await page.locator('#stockListTable tr:has-text("ST-STEEL") td').allTextContents();
   check("Stock saved without Excel and listed for the month", stockCells.includes("500") && stockCells.includes("400"), JSON.stringify(stockCells));
   await s1.locator("[data-row-supplier-search]").fill("apex");
@@ -180,7 +186,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.locator("#stockEntryTable tbody tr").nth(0).locator('[data-f="available_quantity"]').fill("20");
   await clearToast();
   await page.click("#stockSaveAll");
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Row 1"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
   check("Wrong stock row is refused with the row number", (await toastText()).includes("Row 1: Available quantity"), await toastText());
 
   // a used supplier cannot be deleted; an unused one can
@@ -188,10 +194,10 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForSelector("#supplierRegisterTable tbody tr");
   await clearToast();
   await page.locator('#supplierRegisterTable tbody tr:has-text("Apex") [data-delete-supplier]').click();
-  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("is used"));
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("is used"));
   check("Deleting a used supplier is refused with where it is used", (await toastText()).includes("supplier/material relationship"), await toastText());
   await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-delete-supplier]').click();
-  await page.waitForFunction(() => !document.querySelector("#supplierRegisterTable").textContent.includes("ST Spare Supplier Two"));
+  await page.waitForFunction(() => { const t = document.querySelector("#supplierRegisterTable"); return t && t.querySelector("tbody tr") && !t.textContent.includes("ST Spare Supplier Two"); });
   check("Delete an unused supplier", true);
   void spare;
 
@@ -199,7 +205,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-supplier-tab="Supplier-to-supplier material transfer"]');
   await page.waitForSelector("#transferEntryTable tbody tr");
   const t1 = page.locator("#transferEntryTable tbody tr").nth(0);
-  check("Transfer entry is a table row", (await page.locator("#transferEntryTable thead th").count()) === 7);
+  check("Transfer entry is a table row", (await page.locator("#transferEntryTable thead th").count()) === 10);
   await t1.locator("[data-row-material-search]").fill("ST-MOTOR");
   await page.waitForTimeout(800);
   check("Transfer material list excludes in-house parts", !(await t1.locator("[data-row-material] option").allTextContents()).some((t) => t.includes("ST-MOTOR")));
