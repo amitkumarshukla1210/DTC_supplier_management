@@ -29,7 +29,22 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 from starlette.responses import JSONResponse
 import xlsxwriter
 
-from app import Base, BOMComponent, Category, CATEGORY_TABLES, Item, MaterialRequest, Supplier, _ensure_category
+from app import Base, BOMComponent, Category, CATEGORY_TABLES, Item, MaterialRequest, SUPPLIER_TIERS, Supplier, _ensure_category, _tier_list, _tier_text
+
+
+TOP_TIER = "T1"  # supplies you directly (formerly called Direct)
+
+
+def _normalize_tier(value: Any) -> str:
+    """'T1', 't2', 'Direct' (= T1) ... -> 'T1', 'T2' ...; anything else is refused."""
+    text = str(value or "").strip().upper().replace(" ", "").replace("-", "")
+    if text in {"", "DIRECT"}:
+        return TOP_TIER
+    if re.fullmatch(r"TIER[1-9]", text):  # "Tier 2" -> T2
+        text = "T" + text[4:]
+    if not re.fullmatch(r"T[1-9]", text):
+        raise HTTPException(status_code=422, detail=f"Tier must be T1 (supplies you), T2, T3 …; got {value!r}")
+    return text
 
 
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -156,13 +171,17 @@ class ModelBOM(Base):
 
 
 class SupplierPart(Base):
+    """Who supplies a part: tier T1 = supplies you (a T1 Material Master code you buy); T2 = supplies
+    a T1 supplier (parent), T3 = supplies a T2 supplier ... A T2/T3 row may use a code from the T2 / T3
+    Material Master (tier_material_id) instead of a T1 code (material_id): exactly one is set."""
     __tablename__ = "supplier_parts"
     __table_args__ = (UniqueConstraint("material_id", "supplier_id", "tier", "parent_supplier_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    material_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
+    material_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=True, index=True)
+    tier_material_id: Mapped[int | None] = mapped_column(ForeignKey("tier_materials.id"), nullable=True, index=True)
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
-    tier: Mapped[str] = mapped_column(String(24), default="Direct", index=True)
+    tier: Mapped[str] = mapped_column(String(24), default="T1", index=True)
     parent_supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True, index=True)
     sob_percent: Mapped[float] = mapped_column(Float, default=100)
     lead_time_days: Mapped[int] = mapped_column(Integer, default=0)
@@ -173,6 +192,14 @@ class SupplierPart(Base):
     price_mode: Mapped[str] = mapped_column(String(24), default="spot")
     price_interval_months: Mapped[int] = mapped_column(Integer, default=1)
     price_updated_month: Mapped[str] = mapped_column(String(7), default=lambda: _month_text(date.today()))
+
+
+class AppSetting(Base):
+    """One-time data updates already done (key = name of the update)."""
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(200), default="")
 
 
 class PlanningCycle(Base):
@@ -533,9 +560,10 @@ class NewPartBOMInput(BaseModel):
 
 
 class SupplierPartInput(BaseModel):
-    material_id: int
+    material_id: int | None = None  # T1 Material Master code
+    tier_material_id: int | None = None  # T2 / T3 Material Master code (T2/T3 rows only)
     supplier_id: int
-    tier: str = Field(default="Direct", min_length=2, max_length=24)
+    tier: str = Field(default="T1", min_length=2, max_length=24)
     parent_supplier_id: int | None = None
     sob_percent: float = Field(default=100, ge=0, le=100)
     lead_time_days: int = Field(default=0, ge=0, le=5000)
@@ -703,6 +731,7 @@ SUPPLIER_COLUMN_ALIASES = {
     "email": "email", "e-mail": "email", "email_id": "email", "mail": "email",
     "phone": "phone", "mobile": "phone", "phone_number": "phone", "contact_number": "phone", "mobile_number": "phone",
     "approval": "status", "status": "status", "approval_status": "status",
+    "tier": "tiers", "tiers": "tiers", "supplier_tier": "tiers", "supplier_tiers": "tiers",
 }
 
 ALTERNATE_CODE_COLUMN_ALIASES = {
@@ -1074,7 +1103,7 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
             groups: dict[tuple[str, int | None], list[SupplierPart]] = {}
             for link in links:
                 groups.setdefault((link.tier, link.parent_supplier_id), []).append(link)
-            direct_links = groups.get(("Direct", None), [])
+            direct_links = groups.get((TOP_TIER, None), [])
             if not groups:
                 groups[("Unassigned", None)] = []
             own_stock_used = 0.0
@@ -1104,7 +1133,7 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
                     allocated_actual = actual_demand * link.sob_percent / 100 if actual_demand is not None else None
                     own_stock_allocated = (
                         own_stock_opening.get(material_id, 0) * link.sob_percent / 100
-                        if tier == "Direct" and parent_id is None else 0
+                        if tier == TOP_TIER and parent_id is None else 0
                     )
                     supplier_balance = projected[link.id] + incoming + transfer_delta - allocated_demand
                     balance = supplier_balance + own_stock_allocated
@@ -1157,7 +1186,7 @@ def _planning_report(db: Session, workspace: str, start_month: str, end_month: s
                     unassigned = material_demand * unassigned_share / 100
                     own_stock_allocated = (
                         own_stock_opening.get(material_id, 0) * unassigned_share / 100
-                        if (tier == "Direct" and parent_id is None) or not links else 0
+                        if (tier == TOP_TIER and parent_id is None) or not links else 0
                     )
                     unassigned_shortage = max(0, unassigned - own_stock_allocated)
                     own_stock_used += min(own_stock_allocated, unassigned)
@@ -1429,6 +1458,72 @@ def _report_pdf(rows: list[dict], title: str) -> io.BytesIO:
     return output
 
 
+def add_supplier_tier(supplier: Supplier | None, tier: str) -> None:
+    """A supplier used at a tier (T1-T3) shows in that Supplier Master tab too."""
+    if supplier is not None and tier in SUPPLIER_TIERS and tier not in _tier_list(supplier.tiers):
+        supplier.tiers = ",".join(_tier_list(_tier_list(supplier.tiers) + [tier]))
+
+
+def tiers_from_links(db: Session, link: "SupplierPart") -> None:
+    add_supplier_tier(db.get(Supplier, link.supplier_id), link.tier)
+    if link.parent_supplier_id and re.fullmatch(r"T[2-9]", link.tier or ""):
+        add_supplier_tier(db.get(Supplier, link.parent_supplier_id), f"T{int(link.tier[1:]) - 1}")
+
+
+def upgrade_supplier_parts(db: Session) -> None:
+    """Start-up updates of supplier/material relationships (each runs once):
+    1. the table gets tier_material_id and material_id may be empty (T2/T3 codes); SQLite cannot change a
+       column, so the table is rebuilt with its rows (a copy of the database file is kept first);
+    2. tiers renamed: the supplier that supplies you is T1 (was "Direct"); old T1 -> T2, T2 -> T3 ..."""
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    bind = db.get_bind()
+    columns = {column["name"]: column for column in sa_inspect(bind).get_columns("supplier_parts")}
+    needs_rebuild = "tier_material_id" not in columns or not columns["material_id"]["nullable"]
+    done = {row.key for row in db.scalars(select(AppSetting)).all()}
+    needs_rename = "tiers_t1_is_direct" not in done
+    if (needs_rebuild or needs_rename) and db.scalar(select(func.count(SupplierPart.id)) if not needs_rebuild else sa_text("SELECT COUNT(*) FROM supplier_parts")):
+        url = str(bind.url)
+        if url.startswith("sqlite:///"):
+            source = Path(url.removeprefix("sqlite:///"))
+            backup = source.with_name(f"{source.name}.before-tier-update-{datetime.now():%Y%m%d-%H%M%S}.bak")
+            if source.is_file():
+                db.commit()
+                backup.write_bytes(source.read_bytes())
+    if needs_rebuild:
+        old_columns = [name for name in columns if name in SupplierPart.__table__.columns]
+        db.execute(sa_text("PRAGMA legacy_alter_table=ON"))
+        db.execute(sa_text("ALTER TABLE supplier_parts RENAME TO supplier_parts_old"))
+        for (index_name,) in db.execute(sa_text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='supplier_parts_old' AND sql IS NOT NULL")).all():
+            db.execute(sa_text(f'DROP INDEX "{index_name}"'))
+        db.commit()
+        SupplierPart.__table__.create(bind)
+        names = ", ".join(old_columns)
+        db.execute(sa_text(f"INSERT INTO supplier_parts ({names}) SELECT {names} FROM supplier_parts_old"))
+        db.execute(sa_text("DROP TABLE supplier_parts_old"))
+        db.execute(sa_text("PRAGMA legacy_alter_table=OFF"))
+        db.commit()
+    if needs_rename:
+        tiers = sorted({tier for tier in db.scalars(select(SupplierPart.tier).distinct()).all() if re.fullmatch(r"T[1-9]", tier or "")}, reverse=True)
+        for tier in tiers:  # T2 -> T3 before T1 -> T2
+            db.execute(sa_text("UPDATE supplier_parts SET tier = :new WHERE tier = :old"), {"new": f"T{int(tier[1:]) + 1}", "old": tier})
+        db.execute(sa_text("UPDATE supplier_parts SET tier = 'T1' WHERE tier = 'Direct' OR tier = '' OR tier IS NULL"))
+        db.add(AppSetting(key="tiers_t1_is_direct", value=datetime.now().isoformat(timespec="seconds")))
+        db.commit()
+    # suppliers' tiers (Supplier Master tabs), once: from their relationships; T1 when none
+    if "supplier_tiers_set" not in done:
+        for supplier in db.scalars(select(Supplier)).all():
+            if not _tier_list(supplier.tiers):
+                supplier.tiers = ""
+        db.flush()
+        for link in db.scalars(select(SupplierPart)).all():
+            tiers_from_links(db, link)
+        for supplier in db.scalars(select(Supplier)).all():
+            if not _tier_list(supplier.tiers):
+                supplier.tiers = "T1"
+        db.add(AppSetting(key="supplier_tiers_set", value=datetime.now().isoformat(timespec="seconds")))
+        db.commit()
+
+
 def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     def open_db() -> Session:
         return session_factory()
@@ -1453,6 +1548,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                    ("lead_time_days", "INTEGER NOT NULL DEFAULT 0"), ("buffer_days", "INTEGER NOT NULL DEFAULT 0")):
             if column not in present:
                 db.execute(sa_text(f"ALTER TABLE supplier_materials ADD COLUMN {column} {definition}"))
+        upgrade_supplier_parts(db)
         # bom_line_alternates gained from_month (SOB history); earlier SOB applies from the start
         if "from_month" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("bom_line_alternates")}:
             db.execute(sa_text("ALTER TABLE bom_line_alternates ADD COLUMN from_month VARCHAR(7) NOT NULL DEFAULT ''"))
@@ -2174,7 +2270,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         alternate_items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_(alternate_ids))).all()} if alternate_ids else {}
         links: dict[int, list[SupplierPart]] = {}
         statement = select(SupplierPart).where(
-            SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None),
+            SupplierPart.tier == TOP_TIER, SupplierPart.parent_supplier_id.is_(None),
             SupplierPart.sob_percent > 0, SupplierPart.unit_price > 0,
         )
         if material_ids is not None:
@@ -2602,9 +2698,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         if limit < 1 or limit > 1000 or offset < 0:
             raise HTTPException(status_code=422, detail="Use limit 1–1000 and a non-negative offset")
         with open_db() as db:
-            statement = select(SupplierPart).join(Item, SupplierPart.material_id == Item.id).join(
-                Supplier, SupplierPart.supplier_id == Supplier.id
-            ).order_by(SupplierPart.material_id, SupplierPart.tier, SupplierPart.id)
+            statement = select(SupplierPart).outerjoin(Item, SupplierPart.material_id == Item.id).outerjoin(
+                TierMaterial, SupplierPart.tier_material_id == TierMaterial.id
+            ).join(Supplier, SupplierPart.supplier_id == Supplier.id).order_by(SupplierPart.material_id, SupplierPart.tier, SupplierPart.id)
             if material_id:
                 statement = statement.where(SupplierPart.material_id == material_id)
             if supplier_id:
@@ -2612,19 +2708,21 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if search.strip():
                 like = f"%{search.strip()}%"
                 statement = statement.where(or_(
-                    Item.code.ilike(like), Item.name.ilike(like), Supplier.code.ilike(like),
-                    Supplier.name.ilike(like), SupplierPart.tier.ilike(like),
+                    Item.code.ilike(like), Item.name.ilike(like), TierMaterial.code.ilike(like), TierMaterial.name.ilike(like),
+                    Supplier.code.ilike(like), Supplier.name.ilike(like), SupplierPart.tier.ilike(like),
                 ))
             total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
             links = db.scalars(statement.offset(offset).limit(limit)).all()
             can_price = _check_price_access(request)
             rows = []
             for link in links:
-                item = db.get(Item, link.material_id)
+                item = db.get(Item, link.material_id) if link.material_id else db.get(TierMaterial, link.tier_material_id)
                 supplier = db.get(Supplier, link.supplier_id)
                 parent = db.get(Supplier, link.parent_supplier_id) if link.parent_supplier_id else None
                 rows.append({
-                    "id": link.id, "material_id": link.material_id, "material_code": item.code if item else "",
+                    "id": link.id, "material_id": link.material_id, "tier_material_id": link.tier_material_id,
+                    "code_master": "T1" if link.material_id else (item.tier if item else "T2"),
+                    "material_code": item.code if item else "",
                     "material_name": item.name if item else "", "supplier_id": link.supplier_id,
                     "supplier_code": supplier.code if supplier else "", "supplier_name": supplier.name if supplier else "",
                     "tier": link.tier, "parent_supplier_id": link.parent_supplier_id,
@@ -2683,7 +2781,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return Response(status_code=204)
 
     @app.post("/api/suppliers/upload", status_code=201)
-    async def upload_suppliers(request: Request):
+    async def upload_suppliers(request: Request, tier: str = "T1"):
         """Supplier register from Excel, all rows or none (heading row found automatically; your own
         headings are fine). Needed: Supplier name. Optional: Supplier code (blank = next free SUP-
         code), Category (new ones are added to the list), Country, Contact person, Email, Phone,
@@ -2736,13 +2834,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                             setattr(supplier, key, cell(row, key))
                     if status_text:
                         supplier.status = statuses[status_text]
+                    for value in (_tier_list(cell(row, "tiers")) or [tier]):
+                        add_supplier_tier(supplier, value)
                     updated += 1
                 else:
                     if not code:
                         while f"sup-{next_number:04d}" in used_codes:
                             next_number += 1
                         code = f"SUP-{next_number:04d}"
-                    supplier = Supplier(code=code, name=name, category=_ensure_category(db, category_text or "Raw material"),
+                    if cell(row, "tiers") and not _tier_list(cell(row, "tiers")):
+                        raise HTTPException(status_code=422, detail=f"Row {number}: tier must be T1, T2 and/or T3")
+                    supplier = Supplier(code=code, name=name, tiers=",".join(_tier_list(cell(row, "tiers")) or _tier_list(tier) or ["T1"]),
+                                        category=_ensure_category(db, category_text or "Raw material"),
                                         country=cell(row, "country") or "-", contact_name=cell(row, "contact_name"), email=cell(row, "email"),
                                         phone=cell(row, "phone"), status=statuses.get(status_text, "Approved"), risk="Medium")
                     db.add(supplier)
@@ -2795,38 +2898,58 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return Response(status_code=204)
 
+    def check_supplier_part(db: Session, values: dict, request: Request, exclude_id: int | None = None) -> dict:
+        """Rules for a supplier/material relationship (new or edited); returns the clean values."""
+        values = dict(values)
+        values["tier"] = _normalize_tier(values.get("tier"))
+        if values.get("unit_price") and not _check_price_access(request) and exclude_id is None:
+            raise HTTPException(status_code=403, detail="Price access is required to set a part price")
+        material_id, tier_material_id = values.get("material_id"), values.get("tier_material_id")
+        if bool(material_id) == bool(tier_material_id):
+            raise HTTPException(status_code=422, detail="Choose one part code (from T1, or for T2/T3 rows from T2/T3 Material Master)")
+        if values["tier"] != TOP_TIER and not values.get("parent_supplier_id"):
+            raise HTTPException(status_code=422, detail=f"A {values['tier']} supplier must have its parent supplier (the supplier it supplies)")
+        if values["tier"] == TOP_TIER:
+            values["parent_supplier_id"] = None
+        if not db.get(Supplier, values["supplier_id"]):
+            raise HTTPException(status_code=404, detail="Supplier not found")
+        if values.get("parent_supplier_id") and not db.get(Supplier, values["parent_supplier_id"]):
+            raise HTTPException(status_code=404, detail="Parent supplier not found")
+        if values.get("parent_supplier_id") == values["supplier_id"]:
+            raise HTTPException(status_code=422, detail="A supplier cannot be its own parent supplier")
+        if material_id:
+            material = db.get(Item, material_id)
+            if not material:
+                raise HTTPException(status_code=404, detail="Material not found")
+            reason = not_purchased_reason(db, material.id)
+            if reason:
+                raise HTTPException(status_code=422, detail=f"{material.code} {reason}, so it cannot have a supplier")
+            column = SupplierPart.material_id
+        else:
+            material = db.get(TierMaterial, tier_material_id)
+            if not material:
+                raise HTTPException(status_code=404, detail="T2/T3 code not found")
+            if values["tier"] == TOP_TIER:
+                raise HTTPException(status_code=422, detail=f"{material.code} is a {material.tier} Material Master code: a T1 supplier needs a T1 code; use tier T2 or T3 for your suppliers' suppliers")
+            column = SupplierPart.tier_material_id
+        same_route = [column == (material_id or tier_material_id), SupplierPart.tier == values["tier"],
+                      (SupplierPart.parent_supplier_id == values["parent_supplier_id"]) if values.get("parent_supplier_id") else SupplierPart.parent_supplier_id.is_(None)]
+        if exclude_id:
+            same_route.append(SupplierPart.id != exclude_id)
+        share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(*same_route)) or 0
+        if share_total + float(values.get("sob_percent", 100)) > 100 + 1e-9:
+            raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
+        if db.scalar(select(SupplierPart.id).where(*same_route, SupplierPart.supplier_id == values["supplier_id"]).limit(1)):
+            raise HTTPException(status_code=409, detail=f"{material.code} with this supplier, tier and parent already exists")
+        return values
+
     def new_supplier_part(db: Session, payload: SupplierPartInput, request: Request) -> SupplierPart:
         """Check and add one supplier/material relationship (flushed, not committed)."""
-        if payload.unit_price and not _check_price_access(request):
-            raise HTTPException(status_code=403, detail="Price access is required to set a part price")
-        if payload.tier != "Direct" and payload.parent_supplier_id is None:
-            raise HTTPException(status_code=422, detail="T1/T2 supplier links must identify the customer supplier they serve")
-        material = db.get(Item, payload.material_id)
-        if not material or not db.get(Supplier, payload.supplier_id):
-            raise HTTPException(status_code=404, detail="Material or supplier not found")
-        reason = not_purchased_reason(db, material.id)
-        if reason:
-            raise HTTPException(status_code=422, detail=f"{material.code} {reason}, so it cannot have a supplier")
-        share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(
-            SupplierPart.material_id == payload.material_id,
-            SupplierPart.tier == payload.tier,
-            SupplierPart.parent_supplier_id == payload.parent_supplier_id,
-        )) or 0
-        if share_total + payload.sob_percent > 100:
-            raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
-        if payload.parent_supplier_id and not db.get(Supplier, payload.parent_supplier_id):
-            raise HTTPException(status_code=404, detail="Parent supplier not found")
-        existing = db.scalar(select(SupplierPart).where(
-            SupplierPart.material_id == payload.material_id,
-            SupplierPart.supplier_id == payload.supplier_id,
-            SupplierPart.tier == payload.tier,
-            SupplierPart.parent_supplier_id == payload.parent_supplier_id,
-        ))
-        if existing:
-            raise HTTPException(status_code=409, detail=f"{material.code} with this supplier, tier and parent already exists")
-        link = SupplierPart(**payload.model_dump())
+        values = check_supplier_part(db, payload.model_dump(), request)
+        link = SupplierPart(**values)
         db.add(link)
         db.flush()  # later rows of the same batch see it (SOB total, duplicates)
+        tiers_from_links(db, link)
         return link
 
     @app.post("/api/planning/supplier-parts/upload", status_code=201)
@@ -2840,9 +2963,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         can_price = _check_price_access(request)
         with open_db() as db:
             items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
+            tier_codes = {code.code.casefold(): code for code in db.scalars(select(TierMaterial)).all()}
             suppliers = {supplier.name.strip().casefold(): supplier for supplier in db.scalars(select(Supplier)).all()}
             suppliers.update({supplier.code.casefold(): supplier for supplier in suppliers.values()})
-            existing = {(link.material_id, link.supplier_id, link.tier, link.parent_supplier_id): link
+            existing = {(("t1", link.material_id) if link.material_id else ("tm", link.tier_material_id), link.supplier_id, link.tier, link.parent_supplier_id): link
                         for link in db.scalars(select(SupplierPart)).all()}
             next_number = int(db.scalar(select(func.count(Supplier.id))) or 0) + 1001
             used_codes = set(db.scalars(select(Supplier.code)).all())
@@ -2873,7 +2997,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     return found
                 while f"SUP-{next_number:04d}" in used_codes:
                     next_number += 1
-                supplier = Supplier(code=f"SUP-{next_number:04d}", name=name, category=_ensure_category(db, category or "Raw material"), country="-",
+                supplier = Supplier(code=f"SUP-{next_number:04d}", name=name, tiers="", category=_ensure_category(db, category or "Raw material"), country="-",
                                     status="Approved", risk="Medium")
                 used_codes.add(supplier.code)
                 db.add(supplier)
@@ -2887,17 +3011,27 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 code, name = text(row, "material_code"), text(row, "supplier_name")
                 if not code or not name:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code and supplier_name are required")
+                try:
+                    tier = _normalize_tier(text(row, "tier"))
+                except HTTPException as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {exc.detail}") from exc
                 material = items.get(code.casefold())
-                if not material:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code {code!r} is not in Material Master")
-                if material.id not in reasons:
-                    reasons[material.id] = not_purchased_reason(db, material.id)
-                if reasons[material.id]:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {material.code} {reasons[material.id]}, so it cannot have a supplier")
-                tier = text(row, "tier") or "Direct"
+                tier_code = None if material else tier_codes.get(code.casefold())
+                if not material and not tier_code:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code {code!r} is not in T1, T2 or T3 Material Master")
+                if tier_code and tier == TOP_TIER:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is a {tier_code.tier} Material Master code: a T1 supplier needs a T1 code; use tier T2 or T3")
+                if material:
+                    if material.id not in reasons:
+                        reasons[material.id] = not_purchased_reason(db, material.id)
+                    if reasons[material.id]:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {material.code} {reasons[material.id]}, so it cannot have a supplier")
                 parent_name = text(row, "parent_supplier_name")
-                if tier != "Direct" and not parent_name:
+                if tier != TOP_TIER and not parent_name:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: tier {tier} needs parent_supplier_name (the supplier it supplies)")
+                if tier == TOP_TIER:
+                    parent_name = ""
+                part = material or tier_code
                 sob = number(row, "sob_percent", 100, row_number)
                 if sob > 100:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: sob_percent cannot exceed 100")
@@ -2910,11 +3044,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 price_mode = text(row, "price_mode") or "spot"
                 if price_mode not in {"spot", "fixed_monthly", "every_n_months"}:
                     raise HTTPException(status_code=422, detail=f"Row {row_number}: price_mode must be spot, fixed_monthly or every_n_months")
-                supplier = supplier_for(name, material.category)
-                parent = supplier_for(parent_name, material.category) if parent_name else None
-                key = (material.id, supplier.id, tier, parent.id if parent else None)
+                supplier = supplier_for(name, part.category)
+                parent = supplier_for(parent_name, part.category) if parent_name else None
+                key = (("t1", material.id) if material else ("tm", tier_code.id), supplier.id, tier, parent.id if parent else None)
                 if key in seen:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {material.code} / {supplier.name} / {tier} is repeated in the file")
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {part.code} / {supplier.name} / {tier} is repeated in the file")
                 seen.add(key)
                 values = {
                     "sob_percent": sob, "unit_price": price, "currency": currency,
@@ -2928,7 +3062,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         setattr(link, field_name, value)
                     updated += 1
                 else:
-                    link = SupplierPart(material_id=material.id, supplier_id=supplier.id, tier=tier, parent_supplier_id=key[3], **values)
+                    link = SupplierPart(material_id=material.id if material else None, tier_material_id=tier_code.id if tier_code else None,
+                                        supplier_id=supplier.id, tier=tier, parent_supplier_id=key[3], **values)
+                    tiers_from_links(db, link)
                     db.add(link)
                     existing[key] = link
                     added += 1
@@ -2936,13 +3072,13 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.flush()
             totals: dict[tuple, float] = {}
             for link in existing.values():
-                route = (link.material_id, link.tier, link.parent_supplier_id)
+                route = (link.material_id, link.tier_material_id, link.tier, link.parent_supplier_id)
                 totals[route] = totals.get(route, 0) + link.sob_percent
             over = [route for route, total in totals.items() if total > 100.0001]
             if over:
-                material = db.get(Item, over[0][0])
+                material = db.get(Item, over[0][0]) if over[0][0] else db.get(TierMaterial, over[0][1])
                 db.rollback()
-                raise HTTPException(status_code=422, detail=f"SOB for {material.code} ({over[0][1]}) adds up to more than 100% after this upload")
+                raise HTTPException(status_code=422, detail=f"SOB for {material.code} ({over[0][2]}) adds up to more than 100% after this upload")
             db.commit()
             return {"rows": len(rows), "added": added, "updated": updated, "suppliers_created": created}
 
@@ -3019,6 +3155,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=404, detail="Material not found")
             if db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.tier_material_id == material_id).limit(1)):
                 raise HTTPException(status_code=409, detail=f"{material.code} is used in a supplier's material master; remove it there first")
+            if db.scalar(select(SupplierPart.id).where(SupplierPart.tier_material_id == material_id).limit(1)):
+                raise HTTPException(status_code=409, detail=f"{material.code} is used in a supplier/material relationship; remove it there first")
             db.delete(material)
             db.commit()
             return Response(status_code=204)
@@ -3667,7 +3805,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             raise HTTPException(status_code=404, detail="Supplier or part not found")
         quote = db.scalar(select(SupplierPart).where(
             SupplierPart.material_id == material_id, SupplierPart.supplier_id == supplier_id,
-            SupplierPart.tier == "Direct", SupplierPart.parent_supplier_id.is_(None)))
+            SupplierPart.tier == TOP_TIER, SupplierPart.parent_supplier_id.is_(None)))
         lines = db.scalars(select(SupplierBOMLine).where(
             SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLine.product_material_id == material_id).order_by(SupplierBOMLine.id)).all()
         line_ids = [line.id for line in lines]
@@ -3761,10 +3899,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     @app.get("/api/planning/supplier-bom/products")
     def supplier_bom_products(request: Request, supplier_id: int):
-        """Parts you buy from this supplier (Direct relationships), with BOM flag."""
+        """Parts you buy from this supplier (T1 relationships), with BOM flag."""
         current_user(request)
         with open_db() as db:
-            links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == "Direct",
+            links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == TOP_TIER,
                                                           SupplierPart.parent_supplier_id.is_(None))).all()
             ids = sorted({link.material_id for link in links})
             items = db.scalars(select(Item).where(Item.id.in_(ids)).order_by(Item.code)).all() if ids else []
@@ -3998,9 +4136,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     @app.patch("/api/planning/supplier-parts/{link_id}")
     def update_supplier_part(link_id: int, payload: dict, request: Request):
+        """Edit any field of a relationship: supplier, part (T1, or T2/T3 for T2/T3 rows), tier,
+        parent supplier, SOB, lead time, MOQ, buffer, price, currency, price agreement."""
         current_user(request)
         _check_supply_role(request)
-        allowed = {"sob_percent", "lead_time_days", "moq", "buffer_days", "unit_price", "currency", "price_mode", "price_interval_months"}
+        allowed = {"material_id", "tier_material_id", "supplier_id", "tier", "parent_supplier_id", "sob_percent", "lead_time_days",
+                   "moq", "buffer_days", "unit_price", "currency", "price_mode", "price_interval_months"}
         if set(payload) - allowed:
             raise HTTPException(status_code=422, detail="Unsupported supplier/material update field")
         if "unit_price" in payload and not _check_price_access(request):
@@ -4009,23 +4150,25 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             link = db.get(SupplierPart, link_id)
             if not link:
                 raise HTTPException(status_code=404, detail="Supplier/material link not found")
-            if "sob_percent" in payload:
-                share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(
-                    SupplierPart.material_id == link.material_id,
-                    SupplierPart.tier == link.tier,
-                    SupplierPart.parent_supplier_id == link.parent_supplier_id,
-                    SupplierPart.id != link.id,
-                )) or 0
-                if share_total + float(payload["sob_percent"]) > 100:
-                    raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
-            price_fields = {"unit_price", "price_mode", "price_interval_months"}
-            price_changed = bool(price_fields.intersection(payload))
-            for key, value in payload.items():
+            current = {key: getattr(link, key) for key in allowed}
+            merged = {**current, **payload}
+            if payload.get("material_id"):
+                merged["tier_material_id"] = payload.get("tier_material_id")
+            if payload.get("tier_material_id"):
+                merged["material_id"] = payload.get("material_id")
+            try:
+                values = SupplierPartInput(**{k: v for k, v in merged.items() if k in SupplierPartInput.model_fields}).model_dump()
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="Check the values: SOB 0-100, lead time / MOQ / buffer 0 or more, currency like INR") from exc
+            values = check_supplier_part(db, values, request, exclude_id=link_id)
+            price_changed = any(values[key] != current[key] for key in ("unit_price", "price_mode", "price_interval_months"))
+            for key, value in values.items():
                 setattr(link, key, value)
+            tiers_from_links(db, link)
             if price_changed:
                 link.price_updated_month = _month_text(date.today())
             db.commit()
-            return {"id": link.id, "price_updated_month": link.price_updated_month}
+            return {"id": link.id, "tier": link.tier, "price_updated_month": link.price_updated_month}
 
     @app.post("/api/planning/plans", status_code=201)
     def upload_plan(payload: PlanUpload, request: Request):
@@ -4304,12 +4447,14 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         report_month = _month_text(_month(report_month))
         with open_db() as db:
             rows = db.execute(
-                select(SupplierStockSnapshot, SupplierPart, Item, Supplier)
+                select(SupplierStockSnapshot, SupplierPart, Supplier)
                 .join(SupplierPart, SupplierPart.id == SupplierStockSnapshot.supplier_part_id)
-                .join(Item, Item.id == SupplierPart.material_id).join(Supplier, Supplier.id == SupplierPart.supplier_id)
+                .join(Supplier, Supplier.id == SupplierPart.supplier_id)
                 .where(SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == report_month)
-                .order_by(Supplier.name, Item.code)
+                .order_by(Supplier.name, SupplierPart.id)
             ).all()
+            rows = [(stock, link, db.get(Item, link.material_id) if link.material_id else db.get(TierMaterial, link.tier_material_id), supplier)
+                    for stock, link, supplier in rows]
             return {"report_month": report_month, "items": [
                 {"id": stock.id, "supplier_part_id": link.id, "supplier_code": supplier.code, "supplier_name": supplier.name,
                  "material_code": item.code, "material_name": item.name, "uom": item.uom, "tier": link.tier,
@@ -4327,10 +4472,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         with open_db() as db:
             links = db.scalars(select(SupplierPart)).all()
             suppliers = {s.code: s for s in db.scalars(select(Supplier)).all()}
-            materials_by_code = {i.code: i for i in db.scalars(select(Item)).all()}
-            by_key: dict[tuple[int, int], list[SupplierPart]] = {}
+            materials_by_code = {i.code: ("t1", i.id) for i in db.scalars(select(Item)).all()}
+            materials_by_code.update({t.code: ("tm", t.id) for t in db.scalars(select(TierMaterial)).all()})
+            by_key: dict[tuple, list[SupplierPart]] = {}
             for link in links:
-                by_key.setdefault((link.supplier_id, link.material_id), []).append(link)
+                by_key.setdefault((link.supplier_id, ("t1", link.material_id) if link.material_id else ("tm", link.tier_material_id)), []).append(link)
             suppliers_by_id = {supplier.id: supplier for supplier in suppliers.values()}
             saved = 0
             for row in rows:
@@ -4338,8 +4484,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 item = materials_by_code.get(str(row.get("material_code", "")).strip())
                 if not supplier or not item:
                     raise HTTPException(status_code=422, detail="Every supplier_code and material_code must exist in the master data")
-                candidates = by_key.get((supplier.id, item.id), [])
-                tier = str(row.get("tier") or "").strip()
+                candidates = by_key.get((supplier.id, item), [])
+                tier = _normalize_tier(row.get("tier")) if str(row.get("tier") or "").strip() else ""
                 parent_code = str(row.get("parent_supplier_code") or "").strip()
                 if tier:
                     candidates = [candidate for candidate in candidates if candidate.tier == tier]
@@ -4351,9 +4497,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         and suppliers_by_id[candidate.parent_supplier_id].code == parent_code
                     ]
                 if not candidates:
-                    raise HTTPException(status_code=422, detail=f"No supplier/material relationship configured for {supplier.code} and {item.code}")
+                    raise HTTPException(status_code=422, detail=f"No supplier/material relationship configured for {supplier.code} and {row.get('material_code')}")
                 if len(candidates) > 1:
-                    raise HTTPException(status_code=422, detail=f"Supplier/material relationship is ambiguous for {supplier.code} and {item.code}; include tier and parent_supplier_code")
+                    raise HTTPException(status_code=422, detail=f"Supplier/material relationship is ambiguous for {supplier.code} and {row.get('material_code')}; include tier and parent_supplier_code")
                 link = candidates[0]
                 quantity = float(row.get("quantity") or 0)
                 available = float(row.get("available_quantity")) if row.get("available_quantity") is not None else None
@@ -4401,7 +4547,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             "own-stock": ["material_code", "quantity"],
             "supplier-stock": ["supplier_code", "material_code", "tier", "parent_supplier_code", "quantity", "available_quantity", "arrival_month"],
             "alternate-codes": ["main_code", "alternate_code"],
-            "suppliers": ["supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval"],
+            "suppliers": ["supplier_code", "supplier_name", "supplier_tier", "category", "country", "contact_person", "email", "phone", "approval"],
             "supplier-parts": ["material_code", "supplier_name", "tier", "parent_supplier_name", "sob_percent", "unit_price", "currency",
                                "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months"],
         }
@@ -4470,6 +4616,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             link = db.get(SupplierPart, payload.supplier_part_id)
             if not link:
                 raise HTTPException(status_code=404, detail="Supplier/material relationship not found")
+            if not link.material_id:
+                raise HTTPException(status_code=422, detail="POs are issued for T1 Material Master codes; this relationship uses a T2/T3 code")
             if link.unit_price <= 0:
                 raise HTTPException(status_code=422, detail="Enter a valid current price before issuing this PO")
             number = f"SC-{int((db.scalar(select(func.count(PlanningPO.id))) or 0) + 1):06d}"

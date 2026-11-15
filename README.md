@@ -80,6 +80,12 @@ Tabs, in order: **Supplier register** (first), Supplier/material relationship, S
 - **Upload supplier stock:** type stock in an entry table (supplier → its material relationships, stock quantity, available quantity, arrival month; Save all) or upload a workbook; the month's saved stock is listed below.
 - **Supplier-to-supplier material transfer:** entry table, one row per transfer, Save all.
 
+## Supplier tiers (T1 / T2 / T3)
+
+- **T1** = supplies you (formerly "Direct"); **T2** = supplies a T1 supplier; **T3** = supplies a T2 supplier. On first start of this version, saved relationships are renamed once (Direct → T1, T1 → T2, T2 → T3) after a copy of the database file is kept (`suppliers.db.before-tier-update-<date>.bak`). "Direct" and "Tier 2" are still accepted in uploads.
+- **Supplier register** has three tabs: **T1 / T2 / T3 Supplier Master**. A supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); tick the tiers in Add / Edit supplier. A relationship saved at a tier adds that tier to the supplier (and the tier above to its parent supplier); tiers are never removed automatically. Supplier list uploads join the open tab unless the sheet has a Supplier tier column.
+- **Relationships**: tier is a drop-down (T1, T2, T3); T2/T3 rows need the parent supplier and may use a **T1, T2 or T3 Material Master code** (hints are labelled); T1 rows use T1 codes you buy. Your BOM price uses T1 rows only; POs are issued for T1 codes only. Coverage shows **Code from** (T1/T2/T3) and **Edit** opens the whole row (supplier, part, tier, parent, SOB, lead time, MOQ, buffer, price).
+
 ## Supplier materials and supplier BOM (cost breakdown)
 
 - **Supplier materials** tab: each supplier's material master. An entry is either picked from your T1, T2 or T3 Material Master (code and name follow your master) or the supplier's own code. Each entry carries the supplier's own price (may differ from yours), lead time and buffer stock. Excel upload links codes found in T1/T2/T3 automatically; other codes become the supplier's own. Supplier BOM lines and alternate codes use only codes from that supplier's material master.

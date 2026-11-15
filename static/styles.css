@@ -528,3 +528,7 @@ th.sorted-desc summary::after { content: " ▼"; font-size: 10px; color: #247ac0
 .entry-table .entry-pick .form-control { width: 200px; }
 .entry-table .entry-name .form-control { width: 240px; }
 .entry-table input.pick-unknown { border-color: #e0a100; background: #fffaf0; }
+.tier-ticks { display: flex; flex-wrap: wrap; gap: 6px 18px; border: 1px solid #dce4ea; border-radius: 10px; padding: 8px 12px; }
+.tier-ticks legend { font-weight: 600; color: #344b60; padding: 0 4px; }
+.tab-count { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: #e4ebf0; color: #344b60; font-size: 11px; }
+.modal:has(.part-edit) { width: min(1200px, 100%); }

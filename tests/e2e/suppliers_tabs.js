@@ -51,6 +51,23 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click("#supplierEditForm button");
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Spare Supplier Two"));
   check("Edit a supplier (name, approval)", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two")').textContent()).includes("On hold"));
+  // three Supplier Master tabs; Add supplier in the T2 tab makes a T2 supplier
+  const tierTabs = await page.locator("[data-supplier-tier-tab]").allTextContents();
+  check("Supplier register has T1 / T2 / T3 Supplier Master tabs", tierTabs.length === 3 && tierTabs[0].startsWith("T1 Supplier Master") && tierTabs[1].startsWith("T2 Supplier Master") && tierTabs[2].startsWith("T3 Supplier Master"), JSON.stringify(tierTabs));
+  await page.click('[data-supplier-tier-tab="T2"]');
+  await page.waitForSelector('[data-supplier-tier-tab="T2"].active');
+  await page.click('[data-action="new-supplier"]');
+  await page.waitForSelector('#modalForm [name="tiers"]');
+  check("Add supplier in the T2 tab ticks T2", JSON.stringify(await page.locator('#modalForm [name="tiers"]:checked').evaluateAll((boxes) => boxes.map((b) => b.value))) === JSON.stringify(["T2"]));
+  await page.fill('#modalForm [name="name"]', "ST Samicon");
+  await page.selectOption("#modalForm #categorySelect", "Electronic Child Part");
+  await page.fill('#modalForm [name="country"]', "India");
+  await page.click("#modalForm .modal-footer button");
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Samicon"));
+  check("T2 supplier listed in the T2 tab with its tier", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Samicon") td').nth(2).textContent()) === "T2");
+  await page.click('[data-supplier-tier-tab="T1"]');
+  await page.waitForSelector('[data-supplier-tier-tab="T1"].active');
+  check("...and not in the T1 tab", !(await page.locator("#supplierRegisterTable").textContent()).includes("ST Samicon"));
   // change the supplier code; a used code is refused
   await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-edit-supplier]').click();
   await page.fill('#supplierEditForm [name="code"]', "SUP-1001");
@@ -82,8 +99,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   }) && await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
   check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 16 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
   const relHeads = await page.locator("#relEntryTable thead th summary").allTextContents();
-  check("Supplier code and supplier name are the first two columns", JSON.stringify(relHeads.slice(0, 4)) === JSON.stringify(["Supplier code", "Supplier name", "Part code (purchased part)", "Part name"]), JSON.stringify(relHeads.slice(0, 4)));
-  check("Code and name in separate columns (part, supplier, parent supplier)", ["Part code (purchased part)", "Part name", "Supplier code", "Supplier name", "Parent supplier code (for T1+)", "Parent supplier name"].every((h) => relHeads.includes(h)), JSON.stringify(relHeads.slice(0, 7)));
+  check("Supplier code and supplier name are the first two columns", JSON.stringify(relHeads.slice(0, 4)) === JSON.stringify(["Supplier code", "Supplier name", "Part code", "Part name"]), JSON.stringify(relHeads.slice(0, 4)));
+  check("Code and name in separate columns (part, supplier, parent supplier)", ["Part code", "Part name", "Supplier code", "Supplier name", "Tier", "Parent supplier code (T2/T3)", "Parent supplier name"].every((h) => relHeads.includes(h)), JSON.stringify(relHeads.slice(0, 7)));
   check("Column headings have the filter (sort, search, Select all, Clear all)", await page.locator("#relEntryTable thead th").nth(0).evaluate((th) => !!th.querySelector("[data-column-sort]") && !!th.querySelector(".multi-search") && !!th.querySelector("[data-column-select-all]") && !!th.querySelector("[data-column-clear]")));
   const pick = (row, key, part) => row.locator(`[data-pick-key="${key}"][data-pick-part="${part}"]`);
   const hints = (row, key, part) => pick(row, key, part).evaluate((input) => [...input.list.options].map((o) => o.value));
@@ -141,7 +158,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await clearToast();
   await page.click("#relSaveAll");
   await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
-  check("An unknown part code is refused with the row number", (await toastText()).includes("Row 1: part NOPE-1 is not a purchased part"), await toastText());
+  check("An unknown part code is refused with the row number", (await toastText()).includes("Row 1: part NOPE-1 is not a purchased T1 code"), await toastText());
   // an error from the server names the row and saves nothing
   await pick(r, "material", "code").fill("ST-STEEL");
   await page.waitForFunction(() => document.querySelector("#relEntryTable [data-row-material]").value !== "");
@@ -164,6 +181,24 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     check("Upload from the page reports added / updated / new suppliers", (await toastText()).includes("1 new supplier"), await toastText());
   }
 
+  // a T2 Material Master code: T2 row for Samicon, parent Apex; hints label the master
+  await api("POST", "/api/planning/tier-materials", { tier: "T2", code: "ST-CHIP", name: "Micro chip", uom: "PCS" });
+  const t2row = page.locator("#relEntryTable tbody tr").nth(0);
+  await pick(t2row, "supplier", "name").fill("ST Samicon");
+  await t2row.locator('[data-f="tier"]').selectOption("T2");
+  await pick(t2row, "supplier", "name").fill("ST Samicon");
+  await pick(t2row, "material", "code").fill("ST-CH");
+  await page.waitForFunction(() => [...document.querySelector('#relEntryTable [data-pick-key="material"][data-pick-part="code"]').list.options].some((o) => o.value === "ST-CHIP"));
+  check("Part hints include T2 Material Master codes, labelled", await pick(t2row, "material", "code").evaluate((input) => [...input.list.options].some((o) => o.value === "ST-CHIP" && o.textContent.includes("T2 Material Master"))));
+  await pick(t2row, "material", "code").fill("ST-CHIP");
+  await page.waitForFunction(() => document.querySelector("#relEntryTable [data-row-tier-material]").value !== "");
+  await pick(t2row, "parent", "code").fill("SUP-1001");
+  await t2row.locator('[data-f="sob_percent"]').fill("100");
+  await clearToast();
+  await page.click("#relSaveAll");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("saved"));
+  check("Save a T2 row with a T2 Material Master code", (await toastText()).includes("1 supplier/material relationship saved"), await toastText());
+
   // Coverage: one value per column, Edit and Delete
   await page.click('[data-supplier-tab="Supplier/material coverage"]');
   await page.waitForSelector('#supplierPartTable tbody tr:has-text("ST-STEEL")');
@@ -171,9 +206,21 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Coverage: Supplier code and Supplier name are the 1st and 2nd columns", JSON.stringify(coverHeads.slice(0, 4)) === JSON.stringify(["Supplier code", "Supplier name", "Material code", "Material name"]), JSON.stringify(coverHeads.slice(0, 4)));
   check("Coverage row values follow the headings", await page.locator('#supplierPartTable tbody tr:has-text("ST-STEEL")').evaluate((tr) => tr.cells[0].textContent.startsWith("SUP-") && tr.cells[2].textContent === "ST-STEEL"));
   check("Coverage shows code and name in separate columns", ["Material code", "Material name", "Supplier code", "Supplier name", "Parent supplier", "Unit price", "Currency", "Price agreement", "Action"].every((h) => coverHeads.includes(h)), JSON.stringify(coverHeads));
+  check("Coverage has a 'Code from' column (T1 / T2 / T3 Material Master)", coverHeads.includes("Code from"));
+  check("The T2 row shows Code from T2, tier T2 and its parent", await page.locator('#supplierPartTable tbody tr:has-text("ST-CHIP")').evaluate((tr) => tr.cells[4].textContent === "T2" && tr.cells[5].textContent === "T2" && tr.cells[6].textContent.includes("Apex")));
   await page.locator('#supplierPartTable tbody tr:has-text("ST-STEEL") [data-edit-supplier-part]').click();
-  await page.fill('#supplierPartEditForm [name="sob_percent"]', "70");
-  await page.click("#supplierPartEditForm button");
+  await page.waitForSelector("#partEditTable tbody tr");
+  const editRow = page.locator("#partEditTable tbody tr").first();
+  check("Edit opens the full row filled in (supplier, part, tier, SOB)", (await editRow.locator('[data-pick-key="supplier"][data-pick-part="code"]').inputValue()) === "SUP-1001" && (await editRow.locator('[data-pick-key="material"][data-pick-part="code"]').inputValue()) === "ST-STEEL" && (await editRow.locator('[data-f="tier"]').inputValue()) === "T1" && (await editRow.locator('[data-f="sob_percent"]').inputValue()) === "60");
+  // a T2 by mistake without parent is refused; then fix and save
+  await editRow.locator('[data-f="tier"]').selectOption("T2");
+  await clearToast();
+  await page.click("#partEditSave");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("parent supplier"));
+  check("Full-row edit: T2 without parent is refused", true);
+  await editRow.locator('[data-f="tier"]').selectOption("T1");
+  await editRow.locator('[data-f="sob_percent"]').fill("70");
+  await page.click("#partEditSave");
   await page.waitForFunction(() => document.querySelector("#supplierPartTable tr:not(:first-child)") && [...document.querySelectorAll("#supplierPartTable tr")].some((tr) => tr.textContent.includes("ST-STEEL") && tr.textContent.includes("70%")));
   check("Edit a relationship (SOB 60 -> 70)", true);
   const pcbRows = await page.locator('#supplierPartTable tbody tr:has-text("ST-PCB")').count();

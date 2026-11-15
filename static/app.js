@@ -1124,13 +1124,13 @@ function renderSupplierPartsTable(result) {
   const canEditPrices = state.user.can_view_prices || state.user.role === "Admin";
   void canEditPrices;
   const modeLabel = { spot: "Spot", fixed_monthly: "Fixed monthly", every_n_months: "Every N months" };
-  const rows = result.items.map((link) => `<tr><td>${esc(link.supplier_code)}</td><td>${esc(link.supplier_name)}</td><td>${esc(link.material_code)}</td><td>${esc(link.material_name)}</td><td>${esc(link.tier)}</td><td>${esc(link.parent_supplier_name || "—")}</td><td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${link.unit_price === undefined ? "Restricted" : money(link.unit_price, link.currency)}</td><td>${esc(link.currency || "")}</td><td>${esc(modeLabel[link.price_mode] || link.price_mode)}</td><td>${esc(link.price_status)}</td><td><button class="text-button" data-edit-supplier-part="${link.id}">Edit</button><button class="text-button button-danger" data-delete-supplier-part="${link.id}">Delete</button></td></tr>`).join("");
+  const rows = result.items.map((link) => `<tr><td>${esc(link.supplier_code)}</td><td>${esc(link.supplier_name)}</td><td>${esc(link.material_code)}</td><td>${esc(link.material_name)}</td><td>${esc(link.code_master || "T1")}</td><td>${esc(link.tier)}</td><td>${esc(link.parent_supplier_name || "—")}</td><td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${link.unit_price === undefined ? "Restricted" : money(link.unit_price, link.currency)}</td><td>${esc(link.currency || "")}</td><td>${esc(modeLabel[link.price_mode] || link.price_mode)}</td><td>${esc(link.price_status)}</td><td><button class="text-button" data-edit-supplier-part="${link.id}">Edit</button><button class="text-button button-danger" data-delete-supplier-part="${link.id}">Delete</button></td></tr>`).join("");
   const pageSize = result.limit;
-  const markup = `${table(["Supplier code", "Supplier name", "Material code", "Material name", "Tier", "Parent supplier", "SOB", "Lead time", "MOQ", "Buffer", "Unit price", "Currency", "Price agreement", "Price status", "Action"], rows, "No supplier/material relationships configured.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(result.offset + 1).toLocaleString()}–${Math.min(result.offset + result.items.length, result.total).toLocaleString()} of ${result.total.toLocaleString()}` : "No supplier/material relationships"}</span><div><button class="button button-small" data-supplier-page="${Math.max(0, result.offset - pageSize)}" ${result.offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-supplier-page="${result.offset + pageSize}" ${result.offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
+  const markup = `${table(["Supplier code", "Supplier name", "Material code", "Material name", "Code from", "Tier", "Parent supplier", "SOB", "Lead time", "MOQ", "Buffer", "Unit price", "Currency", "Price agreement", "Price status", "Action"], rows, "No supplier/material relationships configured.")}<div class="table-toolbar pagination-toolbar"><span>${result.total ? `${(result.offset + 1).toLocaleString()}–${Math.min(result.offset + result.items.length, result.total).toLocaleString()} of ${result.total.toLocaleString()}` : "No supplier/material relationships"}</span><div><button class="button button-small" data-supplier-page="${Math.max(0, result.offset - pageSize)}" ${result.offset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-supplier-page="${result.offset + pageSize}" ${result.offset + result.items.length >= result.total ? "disabled" : ""}>Next</button></div></div>`;
   const target = $("#supplierPartTable");
   if (target) {
     target.innerHTML = markup;
-    setupTableFilters("#supplierPartTable", "#supplierPartFilters", null, [{ title: "Supplier", index: 1 }, { title: "Tier", index: 4 }, { title: "Price status", index: 13 }]);
+    setupTableFilters("#supplierPartTable", "#supplierPartFilters", null, [{ title: "Supplier", index: 1 }, { title: "Tier", index: 5 }, { title: "Price status", index: 14 }]);
   }
   return markup;
 }
@@ -1173,11 +1173,12 @@ function pickCell(kind, key, part, placeholder) {
   const list = `entry-list-${entryListCounter}`;
   return `<input class="form-control" list="${list}" data-pick="${kind}" data-pick-key="${key}" data-pick-part="${part}" placeholder="${esc(placeholder)}" autocomplete="off" /><datalist id="${list}"></datalist>`;
 }
-function entryMaterialCell() {
-  return `<td class="entry-pick">${pickCell("material", "material", "code", "Type part code")}<input type="hidden" data-row-material /></td><td class="entry-name">${pickCell("material", "material", "name", "Type part name")}</td>`;
+function entryMaterialCell(withTierCodes = false) {
+  const extra = withTierCodes ? '<input type="hidden" data-row-tier-material /><input type="hidden" data-pick-tier-codes value="1" />' : "";
+  return `<td class="entry-pick">${pickCell("material", "material", "code", withTierCodes ? "Type part code (T1, or T2/T3)" : "Type part code")}<input type="hidden" data-row-material />${extra}</td><td class="entry-name">${pickCell("material", "material", "name", "Type part name")}</td>`;
 }
 function entrySupplierCell(key, optional = false) {
-  return `<td class="entry-pick">${pickCell("supplier", key, "code", optional ? "Type code (blank = Direct)" : "Type supplier code")}<input type="hidden" data-row-supplier="${key}" /></td><td class="entry-name">${pickCell("supplier", key, "name", optional ? "Type name (blank = Direct)" : "Type supplier name")}</td>`;
+  return `<td class="entry-pick">${pickCell("supplier", key, "code", optional ? "Parent code (T2/T3 rows)" : "Type supplier code")}<input type="hidden" data-row-supplier="${key}" /></td><td class="entry-name">${pickCell("supplier", key, "name", optional ? "Parent name (T2/T3 rows)" : "Type supplier name")}</td>`;
 }
 const entryRemoveCell = '<td><button type="button" class="text-button button-danger" data-entry-remove>Remove</button></td>';
 function fillHints(row, kind, key, items) {
@@ -1185,14 +1186,19 @@ function fillHints(row, kind, key, items) {
   row.pickItems[`${kind}:${key}`] = items;
   row.querySelectorAll(`[data-pick="${kind}"][data-pick-key="${key}"]`).forEach((input) => {
     const byCode = input.dataset.pickPart === "code";
-    input.nextElementSibling.innerHTML = items.map((item) => `<option value="${esc(byCode ? item.code : item.name)}">${esc(byCode ? item.name : item.code)}</option>`).join("");
+    input.nextElementSibling.innerHTML = items.map((item) => `<option value="${esc(byCode ? item.code : item.name)}">${esc(byCode ? item.name : item.code)}${item.kind && item.kind !== "T1" ? ` · ${item.kind} Material Master` : ""}</option>`).join("");
   });
 }
 async function loadRowMaterials(row, search = "") {
   if (!row.querySelector('[data-pick="material"]')) return;
   try {
     const result = await api(`/api/planning/materials?${new URLSearchParams({ offset: "0", limit: "100", search, purchased: "true" })}`);
-    fillHints(row, "material", "material", result.items);
+    let items = result.items.map((item) => ({ ...item, kind: "T1" }));
+    if (row.querySelector("[data-pick-tier-codes]")) {  // relationship rows: T2/T3 Material Master codes too
+      const [t2, t3] = await Promise.all(["T2", "T3"].map((tier) => api(`/api/planning/master-codes?${new URLSearchParams({ tier, search, limit: "50" })}`)));
+      items = items.concat(t2.items.map((item) => ({ ...item, kind: "T2" })), t3.items.map((item) => ({ ...item, kind: "T3" })));
+    }
+    fillHints(row, "material", "material", items);
   } catch (error) { toast(error.message, true); }
 }
 // Set the hidden id from the typed code / name (exact match, capitals ignored) and fill the other box
@@ -1201,10 +1207,18 @@ function resolvePick(row, input) {
   const items = row.pickItems?.[`${kind}:${key}`] || [];
   const text = input.value.trim().toLowerCase();
   const found = text ? items.find((item) => String(part === "code" ? item.code : item.name).toLowerCase() === text) : null;
+  const tierHidden = kind === "material" ? row.querySelector("[data-row-tier-material]") : null;
   const hidden = row.querySelector(kind === "material" ? "[data-row-material]" : `[data-row-supplier="${key}"]`);
   const other = row.querySelector(`[data-pick="${kind}"][data-pick-key="${key}"][data-pick-part="${part === "code" ? "name" : "code"}"]`);
-  const before = hidden.value;
-  if (found) {
+  const before = hidden.value + (tierHidden ? `|${tierHidden.value}` : "");
+  if (tierHidden) tierHidden.value = "";
+  if (found && found.kind && found.kind !== "T1" && tierHidden) {
+    hidden.value = "";
+    tierHidden.value = String(found.id);
+    const spelled = part === "code" ? found.code : found.name;
+    if (input.value !== spelled) input.value = spelled;
+    other.value = part === "code" ? found.name : found.code;
+  } else if (found) {
     hidden.value = String(found.id);
     const spelled = part === "code" ? found.code : found.name;  // the master's spelling ("st-steel" -> "ST-STEEL")
     if (input.value !== spelled) input.value = spelled;
@@ -1214,11 +1228,11 @@ function resolvePick(row, input) {
     if (!text) other.value = "";
   }
   input.classList.toggle("pick-unknown", Boolean(text) && !found);
-  if (hidden.value !== before) hidden.dispatchEvent(new Event("change", { bubbles: true }));
+  if (hidden.value + (tierHidden ? `|${tierHidden.value}` : "") !== before) hidden.dispatchEvent(new Event("change", { bubbles: true }));
 }
 // Pick a row's item by id (used by tests and when filling a row from code)
 function setRowPick(row, kind, key, item) {
-  fillHints(row, kind, key, [item, ...(row.pickItems?.[`${kind}:${key}`] || []).filter((other) => other.id !== item.id)]);
+  fillHints(row, kind, key, [item, ...(row.pickItems?.[`${kind}:${key}`] || []).filter((other) => !(other.id === item.id && other.kind === item.kind))]);
   const input = row.querySelector(`[data-pick="${kind}"][data-pick-key="${key}"][data-pick-part="code"]`);
   input.value = item.code;
   resolvePick(row, input);
@@ -1269,7 +1283,7 @@ const cellValue = (row, selector) => row.querySelector(selector)?.value ?? "";
 
 function relationshipEntryRow() {
   const priced = canSeePrices();
-  return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell()}<td><input class="form-control" data-f="tier" value="Direct" /></td>${entrySupplierCell("parent", true)}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" value="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" value="14" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" value="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" value="0" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" value="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td>${entryRemoveCell}</tr>`;
+  return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell(true)}<td><select class="form-control" data-f="tier"><option value="T1">T1 (supplies you)</option><option value="T2">T2 (supplies a T1 supplier)</option><option value="T3">T3 (supplies a T2 supplier)</option></select></td>${entrySupplierCell("parent", true)}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" value="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" value="14" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" value="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" value="0" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" value="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td>${entryRemoveCell}</tr>`;
 }
 function stockEntryRow() {
   return `<tr>${entrySupplierCell("supplier")}<td><select class="form-control" data-row-link><option value="">Choose supplier first</option></select></td><td><input class="form-control" type="number" min="0" step="any" data-f="quantity" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="available_quantity" placeholder="= quantity" /></td><td><input class="form-control" type="month" data-f="arrival_month" /></td>${entryRemoveCell}</tr>`;
@@ -1278,15 +1292,24 @@ function transferEntryRow() {
   return `<tr>${entryMaterialCell()}${entrySupplierCell("from")}${entrySupplierCell("to")}<td><input class="form-control" type="number" min="0.001" step="any" data-f="quantity" /></td><td><input class="form-control" type="month" data-f="transfer_month" value="${monthOffset(monthNow(), 1)}" /></td><td><input class="form-control" data-f="note" /></td>${entryRemoveCell}</tr>`;
 }
 
+const SUPPLIER_TIER_TABS = [["T1", "T1 Supplier Master"], ["T2", "T2 Supplier Master"], ["T3", "T3 Supplier Master"]];
+// Tick boxes T1 / T2 / T3: a supplier can be more than one (e.g. TATA Steel is T1 for you and T2 for Supangita)
+function supplierTierField(selected) {
+  return `<fieldset class="field full tier-ticks"><legend>Supplier tier (one or more)</legend>${SUPPLIER_TIER_TABS.map(([tier]) => `<label class="check-option"><input type="checkbox" name="tiers" value="${tier}" ${selected.includes(tier) ? "checked" : ""} /> ${tier}${tier === "T1" ? " (supplies you)" : tier === "T2" ? " (supplies a T1 supplier)" : " (supplies a T2 supplier)"}</label>`).join("")}</fieldset>`;
+}
+
 function openSupplierEdit(supplier) {
   if (!supplier) return;
   $("#modalTitle").textContent = `Edit ${supplier.code} · ${supplier.name}`;
-  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier code", "code", "text", { required: true, maxlength: 24, value: supplier.code })}${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${categoryField(supplier.category)}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
+  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier code", "code", "text", { required: true, maxlength: 24, value: supplier.code })}${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${supplierTierField(supplier.tiers || ["T1"])}${categoryField(supplier.category)}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
   modalLayer.hidden = false;
   bindCategoryField($("#supplierEditForm"));
   $("#supplierEditForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const values = takeCategory(Object.fromEntries(new FormData(event.currentTarget).entries()));
+    const data = new FormData(event.currentTarget);
+    const values = takeCategory(Object.fromEntries(data.entries()));
+    values.tiers = data.getAll("tiers");
+    if (!values.tiers.length) return toast("Tick at least one tier: T1, T2 or T3.", true);
     try {
       await api(`/api/suppliers/${supplier.id}`, { method: "PATCH", body: JSON.stringify(values) });
       await reloadCategories();
@@ -1297,20 +1320,40 @@ function openSupplierEdit(supplier) {
   });
 }
 
+// Edit a saved relationship: the whole row (supplier, part, tier, parent, SOB, lead time, MOQ,
+// buffer, price, agreement) in the same one-row table as Supplier/material relationship.
 function openSupplierPartEdit(link) {
   if (!link) return;
-  const priced = canSeePrices() && link.unit_price !== undefined;
-  $("#modalTitle").textContent = `Edit ${link.material_code} · ${link.supplier_name} (${link.tier})`;
-  $("#modalBody").innerHTML = `<form id="supplierPartEditForm" class="form-grid">${field("Supplier SOB (%)", "sob_percent", "number", { required: true, min: 0, step: "0.01", value: link.sob_percent })}${field("End-to-end lead time (days)", "lead_time_days", "number", { required: true, min: 0, value: link.lead_time_days })}${field("MOQ", "moq", "number", { required: true, min: 0, step: "any", value: link.moq })}${field("Supplier buffer (days)", "buffer_days", "number", { required: true, min: 0, value: link.buffer_days })}${priced ? `${field("Current unit price", "unit_price", "number", { required: true, min: 0, step: "0.0001", value: link.unit_price })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === link.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<label class="field"><span>Price agreement</span><select class="form-control" name="price_mode">${[["spot", "Spot"], ["fixed_monthly", "Fixed monthly"], ["every_n_months", "Every N months"]].map(([value, label]) => `<option value="${value}" ${value === link.price_mode ? "selected" : ""}>${label}</option>`).join("")}</select></label>${field("Price interval (months)", "price_interval_months", "number", { required: true, min: 1, value: link.price_interval_months })}<p class="subtle field full">Material, supplier, tier and parent cannot change here: delete the line and add it again.</p><div class="modal-footer field full"><button class="button button-primary">Save relationship</button></div></form>`;
+  $("#modalTitle").textContent = `Edit ${link.supplier_name} · ${link.material_code} (${link.tier})`;
+  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">Change any column, e.g. a T2 entered by mistake. T2/T3 rows need the parent supplier.</p>${entryTable("partEditTable", ["Supplier code", "Supplier name", "Part code", "Part name", "Tier", "Parent supplier code (T2/T3)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}<div class="modal-footer"><button type="button" class="button button-primary" id="partEditSave">Save relationship</button></div></div>`;
   modalLayer.hidden = false;
-  $("#supplierPartEditForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
-    for (const key of ["sob_percent", "lead_time_days", "moq", "buffer_days", "unit_price", "price_interval_months"]) if (key in values) values[key] = Number(values[key]);
+  const entries = bindEntryTable("partEditTable", relationshipEntryRow);
+  const row = entries.rows()[0];
+  row.querySelector("[data-entry-remove]")?.remove();
+  const supplierOf = (id) => state.suppliers.find((supplier) => supplier.id === id);
+  if (supplierOf(link.supplier_id)) setRowPick(row, "supplier", "supplier", supplierOf(link.supplier_id));
+  if (link.parent_supplier_id && supplierOf(link.parent_supplier_id)) setRowPick(row, "supplier", "parent", supplierOf(link.parent_supplier_id));
+  setRowPick(row, "material", "material", { id: link.material_id || link.tier_material_id, code: link.material_code, name: link.material_name, kind: link.code_master || "T1" });
+  const set = (key, value) => { const input = row.querySelector(`[data-f="${key}"]`); if (input && value !== undefined && value !== null) input.value = value; };
+  set("tier", link.tier); set("sob_percent", link.sob_percent); set("lead_time_days", link.lead_time_days); set("moq", link.moq); set("buffer_days", link.buffer_days);
+  set("unit_price", link.unit_price); set("currency", link.currency); set("price_mode", link.price_mode); set("price_interval_months", link.price_interval_months);
+  $("#partEditSave").addEventListener("click", async () => {
+    const value = (key) => cellValue(row, `[data-f="${key}"]`);
+    const body = {
+      supplier_id: Number(cellValue(row, '[data-row-supplier="supplier"]')) || null,
+      material_id: Number(cellValue(row, "[data-row-material]")) || null, tier_material_id: Number(cellValue(row, "[data-row-tier-material]")) || null,
+      tier: value("tier"), parent_supplier_id: Number(cellValue(row, '[data-row-supplier="parent"]')) || null,
+      sob_percent: Number(value("sob_percent")), lead_time_days: Number(value("lead_time_days")), moq: Number(value("moq")), buffer_days: Number(value("buffer_days")),
+      currency: value("currency"), price_mode: value("price_mode"), price_interval_months: Number(value("price_interval_months") || 1),
+    };
+    if (row.querySelector('[data-f="unit_price"]')) body.unit_price = Number(value("unit_price"));
+    if (!body.supplier_id) return toast("Pick the supplier from the hint list.", true);
+    if (!body.material_id && !body.tier_material_id) return toast("Pick the part code from the hint list.", true);
     try {
-      await api(`/api/planning/supplier-parts/${link.id}`, { method: "PATCH", body: JSON.stringify(values) });
+      await api(`/api/planning/supplier-parts/${link.id}`, { method: "PATCH", body: JSON.stringify(body) });
       modalLayer.hidden = true;
       toast("Relationship saved");
+      state.suppliers = await api("/api/suppliers");
       loadSupplierPartPage(state.supplierOffset || 0);
     } catch (error) { toast(error.message, true); }
   });
@@ -1326,7 +1369,7 @@ function purchasedMaterialPicker(prefix) {
 // Supplier picker: search box filters the supplier list
 function supplierPicker(name, label, optional = false) {
   const options = state.suppliers.map((supplier) => `<option value="${supplier.id}">${esc(supplier.code)} · ${esc(supplier.name)}</option>`).join("");
-  return `<label class="field"><span>${esc(label)}</span><input class="form-control supplier-search" type="search" data-supplier-search="${esc(name)}" placeholder="Search supplier" /><select class="form-control" name="${esc(name)}" ${optional ? "" : "required"}>${optional ? '<option value="">None / Direct</option>' : ""}${options}</select></label>`;
+  return `<label class="field"><span>${esc(label)}</span><input class="form-control supplier-search" type="search" data-supplier-search="${esc(name)}" placeholder="Search supplier" /><select class="form-control" name="${esc(name)}" ${optional ? "" : "required"}>${optional ? '<option value="">None (T1)</option>' : ""}${options}</select></label>`;
 }
 
 function bindSupplierSearch(root) {
@@ -1456,7 +1499,7 @@ async function loadSupplierBomProducts() {
   if (!state.sbSupplier) { select.innerHTML = '<option value="">Choose supplier first</option>'; return loadSupplierBom(); }
   const result = await api(`/api/planning/supplier-bom/products?supplier_id=${state.sbSupplier}`);
   if (!result.items.length) {
-    select.innerHTML = '<option value="">No parts: add a Direct supplier/material relationship first</option>';
+    select.innerHTML = '<option value="">No parts: add a T1 supplier/material relationship first</option>';
     state.sbProduct = "";
   } else {
     if (!result.items.some((item) => String(item.id) === String(state.sbProduct))) state.sbProduct = String(result.items[0].id);
@@ -1614,13 +1657,13 @@ async function renderSupplierControl() {
   const tabs = `<div class="tab-strip">${SUPPLIER_TABS.map((name) => `<button class="tab-button ${tab === name ? "active" : ""}" data-supplier-tab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
   let body = "";
   if (tab === "Supplier/material relationship") {
-    body = `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Who supplies each part you buy, in what share (SOB), at what price and lead time. Upload your own sheet as it is or the template, or type rows in the table (+ Add row, Save all). One row per part and supplier. Needed: part code and supplier. Optional: Tier (blank = Direct; T1/T2 also need the parent supplier), SOB % (blank = 100), unit price, currency, lead time, MOQ, buffer days. SOB for a part at the same tier and parent is limited to 100%. Only purchased parts (no in-house BOM, no negative BOM quantity). New supplier names in a file join the Supplier register; an existing relationship is updated. The whole file, or all typed rows, is rejected if any row is wrong. Saved lines are edited or deleted in Supplier/material coverage.")}
+    body = `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Who supplies each part you buy, in what share (SOB), at what price and lead time. Upload your own sheet as it is or the template, or type rows in the table (+ Add row, Save all). One row per part and supplier. Needed: part code and supplier. Tier: T1 = supplies you (T1 Material Master code you buy); T2 = supplies a T1 supplier and T3 = supplies a T2 supplier (both need the parent supplier, and may use a T1, T2 or T3 Material Master code). Optional: Tier (blank = T1), SOB % (blank = 100), unit price, currency, lead time, MOQ, buffer days. SOB for a part at the same tier and parent is limited to 100%. T1 codes must be purchased parts (no in-house BOM, no negative BOM quantity). New supplier names in a file join the Supplier register; an existing relationship is updated. The whole file, or all typed rows, is rejected if any row is wrong. Saved lines are edited or deleted in Supplier/material coverage.")}
         <form id="supplierPartUploadForm" class="panel-body inline-upload">
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
         </form>
         <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
-        ${entryTable("relEntryTable", ["Supplier code", "Supplier name", "Part code (purchased part)", "Part name", "Tier (Direct, T1, T2…)", "Parent supplier code (for T1+)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
+        ${entryTable("relEntryTable", ["Supplier code", "Supplier name", "Part code", "Part name", "Tier", "Parent supplier code (T2/T3)", "Parent supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency", "Price agreement", "Price interval (months)"])}
       </section>`;
   } else if (tab === "Upload supplier stock") {
     body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
@@ -1640,10 +1683,14 @@ async function renderSupplierControl() {
       <div id="supplierPartTable"></div>
     </section>`;
   } else if (tab === "Supplier register") {
-    const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
-    body = `<section class="panel table-panel">${panelHeader("Supplier register", "Add one supplier with Add supplier, or many at once with an Excel upload (your own headings are fine). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.")}
+    if (!SUPPLIER_TIER_TABS.some(([tier]) => tier === state.supplierTierTab)) state.supplierTierTab = "T1";
+    const tierTab = state.supplierTierTab;
+    const tierLabel = SUPPLIER_TIER_TABS.find(([tier]) => tier === tierTab)[1];
+    const tierStrip = `<div class="tab-strip sub-tab-strip">${SUPPLIER_TIER_TABS.map(([tier, label]) => `<button class="tab-button ${tier === tierTab ? "active" : ""}" data-supplier-tier-tab="${tier}">${esc(label)} <span class="tab-count">${state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tier)).length}</span></button>`).join("")}</div>`;
+    const supplierRows = state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tierTab)).map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc((supplier.tiers || ["T1"]).join(", "))}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
+    body = `${tierStrip}<section class="panel table-panel">${panelHeader(tierLabel, `T1 = supplies you; T2 = supplies a T1 supplier; T3 = supplies a T2 supplier. One supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); a relationship saved at a tier adds the supplier to that tab. Add one supplier with Add supplier, or many with an Excel upload (your own headings are fine; uploaded here, suppliers join ${tierTab} unless the sheet has a Supplier tier column). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Supplier tier, Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.`)}
       <form id="supplierUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier list workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload suppliers</button><a class="button" href="/api/planning/templates/suppliers.xlsx">Download template</a></form>
-      <div class="table-toolbar"><span class="toolbar-add"><button class="button button-small button-primary" data-action="new-supplier">Add supplier</button></span><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers entered.")}</div></section>`;
+      <div class="table-toolbar"><span class="toolbar-add"><button class="button button-small button-primary" data-action="new-supplier">Add supplier</button></span><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Tiers", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, `No ${tierTab} suppliers yet.`)}</div></section>`;
   } else if (tab === "Supplier-to-supplier material transfer") {
     body = `<section class="panel table-panel">${panelHeader("Supplier-to-supplier material transfer", "Record transferable supplier-held surplus, one row per transfer; + Add row for more, then Save all. The receiving supplier is credited in projected coverage in the transfer month. Saved transfers are listed in Transfer schedule.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
@@ -1688,15 +1735,15 @@ async function renderSupplierControl() {
     $("#relSaveAll").addEventListener("click", async () => {
       const rows = [];
       for (const [index, row] of entries.rows().entries()) {
-        const material = Number(cellValue(row, "[data-row-material]"));
+        const material = Number(cellValue(row, "[data-row-material]")) || Number(cellValue(row, "[data-row-tier-material]"));
         const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
         const typed = (key, part) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="${part}"]`).trim();
         if (!material && !supplier && !typed("material", "code") && !typed("supplier", "code")) continue;  // empty row
-        if (!material) return toast(typed("material", "code") ? `Row ${index + 1}: part ${typed("material", "code")} is not a purchased part in T1 Material Master; pick it from the hint list.` : `Row ${index + 1}: type the part code.`, true);
+        if (!material) return toast(typed("material", "code") ? `Row ${index + 1}: part ${typed("material", "code")} is not a purchased T1 code or a T2/T3 Material Master code; pick it from the hint list.` : `Row ${index + 1}: type the part code.`, true);
         if (!supplier) return toast(typed("supplier", "code") ? `Row ${index + 1}: supplier ${typed("supplier", "code")} is not in the Supplier register; pick it from the hint list.` : `Row ${index + 1}: type the supplier.`, true);
         if (typed("parent", "code") && !Number(cellValue(row, '[data-row-supplier="parent"]'))) return toast(`Row ${index + 1}: parent supplier ${typed("parent", "code")} is not in the Supplier register.`, true);
         const value = (key) => cellValue(row, `[data-f="${key}"]`);
-        rows.push({ material_id: material, supplier_id: supplier, tier: value("tier").trim() || "Direct",
+        rows.push({ material_id: Number(cellValue(row, "[data-row-material]")) || null, tier_material_id: Number(cellValue(row, "[data-row-tier-material]")) || null, supplier_id: supplier, tier: value("tier") || "T1",
           parent_supplier_id: Number(cellValue(row, '[data-row-supplier="parent"]')) || null,
           sob_percent: Number(value("sob_percent")), lead_time_days: Number(value("lead_time_days")), moq: Number(value("moq")),
           buffer_days: Number(value("buffer_days")), unit_price: Number(value("unit_price") || 0), currency: value("currency"),
@@ -1792,14 +1839,14 @@ async function renderSupplierControl() {
       event.preventDefault();
       const form = event.currentTarget;
       try {
-        const result = await uploadExcel("/api/suppliers/upload", new FormData(form).get("workbook"));
+        const result = await uploadExcel(`/api/suppliers/upload?tier=${state.supplierTierTab || "T1"}`, new FormData(form).get("workbook"));
         toast(`${result.rows} row(s): ${result.added} supplier(s) added, ${result.updated} updated`);
         form.reset();
         await reloadCategories();
         renderSupplierControl();
       } catch (error) { toast(error.message, true); }
     });
-    setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Category", index: 2 }, { title: "Approval", index: 7 }]);
+    setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Category", index: 3 }, { title: "Approval", index: 8 }]);
     $("#supplierSearch").addEventListener("input", applyTableSearch);
   }
   if (tab === "Supplier-to-supplier material transfer") {
@@ -2089,7 +2136,7 @@ async function renderPurchaseOrders() {
     <section class="panel">${panelHeader("Issue a planning purchase order", "The current supplier/material price is copied to the PO and will not change when the master price is updated.")}
       <form id="poForm" class="panel-body form-grid">
         <label class="field"><span>Search supplier/material</span><input class="form-control" id="poPartSearch" type="search" placeholder="Type part, supplier, or tier" /></label>
-        <label class="field"><span>Supplier and material</span><select class="form-control" name="supplier_part_id" id="poSupplierPartSelect" required>${links.map((link) => `<option value="${link.id}">${esc(link.material_code)} · ${esc(link.supplier_name)} · ${esc(link.tier)}${link.unit_price === undefined ? "" : ` · ${money(link.unit_price, link.currency)}`}</option>`).join("")}</select></label>
+        <label class="field"><span>Supplier and material</span><select class="form-control" name="supplier_part_id" id="poSupplierPartSelect" required>${links.filter((link) => link.material_id).map((link) => `<option value="${link.id}">${esc(link.material_code)} · ${esc(link.supplier_name)} · ${esc(link.tier)}${link.unit_price === undefined ? "" : ` · ${money(link.unit_price, link.currency)}`}</option>`).join("")}</select></label>
         ${field("Quantity", "quantity_ordered", "number", { required: true, min: 0.001, step: "any" })}
         ${field("Expected arrival month", "expected_month", "month", { required: true, value: monthOffset(monthNow(), 1) })}
         <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
@@ -2235,7 +2282,7 @@ function openModal(type, record = {}) {
     form = `<form id="modalForm" class="form-grid"><label class="field full"><span>Parent part</span><select class="form-control" name="parent_item_id" required ${record.parent_item_id ? "disabled" : ""}>${parents}</select>${record.parent_item_id ? `<input type="hidden" name="parent_item_id" value="${record.parent_item_id}" />` : ""}</label><label class="field full"><span>Search Material Master by code or name</span><input class="form-control" id="modalMaterialSearch" type="search" placeholder="Type a material code or name" /></label><label class="field"><span>Part code from Material Master</span><select class="form-control" name="child_item_id" id="modalMaterialSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.code)}</option>`).join("")}</select></label><label class="field"><span>Part name from Material Master</span><select class="form-control" id="modalMaterialNameSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.name)}</option>`).join("")}</select></label><label class="field"><span>Unit from Material Master</span><input class="form-control" id="modalMaterialUnit" value="${esc(selectedMaterial?.uom || "")}" readonly /></label>${field("Quantity per parent", "quantity", "number", { required: true, min: -1000000000, max: 1000000000, step: "any", value: record.quantity ?? 1 })}<div class="score-explainer field full">${parent ? `Adding parts to ${esc(parent.code)} · ${esc(parent.name)}. Choose each purchased or in-house-made child part from Material Master; repeat at the next level for further operations.` : "Choose the child part from Material Master. Repeat at the next level for further in-house operations."} Use a negative quantity for scrap or a by-product. Quantity cannot be zero.</div><div class="modal-footer field full"><button class="button button-primary">Save BOM line</button></div></form>`;
   } else if (type === "supplier") {
     title = "Add supplier";
-    form = `<form id="modalForm" class="form-grid">${field("Supplier code (blank = next free SUP- code)", "code", "text", { maxlength: 24, placeholder: "e.g. ILN-01" })}${field("Supplier name", "name", "text", { required: true })}${categoryField("")}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
+    form = `<form id="modalForm" class="form-grid">${field("Supplier code (blank = next free SUP- code)", "code", "text", { maxlength: 24, placeholder: "e.g. ILN-01" })}${field("Supplier name", "name", "text", { required: true })}${supplierTierField([state.supplierTierTab || "T1"])}${categoryField("")}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
   }
   // Alternate code SOB on this BOM line: shown here, changed only in Alternate codes → Manage SOB
   const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
@@ -2321,7 +2368,11 @@ function openModal(type, record = {}) {
         const path = `/api/items/${values.parent_item_id}/bom${record.component_id ? `/${record.component_id}` : ""}`;
         result = await api(path, { method: record.component_id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
-      if (type === "supplier") result = await api("/api/suppliers", { method: "POST", body: JSON.stringify(takeCategory(values)) });
+      if (type === "supplier") {
+        values.tiers = new FormData(formEl).getAll("tiers");
+        if (!values.tiers.length) throw new Error("Tick at least one tier: T1, T2 or T3.");
+        result = await api("/api/suppliers", { method: "POST", body: JSON.stringify(takeCategory(values)) });
+      }
       if (type === "supplier" || type === "material") await reloadCategories();
       if (type === "product" || type === "model" || type === "material" || type === "bom" || type === "component") await loadCoreData();
       modalLayer.hidden = true;
@@ -2787,6 +2838,8 @@ document.addEventListener("click", async (event) => {
       return renderPurchaseOrders();
     } catch (error) { toast(error.message, true); }
   }
+  const tierTabButton = event.target.closest("[data-supplier-tier-tab]");
+  if (tierTabButton) { state.supplierTierTab = tierTabButton.dataset.supplierTierTab; return renderSupplierControl(); }
   const supplierEdit = event.target.closest("[data-edit-supplier]");
   if (supplierEdit) return openSupplierEdit(state.suppliers.find((supplier) => String(supplier.id) === supplierEdit.dataset.editSupplier));
   const supplierDelete = event.target.closest("[data-delete-supplier]");

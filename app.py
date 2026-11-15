@@ -34,6 +34,9 @@ class Supplier(Base):
     code: Mapped[str] = mapped_column(String(24), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(160), index=True)
     category: Mapped[str] = mapped_column(String(80))
+    # Supplier Master tabs the supplier belongs to: "T1", "T2", "T3" (one or more, comma-separated).
+    # T1 = supplies you; T2 = supplies a T1 supplier ... e.g. TATA Steel can be T1 and T2.
+    tiers: Mapped[str] = mapped_column(String(20), default="T1")
     country: Mapped[str] = mapped_column(String(80))
     contact_name: Mapped[str] = mapped_column(String(120), default="")
     email: Mapped[str] = mapped_column(String(180), default="")
@@ -241,6 +244,7 @@ class QuoteDecision(BaseModel):
 
 class SupplierCreate(BaseModel):
     code: str = Field(default="", max_length=24)  # blank = next free SUP- code
+    tiers: list[str] = ["T1"]
     name: str = Field(min_length=2, max_length=160)
     category: str = Field(min_length=2, max_length=80)
     country: str = Field(min_length=2, max_length=80)
@@ -253,6 +257,7 @@ class SupplierUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     code: str | None = Field(default=None, min_length=1, max_length=24)
+    tiers: list[str] | None = None
     name: str | None = Field(default=None, min_length=2, max_length=160)
     category: str | None = Field(default=None, min_length=2, max_length=80)
     country: str | None = Field(default=None, min_length=2, max_length=80)
@@ -347,6 +352,29 @@ class StockDeliveryCreate(BaseModel):
     quality_accepted: bool = True
 
 
+SUPPLIER_TIERS = ("T1", "T2", "T3")
+
+
+def _tier_list(value) -> list[str]:
+    """'T2,T1' / ['t1'] / 'Tier 2' -> ['T1', 'T2'] (T1-T3 only, in order)."""
+    parts = value if isinstance(value, (list, tuple, set)) else str(value or "").replace(";", ",").split(",")
+    found = set()
+    for part in parts:
+        text_value = str(part).strip().upper().replace(" ", "").replace("TIER", "T")
+        if text_value == "DIRECT":
+            text_value = "T1"
+        if text_value in SUPPLIER_TIERS:
+            found.add(text_value)
+    return [tier for tier in SUPPLIER_TIERS if tier in found]
+
+
+def _tier_text(value) -> str:
+    tiers = _tier_list(value)
+    if not tiers:
+        raise HTTPException(status_code=422, detail="Choose at least one supplier tier: T1, T2 or T3")
+    return ",".join(tiers)
+
+
 def _supplier_dict(supplier: Supplier) -> dict:
     score = round(supplier.on_time_rate * 0.4 + supplier.quality_rate * 0.4 + supplier.response_rate * 0.2)
     return {
@@ -354,6 +382,7 @@ def _supplier_dict(supplier: Supplier) -> dict:
         "code": supplier.code,
         "name": supplier.name,
         "category": supplier.category,
+        "tiers": _tier_list(supplier.tiers),
         "country": supplier.country,
         "contact_name": supplier.contact_name,
         "email": supplier.email,
@@ -496,6 +525,9 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
     if "buffer_days" not in {column["name"] for column in __import__("sqlalchemy").inspect(engine).get_columns("items")}:
         with engine.begin() as connection:
             connection.exec_driver_sql("ALTER TABLE items ADD COLUMN buffer_days INTEGER NOT NULL DEFAULT 0")
+    if "tiers" not in {column["name"] for column in __import__("sqlalchemy").inspect(engine).get_columns("suppliers")}:
+        with engine.begin() as connection:  # set from relationships at start-up (planning)
+            connection.exec_driver_sql("ALTER TABLE suppliers ADD COLUMN tiers VARCHAR(20) NOT NULL DEFAULT ''")
     SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
     @asynccontextmanager
@@ -587,6 +619,7 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
                 raise HTTPException(status_code=409, detail=f"Supplier code {code} is already used by {taken}")
         supplier = Supplier(
             code=code or f"SUP-{sequence:04d}",
+            tiers=_tier_text(payload.tiers),
             name=payload.name.strip(),
             category=_ensure_category(db, payload.category),
             country=payload.country.strip(),
@@ -611,6 +644,8 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
             if value is not None:
                 if key == "category":
                     value = _ensure_category(db, value)
+                if key == "tiers":
+                    value = _tier_text(value)
                 if key == "code":
                     value = value.strip()
                     if not value:

@@ -967,7 +967,7 @@ class SupplierHubApiTests(unittest.TestCase):
         # Rejected files change nothing (all rows or none)
         for rows, expected in [
             ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-MOTOR", "Iljin Noida", "", "", 40, 1, "INR", 0, 0, 0)], "made in-house"),
-            ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-NOPE", "Iljin Noida", "", "", 40, 1, "INR", 0, 0, 0)], "not in Material Master"),
+            ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-NOPE", "Iljin Noida", "", "", 40, 1, "INR", 0, 0, 0)], "is not in T1, T2 or T3 Material Master"),
             ([("PP-PCB", "Iljin Noida", "", "", 70, 1800, "INR", 90, 0, 0), ("PP-PCB", "LG Pune", "", "", 40, 1900, "INR", 60, 0, 0)], "more than 100%"),
             ([("PP-PCB", "Iljin Noida", "", "", 60, 1800, "INR", 90, 0, 0), ("PP-PCB", "Iljin Noida", "", "", 40, 1800, "INR", 90, 0, 0)], "repeated"),
             ([("PP-PCB", "Chip Co", "T2", "", 100, 5, "INR", 0, 0, 0)], "parent_supplier_name"),
@@ -987,10 +987,10 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(response.json(), {"rows": 3, "added": 3, "updated": 0, "suppliers_created": 3})
         found = links_of(pcb)
-        self.assertEqual(found[("Iljin Noida", "Direct")]["sob_percent"], 60)
-        self.assertEqual(found[("Iljin Noida", "Direct")]["unit_price"], 1800)
-        self.assertEqual(found[("Iljin Noida", "Direct")]["currency"], "INR")
-        self.assertEqual((found[("Iljin Noida", "Direct")]["lead_time_days"], found[("Iljin Noida", "Direct")]["moq"]), (90, 500))
+        self.assertEqual(found[("Iljin Noida", "T1")]["sob_percent"], 60)
+        self.assertEqual(found[("Iljin Noida", "T1")]["unit_price"], 1800)
+        self.assertEqual(found[("Iljin Noida", "T1")]["currency"], "INR")
+        self.assertEqual((found[("Iljin Noida", "T1")]["lead_time_days"], found[("Iljin Noida", "T1")]["moq"]), (90, 500))
         self.assertEqual(found[("Chip Co", "T2")]["parent_supplier_name"], "Iljin Noida")
         # BOM price picks it up: (1800 x 60 + 1900 x 40) / 100 = 1840
         row = next(r for r in self.client.get(f"/api/planning/model-bom/{model}").json()["items"] if r["material_id"] == pcb)
@@ -999,7 +999,7 @@ class SupplierHubApiTests(unittest.TestCase):
         response = upload([("PP-PCB", "iljin noida", "", "", 50, 1750, "INR", 80, 0, 0), ("PP-PCB", "LG PUNE", "", "", 50, 1900, "INR", 60, 0, 0)])
         self.assertEqual(response.json(), {"rows": 2, "added": 0, "updated": 2, "suppliers_created": 0})
         self.assertEqual(found.keys(), links_of(pcb).keys())
-        self.assertEqual(links_of(pcb)[("Iljin Noida", "Direct")]["unit_price"], 1750)
+        self.assertEqual(links_of(pcb)[("Iljin Noida", "T1")]["unit_price"], 1750)
 
     def test_supplier_relationship_upload_accepts_users_sheet_as_is(self):
         # The user's sheet: rows 1-3 empty, heading on row 4, columns as in their screenshot
@@ -1038,7 +1038,7 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(len(links), 8)
         steel = links["FL001STEEL0.8"]
         self.assertEqual((steel["supplier_name"], steel["tier"], steel["sob_percent"], steel["unit_price"], steel["currency"], steel["buffer_days"]),
-                         ("JGI Goa", "Direct", 100, 105, "INR", 5))
+                         ("JGI Goa", "T1", 100, 105, "INR", 5))
         self.assertEqual((links["FL001PCB1"]["supplier_name"], links["FL001PCB1"]["unit_price"], links["FL001PCB1"]["buffer_days"]), ("Iljin Noida", 1800, 90))
         # "On hand" is not a supplier field: Material Master stock is unchanged
         material = next(m for m in self.client.get("/api/planning/materials", params={"search": "FL001STEEL0.8"}).json()["items"] if m["code"] == "FL001STEEL0.8")
@@ -1843,10 +1843,141 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(now["SUP-1002"]["contact_name"], "Jordan L.")  # matched by name, blank cells keep old values
         self.assertEqual(len(now), len({s_["code"].lower() for s_ in now.values()}))
         template = load_workbook(io.BytesIO(self.client.get("/api/planning/templates/suppliers.xlsx").content)).active
-        self.assertEqual([c.value for c in template[1]], ["supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval"])
+        self.assertEqual([c.value for c in template[1]], ["supplier_code", "supplier_name", "supplier_tier", "category", "country", "contact_person", "email", "phone", "approval"])
         # the template itself uploads
-        self.assertEqual(upload([("TPL-1", "Template Supplier", "Casting", "India", "A", "a@b.example", "1", "Approved")],
-                                heading=("supplier_code", "supplier_name", "category", "country", "contact_person", "email", "phone", "approval")).status_code, 201)
+        self.assertEqual(upload([("TPL-1", "Template Supplier", "T1, T2", "Casting", "India", "A", "a@b.example", "1", "Approved")],
+                                heading=("supplier_code", "supplier_name", "supplier_tier", "category", "country", "contact_person", "email", "phone", "approval")).status_code, 201)
+        self.assertEqual(suppliers()["TPL-1"]["tiers"], ["T1", "T2"])
+
+    def test_t1_t2_t3_tiers_t2_codes_full_row_edit_and_supplier_tiers(self):
+        api = self.client
+        def material(code, name="Steel"):
+            return api.post("/api/planning/materials", json={"code": code, "name": name, "uom": "kg", "category": "Steel Raw material"}).json()["id"]
+        steel = material("TR-STEEL")
+        chip = api.post("/api/planning/tier-materials", json={"tier": "T2", "code": "TR-CHIP", "name": "MicroChip", "uom": "PCS", "unit_price": 480, "currency": "INR"}).json()["id"]
+        sup = lambda name, tiers=None: api.post("/api/suppliers", json={"name": name, "category": "Casting", "country": "India", **({"tiers": tiers} if tiers else {})}).json()
+        tata, supangita, ilin, samicon = sup("TR TATA Steel"), sup("TR Supangita"), sup("TR ILIN"), sup("TR Samicon", ["T2"])
+        self.assertEqual((tata["tiers"], samicon["tiers"]), (["T1"], ["T2"]))
+        self.assertEqual(api.post("/api/suppliers", json={"name": "TR Bad", "category": "Casting", "country": "India", "tiers": ["T9"]}).status_code, 422)
+        def link(body):
+            return api.post("/api/planning/supplier-parts", json={"sob_percent": 100, "currency": "INR", **body})
+        # TATA sells steel to you (T1) and to Supangita (T2, parent Supangita); "Direct" still means T1
+        t1 = link({"material_id": steel, "supplier_id": tata["id"], "tier": "Direct", "sob_percent": 60, "unit_price": 70})
+        self.assertEqual((t1.status_code, t1.json()["tier"]), (201, "T1"), t1.text)
+        self.assertEqual(link({"material_id": steel, "supplier_id": supangita["id"], "tier": "T1", "sob_percent": 40, "unit_price": 74}).status_code, 201)
+        t2 = link({"material_id": steel, "supplier_id": tata["id"], "tier": "T2", "parent_supplier_id": supangita["id"], "unit_price": 72})
+        self.assertEqual(t2.status_code, 201, t2.text)
+        self.assertIn("must have its parent supplier", link({"material_id": steel, "supplier_id": tata["id"], "tier": "T3"}).json()["detail"])
+        self.assertIn("Tier must be T1", link({"material_id": steel, "supplier_id": tata["id"], "tier": "X1"}).json()["detail"])
+        # a T2 Material Master code: only for T2/T3 rows (Samicon supplies the chip to ILIN)
+        self.assertIn("a T1 supplier needs a T1 code", link({"tier_material_id": chip, "supplier_id": samicon["id"], "tier": "T1"}).json()["detail"])
+        self.assertIn("Choose one part code", link({"material_id": steel, "tier_material_id": chip, "supplier_id": samicon["id"], "tier": "T2", "parent_supplier_id": ilin["id"]}).json()["detail"])
+        chip_link = link({"tier_material_id": chip, "supplier_id": samicon["id"], "tier": "T2", "parent_supplier_id": ilin["id"], "unit_price": 480})
+        self.assertEqual(chip_link.status_code, 201, chip_link.text)
+        only_t3 = sup("TR Only T3", ["T3"])
+        extra = sup("TR Extra")
+        self.assertEqual(link({"material_id": steel, "supplier_id": extra["id"], "tier": "T2", "parent_supplier_id": only_t3["id"], "sob_percent": 0}).status_code, 201)
+        self.assertEqual(next(s_ for s_ in api.get("/api/suppliers").json() if s_["name"] == "TR Only T3")["tiers"], ["T1", "T3"])  # parent of a T2 row is T1
+        self.assertEqual(api.patch(f"/api/planning/supplier-parts/{chip_link.json()['id']}", json={"lead_time_days": 60}).status_code, 200)  # 100% alone in its route
+        rows = {(r["supplier_name"], r["tier"]): r for r in api.get("/api/planning/supplier-parts", params={"search": "TR-"}).json()["items"]}
+        self.assertEqual((rows[("TR Samicon", "T2")]["material_code"], rows[("TR Samicon", "T2")]["code_master"], rows[("TR Samicon", "T2")]["parent_supplier_name"]), ("TR-CHIP", "T2", "TR ILIN"))
+        self.assertEqual(rows[("TR TATA Steel", "T1")]["code_master"], "T1")
+        # suppliers' tiers follow their relationships: TATA T1+T2, ILIN T1 (parent of a T2 row), Samicon T2
+        tiers = {s_["name"]: s_["tiers"] for s_ in api.get("/api/suppliers").json()}
+        self.assertEqual((tiers["TR TATA Steel"], tiers["TR Supangita"], tiers["TR ILIN"], tiers["TR Samicon"]), (["T1", "T2"], ["T1"], ["T1"], ["T2"]))
+        # your BOM price uses T1 rows only: 0.6 x 70 + 0.4 x 74 = 71.6 (TATA's T2 price 72 not used)
+        model = api.post("/api/planning/models", json={"code": "TR-M", "name": "Tier model"}).json()["id"]
+        api.post(f"/api/planning/model-bom/{model}", json={"material_id": steel, "quantity": 1, "uom": "kg"})
+        self.assertAlmostEqual(next(r for r in api.get(f"/api/planning/model-bom/{model}").json()["items"])["unit_price"], 71.6)
+        # POs only for T1 Material Master codes; a T2 code in use cannot be deleted
+        po = api.post("/api/planning/purchase-orders", json={"supplier_part_id": chip_link.json()["id"], "quantity_ordered": 10, "expected_month": "2026-12", "workspace": "trial"})
+        self.assertIn("T1 Material Master codes", po.json()["detail"])
+        self.assertIn("supplier/material relationship", api.delete(f"/api/planning/tier-materials/{chip}").json()["detail"])
+
+        # full-row edit: the T2 row by mistake -> make it T3 under Samicon, then back; supplier and part can change
+        t2_id = t2.json()["id"]
+        edited = api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"tier": "T3", "parent_supplier_id": samicon["id"]})
+        self.assertEqual((edited.status_code, edited.json()["tier"]), (200, "T3"), edited.text)
+        self.assertIn("must have its parent supplier", api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"tier": "T2", "parent_supplier_id": None}).json()["detail"])
+        self.assertIn("SOB cannot exceed 100%", api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"tier": "T1"}).json()["detail"])  # T1 steel is already 60 + 40
+        self.assertIn("already exists", api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"tier": "T1", "sob_percent": 0}).json()["detail"])  # TATA is already T1 for steel
+        moved = api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"tier": "T2", "parent_supplier_id": ilin["id"], "material_id": None, "tier_material_id": chip, "sob_percent": 0})
+        self.assertEqual(moved.status_code, 200, moved.text)
+        row = next(r for r in api.get("/api/planning/supplier-parts", params={"search": "TR-CHIP"}).json()["items"] if r["id"] == t2_id)
+        self.assertEqual((row["material_code"], row["tier"], row["parent_supplier_name"], row["sob_percent"]), ("TR-CHIP", "T2", "TR ILIN", 0))
+        self.assertIn("SOB cannot exceed 100%", api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"sob_percent": 10}).json()["detail"])
+        self.assertIn("own parent", api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"parent_supplier_id": tata["id"]}).json()["detail"])
+        self.assertEqual(api.patch(f"/api/planning/supplier-parts/{t2_id}", json={"supplier_id": supangita["id"]}).json()["tier"], "T2")
+        self.assertIn("T2", next(s_ for s_ in api.get("/api/suppliers").json() if s_["name"] == "TR Supangita")["tiers"])
+
+        # Excel upload: T2 code with "Tier 2", parent; supplier list upload in the T2 tab
+        def sheet(heading, data):
+            workbook = Workbook()
+            ws = workbook.active
+            ws.append(heading)
+            for r in data:
+                ws.append(r)
+            buffer = io.BytesIO()
+            workbook.save(buffer)
+            return buffer.getvalue()
+        up = api.post("/api/planning/supplier-parts/upload", content=sheet(["Material code", "Supplier name", "Tier", "Parent supplier", "SOB %"], [["TR-CHIP", "TR New Chip Co", "Tier 2", "TR Supangita", 50]]))
+        self.assertEqual(up.status_code, 201, up.text)
+        self.assertEqual(next(s_ for s_ in api.get("/api/suppliers").json() if s_["name"] == "TR New Chip Co")["tiers"], ["T2"])
+        bad = api.post("/api/planning/supplier-parts/upload", content=sheet(["Material code", "Supplier name", "Tier"], [["TR-CHIP", "TR ILIN", "T1"]]))
+        self.assertIn("a T1 supplier needs a T1 code", bad.json()["detail"])
+        listed = api.post("/api/suppliers/upload?tier=T2", content=sheet(["Supplier name", "Category"], [["TR Tab Two Co", "Casting"], ["TR TATA Steel", ""]]))
+        self.assertEqual(listed.status_code, 201, listed.text)
+        tiers = {s_["name"]: s_["tiers"] for s_ in api.get("/api/suppliers").json()}
+        # TATA was made T3 above (tiers are added automatically, never removed; untick in Edit)
+        self.assertEqual((tiers["TR Tab Two Co"], tiers["TR TATA Steel"]), (["T2"], ["T1", "T2", "T3"]))
+        self.assertEqual(api.patch(f"/api/suppliers/{samicon['id']}", json={"tiers": ["T2", "T3"]}).json()["tiers"], ["T2", "T3"])
+        self.assertEqual(api.patch(f"/api/suppliers/{samicon['id']}", json={"tiers": []}).status_code, 422)
+
+    def test_older_database_tiers_renamed_table_updated_and_backed_up(self):
+        # A database from before: supplier_parts without tier_material_id (material required),
+        # tiers "Direct" and "T1" (= supplier of the direct supplier), one stock row on the T1 link.
+        import sqlite3
+        db_path = Path(self.temp_dir.name) / "tiers.db"
+        first = TestClient(create_app(f"sqlite:///{db_path}"))
+        first.__enter__()
+        first.__exit__(None, None, None)
+        connection = sqlite3.connect(db_path)
+        connection.execute("DELETE FROM app_settings")
+        connection.execute("DROP TABLE supplier_parts")
+        connection.execute("""CREATE TABLE supplier_parts (id INTEGER PRIMARY KEY, material_id INTEGER NOT NULL, supplier_id INTEGER NOT NULL,
+            tier VARCHAR(24) NOT NULL, parent_supplier_id INTEGER, sob_percent FLOAT NOT NULL, lead_time_days INTEGER NOT NULL, moq FLOAT NOT NULL,
+            buffer_days INTEGER NOT NULL, unit_price FLOAT NOT NULL, currency VARCHAR(3) NOT NULL, price_mode VARCHAR(24) NOT NULL,
+            price_interval_months INTEGER NOT NULL, price_updated_month VARCHAR(7) NOT NULL, UNIQUE (material_id, supplier_id, tier, parent_supplier_id))""")
+        connection.execute("CREATE INDEX ix_supplier_parts_material_id ON supplier_parts (material_id)")
+        item = connection.execute("SELECT id FROM items WHERE code = 'MAT-104'").fetchone()[0]
+        direct, upstream, deeper = [row[0] for row in connection.execute("SELECT id FROM suppliers ORDER BY id LIMIT 3")]
+        connection.execute("UPDATE suppliers SET tiers = ''")
+        for row in ((10, item, direct, "Direct", None), (11, item, upstream, "T1", direct), (12, item, deeper, "T2", upstream)):
+            connection.execute("INSERT INTO supplier_parts VALUES (?, ?, ?, ?, ?, 100, 10, 0, 5, 1.5, 'INR', 'spot', 1, '2026-10')", row)
+        connection.execute("INSERT INTO supplier_stock_snapshots (workspace, report_month, supplier_part_id, quantity, available_quantity) VALUES ('trial', '2026-10', 11, 25, 20)")
+        connection.commit()
+        connection.close()
+        client = TestClient(create_app(f"sqlite:///{db_path}"))
+        client.__enter__()
+        self.assertEqual(client.post("/api/auth/setup", json={"username": "admin", "full_name": "Test Admin", "password": "Secure-test-password-2026!"}).status_code, 201)
+        check = sqlite3.connect(db_path)
+        self.assertEqual(check.execute("SELECT id, tier, parent_supplier_id FROM supplier_parts ORDER BY id").fetchall(), [(10, "T1", None), (11, "T2", direct), (12, "T3", upstream)])
+        columns = {row[1]: row[3] for row in check.execute("PRAGMA table_info(supplier_parts)")}
+        self.assertIn("tier_material_id", columns)
+        self.assertEqual(columns["material_id"], 0)  # may be empty now (T2/T3 codes)
+        self.assertEqual(check.execute("SELECT supplier_part_id, quantity FROM supplier_stock_snapshots").fetchall(), [(11, 25.0)])
+        self.assertEqual(sorted(k for (k,) in check.execute("SELECT key FROM app_settings")), ["supplier_tiers_set", "tiers_t1_is_direct"])
+        tiers = dict(check.execute("SELECT id, tiers FROM suppliers WHERE id IN (?, ?, ?)", (direct, upstream, deeper)).fetchall())
+        self.assertEqual((tiers[direct], tiers[upstream], tiers[deeper]), ("T1", "T2", "T3"))
+        self.assertTrue(list(Path(self.temp_dir.name).glob("tiers.db.before-tier-update-*.bak")))
+        listed = client.get("/api/planning/supplier-parts").json()["items"]
+        self.assertEqual(sorted(r["tier"] for r in listed), ["T1", "T2", "T3"])
+        client.__exit__(None, None, None)
+        # second start: nothing renamed again (T2 stays T2)
+        again = TestClient(create_app(f"sqlite:///{db_path}"))
+        again.__enter__()
+        self.assertEqual(sqlite3.connect(db_path).execute("SELECT tier FROM supplier_parts ORDER BY id").fetchall(), [("T1",), ("T2",), ("T3",)])
+        again.__exit__(None, None, None)
 
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
@@ -1885,7 +2016,7 @@ class SupplierHubApiTests(unittest.TestCase):
             "sob_percent": 100, "lead_time_days": 20, "unit_price": 1,
         })
         upstream = self.client.post("/api/planning/supplier-parts", json={
-            "material_id": material["id"], "supplier_id": direct_supplier["id"], "tier": "T1",
+            "material_id": material["id"], "supplier_id": direct_supplier["id"], "tier": "T2",
             "parent_supplier_id": parent_supplier["id"], "sob_percent": 100, "lead_time_days": 40,
             "unit_price": 1,
         })
