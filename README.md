@@ -48,7 +48,7 @@ Every table's column filter has **Sort A → Z / Z → A** (numbers such as "₹
 
 ## T1 Material Master: Used in
 
-The **Used in** column (right after Material name, also in the Excel / PDF download) shows the BOM levels a code is a line of: **L1** (Model BOM Level 1), **L2** (a Level 2 Part BOM, under an L1 part), **L3** (a Level 3 Part BOM, under an L2 part), or combinations such as **L1 & L2**, **L2 & L3**, **L1 & L3**, **L1 & L2 & L3**. A code used in no BOM shows **Not used** and its row is red.
+The **Used in** column (right after Material name, also in the Excel / PDF download) shows the BOM levels a code is a line of: **L1** (Model BOM Level 1), **L2** (a Level 2 Part BOM, under an L1 part), **L3** (a Level 3 Part BOM, under an L2 part), or combinations such as **L1 & L2**, **L2 & L3**, **L1 & L3**, **L1 & L2 & L3**. An **alternate code** counts as used at the level of each BOM line where it has an SOB above 0% (in any month) and shows e.g. **L3 (alternate)**. A code used in no BOM (and not an alternate above 0% anywhere) shows **Not used** and its row is red.
 
 ## Category list
 

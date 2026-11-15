@@ -1994,11 +1994,25 @@ class SupplierHubApiTests(unittest.TestCase):
         used = {m["code"]: m["used_in"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
         self.assertEqual(used, {"UI-MOTOR": "L1", "UI-STATOR": "L2", "UI-COPPER": "L3", "UI-GASKET": "L1 & L2", "UI-BOLT": "L2 & L3",
                                 "UI-WIRE": "L1 & L3", "UI-STEEL": "L1 & L2 & L3", "UI-SPARE": ""})
+        # alternates: IMPORT 20% on STATOR's STEEL line (L3) -> "L3 (alternate)"; NEWIMP 0% -> not used;
+        # BOLT is a line at L2 & L3 and 30% alternate of WIRE on the model's L1 line -> "L1 & L2 & L3 (alternate)"
+        imp, newimp = material("IMPORT"), material("NEWIMP")
+        for main, alternate in ((ids["STEEL"], imp), (ids["STEEL"], newimp), (ids["WIRE"], ids["BOLT"])):
+            self.assertEqual(self.client.post("/api/planning/alternate-codes", json={"main_item_id": main, "alternate_item_id": alternate}).status_code, 201)
+        uses = self.client.get("/api/planning/alternate-codes/uses", params={"main_item_id": ids["STEEL"]}).json()["uses"]
+        l3_line = next(u for u in uses if u["level"] == "L3")
+        self.assertEqual(self.client.post("/api/planning/alternate-sob", json={"main_item_id": ids["STEEL"], "lines": [{"component_id": l3_line["component_id"]}],
+                                                                             "alternates": [{"alternate_item_id": imp, "sob_percent": 20}, {"alternate_item_id": newimp, "sob_percent": 0}]}).status_code, 200)
+        wire_l1 = next(u for u in self.client.get("/api/planning/alternate-codes/uses", params={"main_item_id": ids["WIRE"]}).json()["uses"] if u["level"] == "L1")
+        self.assertEqual(self.client.post("/api/planning/alternate-sob", json={"main_item_id": ids["WIRE"], "lines": [{"model_bom_id": wire_l1["model_bom_id"]}],
+                                                                             "alternates": [{"alternate_item_id": ids["BOLT"], "sob_percent": 30}]}).status_code, 200)
+        used = {m["code"]: m["used_in"] for m in self.client.get("/api/planning/materials", params={"search": "UI-", "limit": 50}).json()["items"]}
+        self.assertEqual((used["UI-IMPORT"], used["UI-NEWIMP"], used["UI-BOLT"], used["UI-STEEL"]), ("L3 (alternate)", "", "L1 & L2 & L3 (alternate)", "L1 & L2 & L3"))
         sheet = load_workbook(io.BytesIO(self.client.get("/api/planning/tables/materials/xlsx").content)).active
         header = next(r for r in sheet.iter_rows(values_only=True) if r and r[0] == "Material code")
         self.assertEqual(list(header[:3]), ["Material code", "Material name", "Used in"])
         values = {r[0]: r[2] for r in sheet.iter_rows(values_only=True) if r and str(r[0]).startswith("UI-")}
-        self.assertEqual((values["UI-SPARE"], values["UI-STEEL"]), ("Not used", "L1 & L2 & L3"))
+        self.assertEqual((values["UI-SPARE"], values["UI-STEEL"], values["UI-IMPORT"], values["UI-NEWIMP"]), ("Not used", "L1 & L2 & L3", "L3 (alternate)", "Not used"))
 
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,

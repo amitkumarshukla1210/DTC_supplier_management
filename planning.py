@@ -1883,14 +1883,36 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     def bom_levels(db: Session) -> dict[int, list[str]]:
         """Where each T1 code is used: L1 = a line of Model BOM Level 1; L2 = a line of a Level 2
-        Part BOM (under an L1 part); L3 = a line of a Level 3 Part BOM (under an L2 part)."""
+        Part BOM (under an L1 part); L3 = a line of a Level 3 Part BOM (under an L2 part).
+        An alternate code with SOB above 0% on a line (in any month) is used at that line's level."""
         level1 = set(db.scalars(select(ModelBOM.material_id).distinct()).all())
         level2 = set(db.scalars(select(BOMComponent.child_item_id).where(BOMComponent.parent_item_id.in_(level1)).distinct()).all()) if level1 else set()
         level3 = set(db.scalars(select(BOMComponent.child_item_id).where(BOMComponent.parent_item_id.in_(level2)).distinct()).all()) if level2 else set()
-        levels: dict[int, list[str]] = {}
+        direct: dict[int, set[str]] = {}
         for name, ids in (("L1", level1), ("L2", level2), ("L3", level3)):
             for item_id in ids:
-                levels.setdefault(item_id, []).append(name)
+                direct.setdefault(item_id, set()).add(name)
+        # alternates: the level of each BOM line where they take a share
+        as_alternate: dict[int, set[str]] = {}
+        root_history, component_history, _ = _line_alternate_history(db)
+        for line_id, entries in root_history.items():
+            for _, alternate_id, sob in entries:
+                if sob > 0:
+                    as_alternate.setdefault(alternate_id, set()).add("L1")
+        if component_history:
+            parents = dict(db.execute(select(BOMComponent.id, BOMComponent.parent_item_id).where(BOMComponent.id.in_(list(component_history)))).all())
+            for line_id, entries in component_history.items():
+                line_levels = {name for name, ids in (("L2", level1), ("L3", level2)) if parents.get(line_id) in ids}
+                for _, alternate_id, sob in entries:
+                    if sob > 0:
+                        as_alternate.setdefault(alternate_id, set()).update(line_levels)
+        levels: dict[int, list[str]] = {}
+        for item_id in set(direct) | set(as_alternate):
+            names = sorted(direct.get(item_id, set()) | as_alternate.get(item_id, set()))
+            label = " & ".join(names)
+            if as_alternate.get(item_id, set()) - direct.get(item_id, set()):
+                label += " (alternate)"
+            levels[item_id] = [label]
         return levels
 
     @app.get("/api/planning/materials")
