@@ -1696,6 +1696,95 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(restarted.get("/api/suppliers").json(), [])
         restarted.__exit__(None, None, None)
 
+    def test_one_category_list_everywhere(self):
+        import sqlite3
+        db_file = Path(self.temp_dir.name) / "test.db"
+        listed = lambda: self.client.get("/api/planning/categories").json()
+        names = [c["name"] for c in listed()["items"]]
+        self.assertEqual(sorted(names, key=str.casefold), sorted([
+            "Raw material", "Finished assembly", "Electrical components", "Electronic PCB Assy", "Sheet Metal", "Wire Harness",
+            "Plastic Raw material", "Steel Raw material", "Electronic Child Part", "Casting", "Machining", "Packing Material",
+            "Fasteners", "Subassembly"], key=str.casefold))
+        self.assertEqual(self.client.get("/api/planning/material-categories").json()["items"], sorted(names, key=str.casefold))
+        # old sample categories replaced as agreed
+        suppliers = {s_["name"]: s_["category"] for s_ in self.client.get("/api/suppliers").json()}
+        self.assertEqual(suppliers["Apex Precision Works"], "Machining")
+        self.assertEqual(suppliers["Northstar Components"], "Sheet Metal")
+        self.assertEqual(suppliers["Metro Polymer Group"], "Plastic Raw material")
+        self.assertEqual(suppliers["Blue Ridge Fasteners"], "Fasteners")
+        items = {i["code"]: i["category"] for i in self.client.get("/api/planning/materials?limit=500").json()["items"]}
+        self.assertEqual((items["MAT-101"], items["MAT-102"], items["SUB-001"]), ("Machining", "Plastic Raw material", "Subassembly"))
+        self.assertEqual(listed()["unlisted"], [])
+        machining = next(c for c in listed()["items"] if c["name"] == "Machining")
+        self.assertEqual((machining["parts"], machining["suppliers"]), (1, 1))
+
+        # saves use the list's spelling; a new name is added to the list
+        self.assertEqual(self.client.post("/api/planning/materials", json={"code": "CT-STEEL", "name": "Steel", "uom": "kg", "category": "steel raw MATERIAL"}).status_code, 201)
+        self.assertEqual(self.client.post("/api/planning/materials", json={"code": "CT-BRG", "name": "Bearing", "uom": "PCS", "category": "Bearings"}).status_code, 201)
+        saved = {i["code"]: i["category"] for i in self.client.get("/api/planning/materials", params={"search": "CT-"}).json()["items"]}
+        self.assertEqual(saved, {"CT-STEEL": "Steel Raw material", "CT-BRG": "Bearings"})
+        self.assertIn("Bearings", self.client.get("/api/planning/material-categories").json()["items"])
+        caster = self.client.post("/api/suppliers", json={"name": "CT Foundry", "category": "casting", "country": "India"})
+        self.assertEqual(caster.json()["category"], "Casting")
+        workbook = Workbook()
+        ws = workbook.active
+        ws.append(["Code", "Name", "Category"])
+        ws.append(["CT-BOX", "Carton", "packing material"])
+        ws.append(["CT-GSK", "Gasket", "Gaskets"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        self.assertEqual(self.client.post("/api/planning/tier-materials/upload?tier=T2", content=buffer.getvalue()).status_code, 201)
+        tier = {m["code"]: m["category"] for m in self.client.get("/api/planning/tier-materials", params={"tier": "T2"}).json()["items"]}
+        self.assertEqual(tier, {"CT-BOX": "Packing Material", "CT-GSK": "Gaskets"})
+        self.assertIn("Gaskets", self.client.get("/api/planning/material-categories").json()["items"])
+
+        # supplier code after deleting a sample supplier: next free code, not a duplicate
+        apex = next(s_ for s_ in self.client.get("/api/suppliers").json() if s_["name"] == "Apex Precision Works")
+        self.assertEqual(self.client.delete(f"/api/suppliers/{apex['id']}").status_code, 204)
+        fresh = self.client.post("/api/suppliers", json={"name": "CT Harness Co", "category": "Wire Harness", "country": "India"})
+        self.assertEqual(fresh.status_code, 201, fresh.text)
+        codes = [s_["code"] for s_ in self.client.get("/api/suppliers").json()]
+        self.assertEqual(len(codes), len(set(codes)))
+
+        # a category used by your own old records but not in the list: shown, then replaced
+        connection = sqlite3.connect(db_file)
+        connection.execute("UPDATE items SET category = 'Electrical' WHERE code = 'MAT-104'")
+        connection.commit()
+        connection.close()
+        unlisted = listed()["unlisted"]
+        self.assertEqual([(u["name"], u["parts"]) for u in unlisted], [("Electrical", 1)])
+        self.assertEqual(self.client.post("/api/planning/categories/replace", json={"old": "Electrical", "new": "Banana"}).status_code, 422)
+        replaced = self.client.post("/api/planning/categories/replace", json={"old": "Electrical", "new": "electrical components"}).json()
+        self.assertEqual((replaced["new"], replaced["records"]), ("Electrical components", 1))
+        self.assertEqual(listed()["unlisted"], [])
+        # add, rename (records follow), delete (refused while used)
+        self.assertEqual(self.client.post("/api/planning/categories", json={"name": "fasteners"}).status_code, 409)
+        self.assertEqual(self.client.post("/api/planning/categories", json={"name": "Rubber Parts"}).status_code, 201)
+        fasteners = next(c for c in listed()["items"] if c["name"] == "Fasteners")
+        self.assertEqual(self.client.patch(f"/api/planning/categories/{fasteners['id']}", json={"name": "Casting"}).status_code, 409)
+        renamed = self.client.patch(f"/api/planning/categories/{fasteners['id']}", json={"name": "Fastener Parts"}).json()
+        self.assertEqual(renamed["records"], 2)  # MAT-103 and Blue Ridge
+        self.assertEqual(next(s_ for s_ in self.client.get("/api/suppliers").json() if s_["name"] == "Blue Ridge Fasteners")["category"], "Fastener Parts")
+        busy = self.client.delete(f"/api/planning/categories/{fasteners['id']}")
+        self.assertEqual(busy.status_code, 409)
+        self.assertIn("1 parts, 1 suppliers", busy.json()["detail"])
+        rubber = next(c for c in listed()["items"] if c["name"] == "Rubber Parts")
+        self.assertEqual(self.client.delete(f"/api/planning/categories/{rubber['id']}").status_code, 204)
+        # replacing a listed category moves its records and removes it from the list
+        bearings = next(c for c in listed()["items"] if c["name"] == "Bearings")
+        self.assertEqual(self.client.post("/api/planning/categories/replace", json={"old": "Bearings", "new": "Machining"}).json()["records"], 1)
+        self.assertNotIn(bearings["id"], [c["id"] for c in listed()["items"]])
+
+        # the one-time replacement does not run again: a re-added "Plastics" stays after a restart
+        self.assertEqual(self.client.post("/api/planning/categories", json={"name": "Plastics"}).status_code, 201)
+        metro = next(s_ for s_ in self.client.get("/api/suppliers").json() if s_["name"] == "Metro Polymer Group")
+        self.assertEqual(self.client.patch(f"/api/suppliers/{metro['id']}", json={"category": "plastics"}).json()["category"], "Plastics")
+        restarted = TestClient(create_app(f"sqlite:///{db_file}"))
+        restarted.__enter__()
+        restarted.post("/api/auth/login", json={"username": "admin", "password": "Secure-test-password-2026!"})
+        self.assertEqual(next(s_ for s_ in restarted.get("/api/suppliers").json() if s_["name"] == "Metro Polymer Group")["category"], "Plastics")
+        restarted.__exit__(None, None, None)
+
     def test_existing_database_gets_new_supplier_material_columns(self):
         # A database from the previous version: supplier_materials without the T1/T2/T3 link,
         # lead time and buffer columns, holding one entry. Starting the app adds the columns

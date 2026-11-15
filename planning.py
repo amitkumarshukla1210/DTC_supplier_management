@@ -29,7 +29,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 from starlette.responses import JSONResponse
 import xlsxwriter
 
-from app import Base, BOMComponent, Item, MaterialRequest, Supplier
+from app import Base, BOMComponent, Category, CATEGORY_TABLES, Item, MaterialRequest, Supplier, _ensure_category
 
 
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -1802,15 +1802,118 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     @app.get("/api/planning/material-categories")
     def material_categories(request: Request):
+        """The category list (names) for every category dropdown."""
         current_user(request)
         with open_db() as db:
-            names = db.scalars(select(Item.category).distinct()).all()
-        unique: dict[str, str] = {}
-        for name in names:
-            text = (name or "").strip()
-            if text:
-                unique.setdefault(text.casefold(), text)
-        return {"items": sorted(unique.values(), key=str.casefold)}
+            return {"items": sorted(db.scalars(select(Category.name)).all(), key=str.casefold)}
+
+    def category_usage(db: Session) -> dict[str, dict[str, int]]:
+        """Records per category (lower-case key): parts (T1), T2/T3 codes and suppliers."""
+        from sqlalchemy import text as sa_text
+        usage: dict[str, dict[str, int]] = {}
+        labels = {"items": "parts", "suppliers": "suppliers", "tier_materials": "tier_codes"}
+        for table in CATEGORY_TABLES:
+            label = labels[table]
+            for name, count in db.execute(sa_text(f"SELECT trim(category), COUNT(*) FROM {table} GROUP BY lower(trim(category))")).all():
+                if name:
+                    entry = usage.setdefault(name.lower(), {"name": name, "parts": 0, "tier_codes": 0, "suppliers": 0})
+                    entry[label] += count
+        return usage
+
+    def recategorise(db: Session, old: str, new: str) -> int:
+        from sqlalchemy import text as sa_text
+        changed = 0
+        for table in CATEGORY_TABLES:
+            changed += db.execute(sa_text(f"UPDATE {table} SET category = :new WHERE lower(trim(category)) = :old"), {"new": new, "old": old.strip().lower()}).rowcount
+        return changed
+
+    @app.get("/api/planning/categories")
+    def list_categories(request: Request):
+        """The category list with how many parts, T2/T3 codes and suppliers use each, plus categories
+        used by records but not in the list (to replace or add)."""
+        current_user(request)
+        with open_db() as db:
+            usage = category_usage(db)
+            items = []
+            for category in sorted(db.scalars(select(Category)).all(), key=lambda c: c.name.casefold()):
+                used = usage.pop(category.name.lower(), {})
+                items.append({"id": category.id, "name": category.name, "parts": used.get("parts", 0),
+                              "tier_codes": used.get("tier_codes", 0), "suppliers": used.get("suppliers", 0)})
+            unlisted = sorted(usage.values(), key=lambda entry: entry["name"].casefold())
+            return {"items": items, "unlisted": unlisted}
+
+    @app.post("/api/planning/categories", status_code=201)
+    def add_category(payload: dict, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        name = " ".join(str(payload.get("name") or "").split())
+        if len(name) < 2:
+            raise HTTPException(status_code=422, detail="Category needs at least 2 characters")
+        with open_db() as db:
+            if db.scalar(select(Category.id).where(func.lower(Category.name) == name.lower())):
+                raise HTTPException(status_code=409, detail=f"{name} is already in the category list")
+            saved = _ensure_category(db, name)
+            # records already using this name (any spelling) take the list's spelling
+            recategorise(db, saved, saved)
+            db.commit()
+            return {"name": saved}
+
+    @app.patch("/api/planning/categories/{category_id}")
+    def rename_category(category_id: int, payload: dict, request: Request):
+        """Rename a category; every part, T2/T3 code and supplier using it follows."""
+        current_user(request)
+        _check_supply_role(request)
+        name = " ".join(str(payload.get("name") or "").split())
+        if len(name) < 2 or len(name) > 80:
+            raise HTTPException(status_code=422, detail="Category needs 2 to 80 characters")
+        with open_db() as db:
+            category = db.get(Category, category_id)
+            if not category:
+                raise HTTPException(status_code=404, detail="Category not found")
+            other = db.scalar(select(Category).where(func.lower(Category.name) == name.lower(), Category.id != category_id))
+            if other:
+                raise HTTPException(status_code=409, detail=f"{other.name} is already in the list; use Replace to move {category.name} into it")
+            changed = recategorise(db, category.name, name)
+            category.name = name
+            db.commit()
+            return {"name": name, "records": changed}
+
+    @app.delete("/api/planning/categories/{category_id}", status_code=204)
+    def delete_category(category_id: int, request: Request):
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            category = db.get(Category, category_id)
+            if not category:
+                raise HTTPException(status_code=404, detail="Category not found")
+            used = category_usage(db).get(category.name.lower())
+            if used:
+                parts = [f"{used[k]} {label}" for k, label in (("parts", "parts"), ("tier_codes", "T2/T3 codes"), ("suppliers", "suppliers")) if used[k]]
+                raise HTTPException(status_code=409, detail=f"{category.name} is used by {', '.join(parts)}; use Replace to move them to another category first")
+            db.delete(category)
+            db.commit()
+            return Response(status_code=204)
+
+    @app.post("/api/planning/categories/replace")
+    def replace_category(payload: dict, request: Request):
+        """Move every record from one category (in the list or not) to a category in the list.
+        An old category that was in the list is removed from it."""
+        current_user(request)
+        _check_supply_role(request)
+        old = " ".join(str(payload.get("old") or "").split())
+        new = " ".join(str(payload.get("new") or "").split())
+        with open_db() as db:
+            target = db.scalar(select(Category).where(func.lower(Category.name) == new.lower()))
+            if not old or not target:
+                raise HTTPException(status_code=422, detail="Choose the old category and a category from your list")
+            if old.lower() == target.name.lower():
+                raise HTTPException(status_code=422, detail="Choose a different category to replace with")
+            changed = recategorise(db, old, target.name)
+            listed = db.scalar(select(Category).where(func.lower(Category.name) == old.lower()))
+            if listed:
+                db.delete(listed)
+            db.commit()
+            return {"old": old, "new": target.name, "records": changed}
 
     @app.post("/api/planning/materials", status_code=201)
     def add_material(payload: MaterialInput, request: Request):
@@ -1827,7 +1930,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if owner:
                 raise HTTPException(status_code=409, detail=f"{code} already exists in {owner} Material Master")
             item = Item(
-                code=code, name=payload.name.strip(), category=payload.category.strip(),
+                code=code, name=payload.name.strip(), category=_ensure_category(db, payload.category),
                 uom=payload.uom.strip(), stock_on_hand=payload.stock_on_hand,
                 reorder_level=0, buffer_days=payload.buffer_days, unit_cost=payload.unit_cost, currency=payload.currency,
             )
@@ -1859,7 +1962,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=409, detail="Material code already exists")
             if db.scalar(select(TierMaterial.tier).where(func.lower(TierMaterial.code) == code.lower()).limit(1)):
                 raise HTTPException(status_code=409, detail=f"{code} already exists in {code_owner(db, code)} Material Master")
-            item.code, item.name, item.category, item.uom = code, payload.name.strip(), payload.category.strip(), payload.uom.strip()
+            item.code, item.name, item.category, item.uom = code, payload.name.strip(), _ensure_category(db, payload.category), payload.uom.strip()
             item.stock_on_hand, item.buffer_days = payload.stock_on_hand, payload.buffer_days
             if _check_price_access(request):
                 item.unit_cost, item.currency = payload.unit_cost, payload.currency
@@ -2688,7 +2791,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     return found
                 while f"SUP-{next_number:04d}" in used_codes:
                     next_number += 1
-                supplier = Supplier(code=f"SUP-{next_number:04d}", name=name, category=category or "General", country="-",
+                supplier = Supplier(code=f"SUP-{next_number:04d}", name=name, category=_ensure_category(db, category or "Raw material"), country="-",
                                     status="Approved", risk="Medium")
                 used_codes.add(supplier.code)
                 db.add(supplier)
@@ -2803,7 +2906,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         current_user(request)
         with open_db() as db:
             code = check_tier_material(db, payload, request)
-            material = TierMaterial(tier=payload.tier, code=code, name=payload.name.strip(), category=payload.category.strip(), uom=payload.uom.strip(),
+            material = TierMaterial(tier=payload.tier, code=code, name=payload.name.strip(), category=_ensure_category(db, payload.category), uom=payload.uom.strip(),
                                     unit_price=payload.unit_price, currency=payload.currency)
             db.add(material)
             db.commit()
@@ -2817,7 +2920,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if not material or material.tier != payload.tier:
                 raise HTTPException(status_code=404, detail=f"{payload.tier} material not found")
             material.code = check_tier_material(db, payload, request, material)
-            material.name, material.category, material.uom = payload.name.strip(), payload.category.strip(), payload.uom.strip()
+            material.name, material.category, material.uom = payload.name.strip(), _ensure_category(db, payload.category), payload.uom.strip()
             if _check_price_access(request):
                 material.unit_price, material.currency = payload.unit_price, payload.currency
             sync_linked_supplier_materials(db, tier_material=material)
@@ -2863,7 +2966,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 seen.add(code.lower())
                 price, currency = _price_cells(row, row_number, can_price)
                 uom = str(row.get("uom") or "ea").strip() or "ea"
-                category = str(row.get("category") or "Raw material").strip() or "Raw material"
+                category = _ensure_category(db, str(row.get("category") or "").strip() or "Raw material")
                 material = mine.get(code.lower())
                 if material:
                     material.name, material.category, material.uom = name, category, uom

@@ -183,8 +183,35 @@ function field(label, name, type = "text", options = {}) {
 
 function categoryField(selected) {
   const names = [...state.materialCategories];
-  if (selected && !names.some((name) => name.toLowerCase() === selected.toLowerCase())) names.unshift(selected);
-  return `<label class="field"><span>Category</span><select class="form-control" name="category_choice" id="categorySelect" required>${names.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(selected).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control category-new" id="categoryNew" name="category_new" placeholder="Type new category name" minlength="2" maxlength="80" hidden /></label>`;
+  const outside = selected && !names.some((name) => name.toLowerCase() === String(selected).toLowerCase());
+  return `<label class="field"><span>Category</span><select class="form-control" name="category_choice" id="categorySelect" required>${outside ? `<option value="" selected disabled>${esc(selected)} (not in list: choose one)</option>` : ""}${names.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(selected).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control category-new" id="categoryNew" name="category_new" placeholder="Type new category name" minlength="2" maxlength="80" hidden /></label>`;
+}
+
+// Category dropdown (the one list from Product Master → Category) with "+ Add new category".
+// A record whose old category is not in the list shows it marked, until you pick one from the list.
+function bindCategoryField(root = document) {
+  const choice = root.querySelector("#categorySelect");
+  const fresh = root.querySelector("#categoryNew");
+  if (!choice || !fresh) return;
+  const sync = () => {
+    const adding = choice.value === "__new__";
+    fresh.hidden = !adding;
+    fresh.required = adding;
+    if (adding) fresh.focus();
+  };
+  choice.addEventListener("change", sync);
+  sync();
+}
+function takeCategory(values) {
+  values.category = values.category_choice === "__new__" ? (values.category_new || "").trim() : values.category_choice;
+  const known = state.materialCategories.find((name) => name.toLowerCase() === String(values.category).toLowerCase());
+  if (known) values.category = known;
+  delete values.category_choice;
+  delete values.category_new;
+  return values;
+}
+async function reloadCategories() {
+  try { state.materialCategories = (await api("/api/planning/material-categories")).items; } catch { /* keep the old list */ }
 }
 
 function unitField(label = "Unit", name = "uom", selected = "ea") {
@@ -502,7 +529,8 @@ async function renderMaster() {
     }));
   }).join("");
   const modelRows = state.models.map((item) => `<tr data-edit-model="${item.id}" tabindex="0"><td>${esc(item.code)}</td><td>${esc(item.name)}</td><td>${esc(item.product_names?.join(", ") || "Unassigned")}</td><td><button class="text-button" data-edit-model="${item.id}">Edit</button><button class="text-button button-danger" data-delete-model="${item.id}">Delete</button></td></tr>`).join("");
-  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master", "Alternate codes", "SOB change log"];
+  const tabs = ["Product Master", "Model BOM Level 1", "Level 2 Part BOM", "Level 3 Part BOM", "Material Master", "T2 Material Master", "T3 Material Master", "Alternate codes", "SOB change log", "Category"];
+  const categoryTab = state.bomTab === "Category";
   const altTab = state.bomTab === "Alternate codes";
   const logTab = state.bomTab === "SOB change log";
   const tierTab = TIER_TABS[state.bomTab];
@@ -514,6 +542,10 @@ async function renderMaster() {
     : state.bomTab === "Material Master"
       ? '<button class="button" data-action="new-model">Add model</button><button class="button button-primary" data-action="new-material">Add material</button>'
       : tierTab ? `<button class="button button-primary" data-action="new-tier-material">Add ${tierTab} material</button>` : "";
+  const categorySection = `<section class="panel table-panel">${panelHeader("Category", "The one category list for parts (T1, T2, T3) and suppliers: every category dropdown uses it. Add, rename (every record using it follows) or delete (only when nothing uses it). A new category typed in a dropdown or found in an Excel upload is added here automatically.")}
+      <form id="categoryAddForm" class="panel-body inline-upload"><label class="field"><span>New category</span><input class="form-control" name="name" minlength="2" maxlength="80" required placeholder="e.g. Rubber Parts" /></label><button class="button button-primary" type="submit">Add category</button></form>
+      <div id="categoryTable"></div>
+      <div id="categoryUnlisted"></div></section>`;
   const logSection = `<section class="panel table-panel">${panelHeader("SOB change log", "Every alternate SOB change: when, who, which code, where it is used (L1 / L2 / L3), from which month and the split. Set or remove SOB in Alternate codes → Manage SOB.")}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code, use, split or user" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/sob-change-log.xlsx" id="sobLogExcel">Download Excel</a><a class="button button-small" href="/api/planning/sob-change-log.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <div id="sobLogTable"></div></section>`;
@@ -542,6 +574,7 @@ async function renderMaster() {
       <div id="modelMasterTable">${table(["Model code", "Model name", "Assigned products", "Action"], modelRows, "No models yet.")}</div></section>`
     : altTab ? altSection
     : logTab ? logSection
+    : categoryTab ? categorySection
     : tierTab ? `<section class="panel table-panel">${panelHeader(`${tierTab} Material Master`, `Codes used further down the supply chain (${tierTab === "T2" ? "by your T1 suppliers' suppliers" : "by your T2 suppliers' suppliers"}). Not part of your planning; suppliers pick them into their own material master. A code can be in only one of T1, T2 or T3.`)}
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="masterSearch" type="search" placeholder="Search code or name" /></label><button class="button button-small" type="button" data-execute-master-search>Execute</button><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.xlsx">Download Excel</a><a class="button button-small" href="/api/planning/tier-materials/${tierTab}.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div>
       <form id="tierUploadForm" class="panel-body inline-upload"><label class="field"><span>Upload ${tierTab} Material Master (Code, Name, Category, Unit, Unit price / Unit cost, Currency; your own headings are fine)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button" type="submit">Upload</button></form>
@@ -572,6 +605,19 @@ async function renderMaster() {
     initAlternateCodesTab();
   } else if (logTab) {
     loadSobLog(0);
+  } else if (categoryTab) {
+    $("#categoryAddForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      try {
+        const saved = await api("/api/planning/categories", { method: "POST", body: JSON.stringify({ name: form.elements.name.value }) });
+        toast(`${saved.name} added to the category list`);
+        form.reset();
+        await reloadCategories();
+        loadCategoryTab();
+      } catch (error) { toast(error.message, true); }
+    });
+    loadCategoryTab();
   } else if (tierTab) {
     await loadTierMaterialPage(0);
     $("#tierUploadForm").addEventListener("submit", async (event) => {
@@ -930,16 +976,18 @@ async function loadTierMaterialPage(offset = 0) {
 function openTierMaterial(material = null) {
   const tier = TIER_TABS[state.bomTab];
   $("#modalTitle").textContent = material ? `Edit ${material.code}` : `Add ${tier} material`;
-  $("#modalBody").innerHTML = `<form id="tierForm" class="form-grid">${field("Code", "code", "text", { required: true, maxlength: 48, value: material?.code })}${field("Name", "name", "text", { required: true, maxlength: 180, value: material?.name })}${field("Category", "category", "text", { required: true, value: material?.category || "Raw material" })}${unitField("Unit", "uom", material?.uom || "kg")}${canSeePrices() ? `${field("Reference price", "unit_price", "number", { min: 0, step: "0.0001", value: material?.unit_price ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === (material?.currency || "INR") ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<div class="modal-footer field full"><button class="button button-primary">Save ${tier} material</button></div></form>`;
+  $("#modalBody").innerHTML = `<form id="tierForm" class="form-grid">${field("Code", "code", "text", { required: true, maxlength: 48, value: material?.code })}${field("Name", "name", "text", { required: true, maxlength: 180, value: material?.name })}${categoryField(material?.category || "Raw material")}${unitField("Unit", "uom", material?.uom || "kg")}${canSeePrices() ? `${field("Reference price", "unit_price", "number", { min: 0, step: "0.0001", value: material?.unit_price ?? 0 })}<label class="field"><span>Currency</span><select class="form-control" name="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option ${c === (material?.currency || "INR") ? "selected" : ""}>${c}</option>`).join("")}</select></label>` : ""}<div class="modal-footer field full"><button class="button button-primary">Save ${tier} material</button></div></form>`;
   modalLayer.hidden = false;
+  bindCategoryField($("#tierForm"));
   $("#tierForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const values = takeCategory(Object.fromEntries(new FormData(event.currentTarget).entries()));
     const body = { tier, code: values.code, name: values.name, category: values.category, uom: values.uom, unit_price: Number(values.unit_price ?? material?.unit_price ?? 0), currency: values.currency || material?.currency || "INR" };
     try {
       await api(material ? `/api/planning/tier-materials/${material.id}` : "/api/planning/tier-materials", { method: material ? "PATCH" : "POST", body: JSON.stringify(body) });
       modalLayer.hidden = true;
       toast(`${tier} material saved`);
+      reloadCategories();
       loadTierMaterialPage(0);
     } catch (error) { toast(error.message, true); }
   });
@@ -985,6 +1033,18 @@ async function loadAlternateCodes(offset = 0) {
 }
 
 const SOB_LEVELS = [["L1", "direct use in Model BOM Level 1"], ["L2", "Level 2 part BOMs"], ["L3", "Level 3 part BOMs"]];
+
+async function loadCategoryTab() {
+  const target = $("#categoryTable");
+  if (!target) return;
+  const { items, unlisted } = await api("/api/planning/categories");
+  state.categoryItems = items;
+  target.innerHTML = table(["Category", "Parts (T1)", "T2 / T3 codes", "Suppliers", "Rename", "Delete"],
+    items.map((c) => `<tr><td>${esc(c.name)}</td><td>${number(c.parts, 0)}</td><td>${number(c.tier_codes, 0)}</td><td>${number(c.suppliers, 0)}</td><td><button class="text-button" data-category-rename="${c.id}">Rename</button></td><td><button class="text-button button-danger" data-category-delete="${c.id}">Delete</button></td></tr>`).join(""), "No categories yet.");
+  const options = items.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
+  $("#categoryUnlisted").innerHTML = unlisted.length ? `<h3 class="subtable-heading">Categories used by records but not in your list</h3><p class="subtle panel-body">Replace each with a category from your list (the records move to it), or add it to your list.</p>${table(["Old category", "Parts (T1)", "T2 / T3 codes", "Suppliers", "Replace with", "Action"],
+    unlisted.map((u) => `<tr data-unlisted="${esc(u.name)}"><td>${esc(u.name)}</td><td>${number(u.parts, 0)}</td><td>${number(u.tier_codes, 0)}</td><td>${number(u.suppliers, 0)}</td><td><select class="form-control" data-replace-with><option value="">Choose from your list</option>${options}</select></td><td><button class="text-button" data-category-replace>Replace</button><button class="text-button" data-category-adopt>Add to my list</button></td></tr>`).join(""))}` : "";
+}
 
 // Manage SOB (Alternate codes): every use of the main code with its SOB; one change, from a
 // month, goes on all ticked uses at once and is written to the SOB change log.
@@ -1163,13 +1223,15 @@ function transferEntryRow() {
 function openSupplierEdit(supplier) {
   if (!supplier) return;
   $("#modalTitle").textContent = `Edit ${supplier.code} · ${supplier.name}`;
-  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${field("Category", "category", "text", { required: true, value: supplier.category })}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
+  $("#modalBody").innerHTML = `<form id="supplierEditForm" class="form-grid">${field("Supplier name", "name", "text", { required: true, value: supplier.name })}${categoryField(supplier.category)}${field("Country", "country", "text", { required: true, value: supplier.country || "" })}${field("Contact person", "contact_name", "text", { value: supplier.contact_name || "" })}${field("Email", "email", "email", { value: supplier.email || "" })}${field("Phone", "phone", "text", { value: supplier.phone || "" })}<label class="field"><span>Approval</span><select class="form-control" name="status">${["Pending review", "Approved", "On hold"].map((status) => `<option ${status === supplier.status ? "selected" : ""}>${status}</option>`).join("")}</select></label><div class="modal-footer field full"><button class="button button-primary">Save supplier</button></div></form>`;
   modalLayer.hidden = false;
+  bindCategoryField($("#supplierEditForm"));
   $("#supplierEditForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const values = takeCategory(Object.fromEntries(new FormData(event.currentTarget).entries()));
     try {
       await api(`/api/suppliers/${supplier.id}`, { method: "PATCH", body: JSON.stringify(values) });
+      await reloadCategories();
       modalLayer.hidden = true;
       toast("Supplier saved");
       renderSupplierControl();
@@ -2107,7 +2169,7 @@ function openModal(type, record = {}) {
     form = `<form id="modalForm" class="form-grid"><label class="field full"><span>Parent part</span><select class="form-control" name="parent_item_id" required ${record.parent_item_id ? "disabled" : ""}>${parents}</select>${record.parent_item_id ? `<input type="hidden" name="parent_item_id" value="${record.parent_item_id}" />` : ""}</label><label class="field full"><span>Search Material Master by code or name</span><input class="form-control" id="modalMaterialSearch" type="search" placeholder="Type a material code or name" /></label><label class="field"><span>Part code from Material Master</span><select class="form-control" name="child_item_id" id="modalMaterialSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.code)}</option>`).join("")}</select></label><label class="field"><span>Part name from Material Master</span><select class="form-control" id="modalMaterialNameSelect" required>${state.materials.map((item) => `<option value="${item.id}" data-code="${esc(item.code)}" data-name="${esc(item.name)}" data-uom="${esc(item.uom)}" ${String(item.id) === String(record.material_id) ? "selected" : ""}>${esc(item.name)}</option>`).join("")}</select></label><label class="field"><span>Unit from Material Master</span><input class="form-control" id="modalMaterialUnit" value="${esc(selectedMaterial?.uom || "")}" readonly /></label>${field("Quantity per parent", "quantity", "number", { required: true, min: -1000000000, max: 1000000000, step: "any", value: record.quantity ?? 1 })}<div class="score-explainer field full">${parent ? `Adding parts to ${esc(parent.code)} · ${esc(parent.name)}. Choose each purchased or in-house-made child part from Material Master; repeat at the next level for further operations.` : "Choose the child part from Material Master. Repeat at the next level for further in-house operations."} Use a negative quantity for scrap or a by-product. Quantity cannot be zero.</div><div class="modal-footer field full"><button class="button button-primary">Save BOM line</button></div></form>`;
   } else if (type === "supplier") {
     title = "Add supplier";
-    form = `<form id="modalForm" class="form-grid">${field("Supplier name", "name", "text", { required: true })}${field("Category", "category", "text", { required: true })}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
+    form = `<form id="modalForm" class="form-grid">${field("Supplier name", "name", "text", { required: true })}${categoryField("")}${field("Country", "country", "text", { required: true })}${field("Contact person", "contact_name")}${field("Email", "email", "email")}${field("Phone", "phone")}<div class="modal-footer field full"><button class="button button-primary">Add supplier</button></div></form>`;
   }
   // Alternate code SOB on this BOM line: shown here, changed only in Alternate codes → Manage SOB
   const lineAlternates = (type === "bom" || type === "component") && (record.root_bom_id || record.component_id) ? record.alternates || [] : [];
@@ -2125,18 +2187,7 @@ function openModal(type, record = {}) {
       holder.innerHTML = history.length ? `<table class="sob-history"><thead><tr><th>From</th>${lineAlternates.map((alt) => `<th>${esc(alt.code)}</th>`).join("")}<th>Main</th></tr></thead><tbody>${history.map((change) => `<tr><td>${change.from_month ? esc(monthLabel(change.from_month)) : "Start"}</td>${lineAlternates.map((alt) => `<td>${number(change.alternates.find((a) => a.alternate_item_id === alt.id)?.sob_percent || 0, 2)}%</td>`).join("")}<td>${number(change.main_sob_percent, 2)}%</td></tr>`).join("")}</tbody></table>` : '<span class="subtle">No SOB set on this line yet (main code 100%).</span>';
     }).catch((error) => { const holder = $("#lineSobHistory"); if (holder) holder.textContent = error.message; });
   }
-  if (type === "material") {
-    const choice = $("#categorySelect");
-    const fresh = $("#categoryNew");
-    const sync = () => {
-      const adding = choice.value === "__new__";
-      fresh.hidden = !adding;
-      fresh.required = adding;
-      if (adding) fresh.focus();
-    };
-    choice.addEventListener("change", sync);
-    sync();
-  }
+  bindCategoryField($("#modalBody"));
   if (type === "component") bindMaterialSearch("modalMaterialSearch", "modalMaterialSelect", "modalMaterialNameSelect");
   if (type === "bom" && !record.root_bom_id) bindMaterialSearch("modalMaterialSearch", "modalMaterialSelect", "modalMaterialName");
   if (type === "bom") {
@@ -2185,11 +2236,7 @@ function openModal(type, record = {}) {
         result = await api(record.id ? `/api/planning/models/${record.id}` : "/api/planning/models", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
       if (type === "material") {
-        values.category = values.category_choice === "__new__" ? (values.category_new || "").trim() : values.category_choice;
-        const known = state.materialCategories.find((name) => name.toLowerCase() === values.category.toLowerCase());
-        if (known) values.category = known;
-        delete values.category_choice;
-        delete values.category_new;
+        takeCategory(values);
         for (const key of ["stock_on_hand", "buffer_days", "unit_cost"]) values[key] = Number(values[key] || 0);
         result = await api(record.id ? `/api/planning/materials/${record.id}` : "/api/planning/materials", { method: record.id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
@@ -2208,7 +2255,8 @@ function openModal(type, record = {}) {
         const path = `/api/items/${values.parent_item_id}/bom${record.component_id ? `/${record.component_id}` : ""}`;
         result = await api(path, { method: record.component_id ? "PATCH" : "POST", body: JSON.stringify(values) });
       }
-      if (type === "supplier") result = await api("/api/suppliers", { method: "POST", body: JSON.stringify(values) });
+      if (type === "supplier") result = await api("/api/suppliers", { method: "POST", body: JSON.stringify(takeCategory(values)) });
+      if (type === "supplier" || type === "material") await reloadCategories();
       if (type === "product" || type === "model" || type === "material" || type === "bom" || type === "component") await loadCoreData();
       modalLayer.hidden = true;
       toast(`${title} saved`);
@@ -2352,6 +2400,33 @@ document.addEventListener("click", async (event) => {
   if (altDelete) {
     if (!window.confirm("Delete this alternate code? Its SOB on every BOM line goes back to the main code.")) return;
     try { await api(`/api/planning/alternate-codes/${altDelete.dataset.altDelete}`, { method: "DELETE" }); toast("Alternate code deleted"); return loadAlternateCodes(0); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const categoryRename = event.target.closest("[data-category-rename]");
+  if (categoryRename) {
+    const category = (state.categoryItems || []).find((c) => String(c.id) === categoryRename.dataset.categoryRename);
+    const name = window.prompt(`Rename "${category.name}" to (every part and supplier using it follows):`, category.name);
+    if (!name || name.trim() === category.name) return;
+    try { const result = await api(`/api/planning/categories/${category.id}`, { method: "PATCH", body: JSON.stringify({ name }) }); toast(`Renamed to ${result.name} (${result.records} record${result.records === 1 ? "" : "s"} updated)`); await reloadCategories(); return loadCategoryTab(); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const categoryDelete = event.target.closest("[data-category-delete]");
+  if (categoryDelete) {
+    if (!window.confirm("Delete this category from the list?")) return;
+    try { await api(`/api/planning/categories/${categoryDelete.dataset.categoryDelete}`, { method: "DELETE" }); toast("Category deleted"); await reloadCategories(); return loadCategoryTab(); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const categoryReplace = event.target.closest("[data-category-replace]");
+  if (categoryReplace) {
+    const row = categoryReplace.closest("tr");
+    const target = row.querySelector("[data-replace-with]").value;
+    if (!target) return toast("Choose the category to replace it with.", true);
+    try { const result = await api("/api/planning/categories/replace", { method: "POST", body: JSON.stringify({ old: row.dataset.unlisted, new: target }) }); toast(`${result.old} replaced by ${result.new} (${result.records} record${result.records === 1 ? "" : "s"})`); await reloadCategories(); return loadCategoryTab(); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const categoryAdopt = event.target.closest("[data-category-adopt]");
+  if (categoryAdopt) {
+    try { const saved = await api("/api/planning/categories", { method: "POST", body: JSON.stringify({ name: categoryAdopt.closest("tr").dataset.unlisted }) }); toast(`${saved.name} added to your list`); await reloadCategories(); return loadCategoryTab(); }
     catch (error) { toast(error.message, true); return; }
   }
   const altManage = event.target.closest("[data-alt-manage]");

@@ -179,6 +179,54 @@ class Delivery(Base):
     note: Mapped[str] = mapped_column(Text, default="")
 
 
+class Category(Base):
+    """The one list of part / supplier categories used in every dropdown."""
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+
+
+# The user's category list (set up once), and old names replaced when it is set up.
+DEFAULT_CATEGORIES = [
+    "Raw material", "Finished assembly", "Electrical components", "Electronic PCB Assy", "Sheet Metal",
+    "Wire Harness", "Plastic Raw material", "Steel Raw material", "Electronic Child Part", "Casting",
+    "Machining", "Packing Material", "Fasteners", "Subassembly",
+]
+CATEGORY_REPLACEMENTS = {"CNC machining": "Machining", "Metal fabrication": "Sheet Metal", "Plastics": "Plastic Raw material"}
+CATEGORY_TABLES = ("items", "suppliers", "tier_materials")
+
+
+def _ensure_category(db: Session, name: str | None) -> str:
+    """Category as written in the list (case-insensitive match); a new name is added to the list."""
+    text_value = " ".join((name or "").split())
+    if not text_value:
+        raise HTTPException(status_code=422, detail="Category is required")
+    if len(text_value) > 80:
+        raise HTTPException(status_code=422, detail="Category can have at most 80 characters")
+    existing = db.scalar(select(Category).where(func.lower(Category.name) == text_value.lower()))
+    if existing:
+        return existing.name
+    db.add(Category(name=text_value))
+    db.flush()
+    return text_value
+
+
+def _setup_categories(db: Session) -> None:
+    """First start with the category list: add the user's list, replace the old names agreed with
+    the user, and write existing values with the list's spelling. Runs once (list empty)."""
+    if db.scalar(select(func.count(Category.id))):
+        return
+    db.add_all(Category(name=name) for name in DEFAULT_CATEGORIES)
+    db.flush()
+    spelling = {name.lower(): name for name in DEFAULT_CATEGORIES}
+    spelling.update({old.lower(): new for old, new in CATEGORY_REPLACEMENTS.items()})
+    for table in CATEGORY_TABLES:
+        for old_lower, new in spelling.items():
+            db.execute(text(f"UPDATE {table} SET category = :new WHERE lower(trim(category)) = :old"), {"new": new, "old": old_lower})
+    db.commit()
+
+
 class Activity(Base):
     __tablename__ = "activities"
 
@@ -452,6 +500,7 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
     async def lifespan(_: FastAPI):
         with SessionLocal() as db:
             _seed(db)
+            _setup_categories(db)
         yield
         engine.dispose()
 
@@ -524,11 +573,15 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
 
     @app.post("/api/suppliers", status_code=201)
     def create_supplier(payload: SupplierCreate, db: Session = Depends(get_db)):
+        # next free code (suppliers can be deleted, so the count is not enough)
+        used_codes = set(db.scalars(select(Supplier.code)).all())
         sequence = int(db.scalar(select(func.count(Supplier.id))) or 0) + 1001
+        while f"SUP-{sequence:04d}" in used_codes:
+            sequence += 1
         supplier = Supplier(
             code=f"SUP-{sequence:04d}",
             name=payload.name.strip(),
-            category=payload.category.strip(),
+            category=_ensure_category(db, payload.category),
             country=payload.country.strip(),
             contact_name=payload.contact_name.strip(),
             email=payload.email.strip(),
@@ -549,6 +602,8 @@ def create_app(database_url: str = DATABASE_URL) -> FastAPI:
             raise HTTPException(status_code=404, detail="Supplier not found")
         for key, value in payload.model_dump(exclude_unset=True).items():
             if value is not None:
+                if key == "category":
+                    value = _ensure_category(db, value)
                 setattr(supplier, key, value.strip() if isinstance(value, str) else value)
         _record_activity(db, f"{supplier.name} supplier profile updated")
         db.commit()

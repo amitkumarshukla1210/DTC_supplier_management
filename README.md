@@ -42,6 +42,12 @@ Planning workbooks can be downloaded from the relevant page. API documentation i
 - **T2 / T3 Material Master** tabs: codes used further down the supply chain (by your suppliers' suppliers): code, name, category, unit, reference price. Form, edit/delete, search, Excel upload/download.
 - A code can be in only one of T1, T2 or T3 (checked on every save and upload, case-insensitive).
 
+## Category list
+
+**Product Master → Category** holds the one category list used for parts (T1, T2, T3) and suppliers; every category field is a dropdown from it with **+ Add new category**. Add, rename (every part and supplier using it follows) or delete (refused while used). A new category typed in a dropdown or found in an Excel upload is added to the list automatically, written as in the list when only the capitals differ ("steel raw MATERIAL" → "Steel Raw material").
+
+Starting list: Raw material, Finished assembly, Electrical components, Electronic PCB Assy, Sheet Metal, Wire Harness, Plastic Raw material, Steel Raw material, Electronic Child Part, Casting, Machining, Packing Material, Fasteners, Subassembly. When the list is first set up, old names are replaced once: CNC machining → Machining, Metal fabrication → Sheet Metal, Plastics → Plastic Raw material. Any other category still used by records but not in the list is shown under the table, to **Replace** with a listed category or **Add to my list**.
+
 ## Alternate codes
 
 **Product Master → Alternate codes** lists which code is an alternate of which (e.g. `FL101STEEL0.8` for `FL001STEEL0.8`): no SOB there. Excel upload accepts your own headings (Main code / Part code, Alternate code); all rows or none.
