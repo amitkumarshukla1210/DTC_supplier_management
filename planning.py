@@ -353,6 +353,13 @@ class SupplierBOMLineSource(Base):
     unit_price: Mapped[float] = mapped_column(Float, default=0)
     currency: Mapped[str] = mapped_column(String(3), default="INR")
     sob_percent: Mapped[float] = mapped_column(Float, default=100)
+    # the T2 supplier's own terms for this material (Supplier/material coverage page)
+    lead_time_days: Mapped[int] = mapped_column(Integer, default=0)
+    moq: Mapped[float] = mapped_column(Float, default=0)
+    buffer_days: Mapped[int] = mapped_column(Integer, default=0)
+    price_mode: Mapped[str] = mapped_column(String(24), default="spot")
+    price_interval_months: Mapped[int] = mapped_column(Integer, default=1)
+    price_updated_month: Mapped[str] = mapped_column(String(7), default=lambda: _month_text(date.today()))
 
 
 class AlternateCode(Base):
@@ -543,6 +550,22 @@ class SupplierBOMSourceInput(BaseModel):
     unit_price: float = Field(default=0, ge=0, allow_inf_nan=False)
     currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
     sob_percent: float = Field(gt=0, le=100, allow_inf_nan=False)
+    lead_time_days: int = Field(default=0, ge=0, le=5000)
+    moq: float = Field(default=0, ge=0, allow_inf_nan=False)
+    buffer_days: int = Field(default=0, ge=0, le=5000)
+    price_mode: str = Field(default="spot", pattern=r"^(spot|fixed_monthly|every_n_months)$")
+    price_interval_months: int = Field(default=1, ge=1, le=120)
+
+
+class CoverageLineInput(BaseModel):
+    """A material line of the part BOM on the coverage page: any T1 / T2 / T3 Material Master code
+    or a code of the supplier's own material master; it joins the supplier's material master."""
+    link_id: int
+    parent_line_id: int | None = None  # an L2 line goes under an L1 line (e.g. iron ore under steel)
+    item_id: int | None = None
+    tier_material_id: int | None = None
+    supplier_material_id: int | None = None
+    quantity: float = Field(gt=0, le=1_000_000_000, allow_inf_nan=False)
 
 
 class NewPartBOMLine(BaseModel):
@@ -1553,6 +1576,13 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             if column not in present:
                 db.execute(sa_text(f"ALTER TABLE supplier_materials ADD COLUMN {column} {definition}"))
         upgrade_supplier_parts(db)
+        # supplier BOM sources (T2 suppliers of a material line) gained their own terms
+        present = {column["name"] for column in sa_inspect(db.get_bind()).get_columns("supplier_bom_line_sources")}
+        for column, definition in (("lead_time_days", "INTEGER NOT NULL DEFAULT 0"), ("moq", "FLOAT NOT NULL DEFAULT 0"), ("buffer_days", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("price_mode", "VARCHAR(24) NOT NULL DEFAULT 'spot'"), ("price_interval_months", "INTEGER NOT NULL DEFAULT 1"),
+                                   ("price_updated_month", f"VARCHAR(7) NOT NULL DEFAULT '{_month_text(date.today())}'")):
+            if column not in present:
+                db.execute(sa_text(f"ALTER TABLE supplier_bom_line_sources ADD COLUMN {column} {definition}"))
         # bom_line_alternates gained from_month (SOB history); earlier SOB applies from the start
         if "from_month" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("bom_line_alternates")}:
             db.execute(sa_text("ALTER TABLE bom_line_alternates ADD COLUMN from_month VARCHAR(7) NOT NULL DEFAULT ''"))
@@ -2793,7 +2823,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return {"model_id": model_id, "model_code": model.code, "tab": tab, "rows": len(parsed)}
 
     @app.get("/api/planning/supplier-parts")
-    def list_supplier_parts(request: Request, material_id: int | None = None, offset: int = 0, limit: int = 500, search: str = "", supplier_id: int | None = None):
+    def list_supplier_parts(request: Request, material_id: int | None = None, offset: int = 0, limit: int = 500, search: str = "", supplier_id: int | None = None, tier: str = ""):
         current_user(request)
         _check_supply_role(request)
         if limit < 1 or limit > 1000 or offset < 0:
@@ -2806,6 +2836,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 statement = statement.where(SupplierPart.material_id == material_id)
             if supplier_id:
                 statement = statement.where(SupplierPart.supplier_id == supplier_id)
+            if tier:
+                statement = statement.where(SupplierPart.tier == _normalize_tier(tier))
             if search.strip():
                 like = f"%{search.strip()}%"
                 statement = statement.where(or_(
@@ -4223,10 +4255,20 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                    "entered_price": line.unit_price, "entered_currency": line.currency,
                    "sources": [{"id": src.id, "sub_supplier_id": src.sub_supplier_id, "sub_supplier": subs[src.sub_supplier_id].name if src.sub_supplier_id in subs else "",
                                 "alternate": (lambda c: None if not (src.item_id or src.supplier_material_id) else {key: c[key] for key in ("kind", "id", "code", "name")})(describe(src.item_id, src.supplier_material_id)),
-                                "unit_price": src.unit_price, "currency": src.currency, "sob_percent": src.sob_percent} for src in sources.get(line.id, [])]}
+                                "unit_price": src.unit_price, "currency": src.currency, "sob_percent": src.sob_percent,
+                                "sub_supplier_code": subs[src.sub_supplier_id].code if src.sub_supplier_id in subs else "",
+                                "lead_time_days": src.lead_time_days, "moq": src.moq, "buffer_days": src.buffer_days, "price_mode": src.price_mode,
+                                "price_interval_months": src.price_interval_months, "price_status": _price_status(src, _month_text(date.today()))} for src in sources.get(line.id, [])]}
             rows.append(row)
             kids = children.get(line.id, [])
-            if kids:
+            if sources.get(line.id) and len({src.currency for src in sources[line.id]}) == 1:
+                for kid in kids:  # its BOM (e.g. steel from ore + coal) is listed; the price is what its suppliers charge
+                    unit_cost(kid, depth + 1)
+                group = sources[line.id]
+                share = sum(src.sob_percent for src in group)
+                price = sum(src.unit_price * src.sob_percent for src in group) / share
+                currency, source = group[0].currency, f"SOB-weighted ({len(group)} source{'s' if len(group) > 1 else ''})"
+            elif kids:
                 total, skipped = 0.0, []
                 for kid in kids:
                     cost, currency, _, _ = unit_cost(kid, depth + 1)
@@ -4389,18 +4431,98 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             line = db.get(SupplierBOMLine, line_id)
             if not line:
                 raise HTTPException(status_code=404, detail="Supplier BOM line not found")
-            if db.scalar(select(SupplierBOMLine.id).where(SupplierBOMLine.parent_line_id == line_id).limit(1)):
-                raise HTTPException(status_code=422, detail="This line has lines below it; its price is their sum, so it takes no sources")
             for number, src in enumerate(payload, start=1):
                 if src.sub_supplier_id is not None and not db.get(Supplier, src.sub_supplier_id):
                     raise HTTPException(status_code=422, detail=f"Source {number}: sub-supplier not found in the Supplier register")
                 if src.item_id or src.supplier_material_id:
                     check_component(db, line.supplier_id, src.item_id, src.supplier_material_id, f"Source {number} alternate")
+            before = {(old.sub_supplier_id, old.unit_price, old.price_mode): old.price_updated_month
+                      for old in db.scalars(select(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id == line_id)).all()}
             db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id == line_id))
             for src in payload:
-                db.add(SupplierBOMLineSource(line_id=line_id, **src.model_dump()))
+                kept = before.get((src.sub_supplier_id, src.unit_price, src.price_mode))  # price unchanged: keep its month
+                db.add(SupplierBOMLineSource(line_id=line_id, **src.model_dump(), **({"price_updated_month": kept} if kept else {})))
             db.commit()
             return {"line_id": line_id, "sources": len(payload)}
+
+    def coverage_link(db: Session, link_id: int) -> SupplierPart:
+        link = db.get(SupplierPart, link_id)
+        if not link or link.tier != TOP_TIER or not link.material_id:
+            raise HTTPException(status_code=404, detail="T1 supplier/material relationship not found")
+        return link
+
+    @app.get("/api/planning/supplier-coverage/{link_id}")
+    def supplier_coverage(link_id: int, request: Request):
+        """Coverage page of one T1 relationship (e.g. Savera -> Base Front Beam): the T1 row and the
+        supplier's part BOM (L1 material lines, quantity per piece) with the T2 suppliers of each line."""
+        current_user(request)
+        _check_supply_role(request)
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            link = coverage_link(db, link_id)
+            t1 = chain_link_json(db, link, can_price, {})
+            item = db.get(Item, link.material_id)
+            t1["uom"] = item.uom if item else ""
+            bom = supplier_bom_view(db, link.supplier_id, link.material_id, can_price)
+            lines = bom["lines"]  # L1 materials, their L2 BOM and L3 BOM, each with its suppliers
+            return {"t1": t1, "lines": lines}
+
+    @app.post("/api/planning/supplier-coverage/lines", status_code=201)
+    def add_coverage_line(payload: CoverageLineInput, request: Request):
+        """Add a material line (e.g. FL001STEEL0.7, 2 kg per beam). A T1/T2/T3 Material Master code joins
+        the supplier's material master. T2 suppliers saved earlier for this part and material become its sources."""
+        current_user(request)
+        _check_supply_role(request)
+        if sum(1 for value in (payload.item_id, payload.tier_material_id, payload.supplier_material_id) if value) != 1:
+            raise HTTPException(status_code=422, detail="Pick one material code")
+        with open_db() as db:
+            link = coverage_link(db, payload.link_id)
+            supplier_id = link.supplier_id
+            if payload.supplier_material_id:
+                own = db.get(SupplierMaterial, payload.supplier_material_id)
+                if not own or own.supplier_id != supplier_id:
+                    raise HTTPException(status_code=422, detail="Material is not in this supplier's material master")
+            else:
+                column = SupplierMaterial.item_id if payload.item_id else SupplierMaterial.tier_material_id
+                code_id = payload.item_id or payload.tier_material_id
+                own = db.scalar(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id, column == code_id))
+                if not own:
+                    master = db.get(Item, code_id) if payload.item_id else db.get(TierMaterial, code_id)
+                    if not master:
+                        raise HTTPException(status_code=404, detail="Material code not found")
+                    if db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.supplier_id == supplier_id, func.lower(SupplierMaterial.code) == master.code.lower())):
+                        raise HTTPException(status_code=409, detail=f"{master.code} is already a code of the supplier's own material master")
+                    own = SupplierMaterial(supplier_id=supplier_id, code=master.code, name=master.name, uom=master.uom or "ea",
+                                           unit_price=getattr(master, "unit_cost", 0) or 0, currency=getattr(master, "currency", None) or "INR",
+                                           item_id=payload.item_id, tier_material_id=payload.tier_material_id)
+                    db.add(own)
+                    db.flush()
+            if payload.parent_line_id is not None:
+                parent = db.get(SupplierBOMLine, payload.parent_line_id)
+                if not parent or parent.supplier_id != supplier_id or parent.product_material_id != link.material_id:
+                    raise HTTPException(status_code=404, detail="Parent line not found in this part BOM")
+                if line_depth(db, parent) >= 3:
+                    raise HTTPException(status_code=422, detail="Lines go down to L3 (L1 material, its L2 BOM, their L3 BOM)")
+            same_place = SupplierBOMLine.parent_line_id == payload.parent_line_id if payload.parent_line_id else SupplierBOMLine.parent_line_id.is_(None)
+            if db.scalar(select(SupplierBOMLine.id).where(SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLine.product_material_id == link.material_id,
+                                                          same_place, SupplierBOMLine.supplier_material_id == own.id)):
+                raise HTTPException(status_code=409, detail=f"{own.code} is already a line {'under that line' if payload.parent_line_id else 'of this part BOM'}; change its quantity with Edit")
+            line = SupplierBOMLine(supplier_id=supplier_id, product_material_id=link.material_id, supplier_material_id=own.id, quantity=payload.quantity,
+                                   parent_line_id=payload.parent_line_id)
+            db.add(line)
+            db.flush()
+            # T2 relationships saved earlier under this T1 part for the same material -> sources of the line
+            earlier = [] if payload.parent_line_id else db.scalars(select(SupplierPart).where(SupplierPart.parent_link_id == link.id, SupplierPart.tier == "T2",
+                                                            (SupplierPart.material_id == own.item_id) if own.item_id else (SupplierPart.tier_material_id == own.tier_material_id))).all() if (own.item_id or own.tier_material_id) else []
+            copied = 0
+            for t2 in earlier:
+                if t2.sob_percent > 0:
+                    db.add(SupplierBOMLineSource(line_id=line.id, sub_supplier_id=t2.supplier_id, unit_price=t2.unit_price, currency=t2.currency,
+                                                 sob_percent=t2.sob_percent, lead_time_days=t2.lead_time_days, moq=t2.moq, buffer_days=t2.buffer_days,
+                                                 price_mode=t2.price_mode, price_interval_months=t2.price_interval_months, price_updated_month=t2.price_updated_month))
+                    copied += 1
+            db.commit()
+            return {"id": line.id, "code": own.code, "sources_copied": copied}
 
     @app.post("/api/planning/supplier-bom/upload", status_code=201)
     async def upload_supplier_bom(request: Request, supplier_id: int, material_id: int):

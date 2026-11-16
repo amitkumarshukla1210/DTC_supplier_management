@@ -1116,7 +1116,8 @@ class SupplierHubApiTests(unittest.TestCase):
             {"sub_supplier_id": sub_a, "unit_price": 480, "currency": "INR", "sob_percent": 60},
             {"sub_supplier_id": sub_b, "supplier_material_id": chip_neo_own, "unit_price": 520, "currency": "INR", "sob_percent": 50}]).status_code, 422, "SOB > 100")
         self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_icset}/sources", json=[
-            {"sub_supplier_id": sub_a, "unit_price": 1, "currency": "INR", "sob_percent": 100}]).status_code, 422, "parent line takes no sources")
+            {"sub_supplier_id": sub_a, "unit_price": 1, "currency": "INR", "sob_percent": 100}]).status_code, 200, "a line with lines below can have its suppliers too")
+        self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_icset}/sources", json=[]).status_code, 200)  # back to the sum of its lines
         self.assertEqual(put(f"/api/planning/supplier-bom/lines/{l_chip}/sources", json=[
             {"sub_supplier_id": sub_a, "unit_price": 480, "currency": "INR", "sob_percent": 60},
             {"sub_supplier_id": sub_b, "supplier_material_id": chip_neo_own, "unit_price": 520, "currency": "INR", "sob_percent": 40}]).status_code, 200)
@@ -2067,6 +2068,87 @@ class SupplierHubApiTests(unittest.TestCase):
         connection.close()
         self.assertEqual(api.delete(f"/api/planning/materials/{mat101}").status_code, 204)
         self.assertEqual(sqlite3.connect(Path(self.temp_dir.name) / "test.db").execute("SELECT COUNT(*) FROM material_requests WHERE item_id = ?", (mat101,)).fetchone()[0], 0)
+
+    def test_supplier_coverage_part_bom_with_t2_suppliers(self):
+        # The user's example: Savera supplies Base Front Beam (T1, 60%); 1 beam needs 2 kg steel
+        # FL001STEEL0.7 (a T2 Material Master code) bought from JGI 30% and TATA 70%.
+        api = self.client
+        beam = api.post("/api/planning/materials", json={"code": "CV-BEAM", "name": "Base Front Beam", "uom": "Nos"}).json()["id"]
+        paint = api.post("/api/planning/materials", json={"code": "CV-PAINT", "name": "Paint", "uom": "L", "unit_cost": 300, "currency": "INR"}).json()["id"]
+        steel = api.post("/api/planning/tier-materials", json={"tier": "T2", "code": "CV-STEEL0.7", "name": "STEEL0.7", "uom": "kg"}).json()["id"]
+        sup = lambda name: api.post("/api/suppliers", json={"name": name, "category": "Sheet Metal", "country": "India"}).json()["id"]
+        savera, jgi, tata = sup("CV Savera"), sup("CV JGI Steel"), sup("CV TATA Steel")
+        link = api.post("/api/planning/supplier-parts", json={"material_id": beam, "supplier_id": savera, "sob_percent": 60, "lead_time_days": 15, "unit_price": 85, "currency": "INR"}).json()["id"]
+        # T2 relationships typed earlier under this T1 part: they become the line's sources
+        for who, sob in ((jgi, 30), (tata, 70)):
+            made = api.post("/api/planning/supplier-parts", json={"tier_material_id": steel, "supplier_id": who, "tier": "T2", "parent_link_id": link, "parent_supplier_id": savera, "sob_percent": sob, "lead_time_days": 10, "moq": 5000, "unit_price": 75, "currency": "INR"})
+            self.assertEqual(made.status_code, 201, made.text)
+        t1_only = api.get("/api/planning/supplier-parts", params={"supplier_id": savera, "tier": "T1"}).json()["items"]
+        self.assertEqual([(r["material_code"], r["tier"]) for r in t1_only], [("CV-BEAM", "T1")])
+        added = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2})
+        self.assertEqual(added.status_code, 201, added.text)
+        self.assertEqual((added.json()["code"], added.json()["sources_copied"]), ("CV-STEEL0.7", 2))
+        self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 3}).status_code, 409)  # one line per code
+        self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "item_id": paint, "quantity": 0.1}).status_code, 201)  # a T1 code, other unit
+        view = api.get(f"/api/planning/supplier-coverage/{link}").json()
+        self.assertEqual((view["t1"]["supplier_name"], view["t1"]["material_code"], view["t1"]["sob_percent"], view["t1"]["uom"]), ("CV Savera", "CV-BEAM", 60, "Nos"))
+        lines = {line["component"]["code"]: line for line in view["lines"]}
+        self.assertEqual((lines["CV-STEEL0.7"]["quantity"], lines["CV-STEEL0.7"]["component"]["uom"], lines["CV-STEEL0.7"]["component"]["origin"]), (2, "kg", "T2"))
+        self.assertEqual((lines["CV-PAINT"]["quantity"], lines["CV-PAINT"]["component"]["uom"], lines["CV-PAINT"]["sources"]), (0.1, "L", []))
+        got = sorted((src["sub_supplier"], src["sob_percent"], src["lead_time_days"], src["moq"]) for src in lines["CV-STEEL0.7"]["sources"])
+        self.assertEqual(got, [("CV JGI Steel", 30, 10, 5000), ("CV TATA Steel", 70, 10, 5000)])
+        # the joined code is now in Savera's material master, linked to the T2 master
+        own = [m for m in api.get("/api/planning/supplier-materials", params={"supplier_id": savera}).json()["items"] if m["code"] == "CV-STEEL0.7"]
+        self.assertEqual(len(own), 1)
+        # edit the T2 suppliers of the line with their own terms
+        line_id = lines["CV-STEEL0.7"]["id"]
+        put = api.put(f"/api/planning/supplier-bom/lines/{line_id}/sources", json=[
+            {"sub_supplier_id": jgi, "sob_percent": 40, "lead_time_days": 12, "moq": 1000, "buffer_days": 7, "price_mode": "fixed_monthly", "unit_price": 74, "currency": "INR"},
+            {"sub_supplier_id": tata, "sob_percent": 60, "lead_time_days": 20, "unit_price": 72, "currency": "INR"}])
+        self.assertEqual(put.status_code, 200, put.text)
+        src = {s["sub_supplier"]: s for s in next(l for l in api.get(f"/api/planning/supplier-coverage/{link}").json()["lines"] if l["id"] == line_id)["sources"]}
+        self.assertEqual((src["CV JGI Steel"]["sob_percent"], src["CV JGI Steel"]["buffer_days"], src["CV JGI Steel"]["price_mode"], src["CV JGI Steel"]["price_status"], src["CV TATA Steel"]["lead_time_days"]), (40, 7, "fixed_monthly", "Current", 20))
+        # price status: JGI's monthly price last updated 2 months ago is due; saving it again unchanged keeps
+        # that month (still due); a new price is from this month (current)
+        import sqlite3
+        db_file = Path(self.temp_dir.name) / "test.db"
+        connection = sqlite3.connect(db_file)
+        connection.execute("UPDATE supplier_bom_line_sources SET price_updated_month = '2000-01' WHERE line_id = ? AND sub_supplier_id = ?", (line_id, jgi))
+        connection.commit()
+        connection.close()
+        status = lambda: {s["sub_supplier"]: s["price_status"] for s in next(l for l in api.get(f"/api/planning/supplier-coverage/{link}").json()["lines"] if l["id"] == line_id)["sources"]}
+        self.assertEqual(status(), {"CV JGI Steel": "Update due", "CV TATA Steel": "Spot"})
+        same = [{"sub_supplier_id": jgi, "sob_percent": 40, "price_mode": "fixed_monthly", "unit_price": 74, "currency": "INR"}, {"sub_supplier_id": tata, "sob_percent": 60, "unit_price": 72, "currency": "INR"}]
+        self.assertEqual(api.put(f"/api/planning/supplier-bom/lines/{line_id}/sources", json=same).status_code, 200)
+        self.assertEqual(status()["CV JGI Steel"], "Update due")
+        same[0]["unit_price"] = 76
+        self.assertEqual(api.put(f"/api/planning/supplier-bom/lines/{line_id}/sources", json=same).status_code, 200)
+        self.assertEqual(status()["CV JGI Steel"], "Current")
+        over = api.put(f"/api/planning/supplier-bom/lines/{line_id}/sources", json=[{"sub_supplier_id": jgi, "sob_percent": 60}, {"sub_supplier_id": tata, "sob_percent": 60}])
+        self.assertEqual(over.status_code, 422)
+        self.assertEqual(api.get("/api/planning/supplier-coverage/999999").status_code, 404)
+        # L2: steel has its own BOM (per 1 kg steel: 1.7 kg iron ore from XYZ, 0.6 kg coal from ABC)
+        ore = api.post("/api/planning/tier-materials", json={"tier": "T3", "code": "CV-ORE", "name": "Iron ore", "uom": "kg"}).json()["id"]
+        coal = api.post("/api/planning/tier-materials", json={"tier": "T3", "code": "CV-COAL", "name": "Coal", "uom": "kg"}).json()["id"]
+        xyz, abc = sup("CV XYZ Mining"), sup("CV ABC Coal")
+        ore_line = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": line_id, "tier_material_id": ore, "quantity": 1.7})
+        self.assertEqual(ore_line.status_code, 201, ore_line.text)
+        self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": line_id, "tier_material_id": coal, "quantity": 0.6}).status_code, 201)
+        self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": line_id, "tier_material_id": ore, "quantity": 2}).status_code, 409)
+        l3 = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": ore_line.json()["id"], "tier_material_id": coal, "quantity": 0.05})  # L3 is allowed
+        self.assertEqual(l3.status_code, 201, l3.text)
+        self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": l3.json()["id"], "tier_material_id": ore, "quantity": 1}).status_code, 422)  # no L4
+        api.delete(f"/api/planning/supplier-bom/lines/{l3.json()['id']}")
+        # the steel line keeps its T2 suppliers while it has lines below
+        self.assertEqual(api.put(f"/api/planning/supplier-bom/lines/{ore_line.json()['id']}/sources", json=[{"sub_supplier_id": xyz, "sob_percent": 100, "unit_price": 9, "currency": "INR"}]).status_code, 200)
+        self.assertEqual(api.put(f"/api/planning/supplier-bom/lines/{line_id}/sources", json=[{"sub_supplier_id": jgi, "sob_percent": 30, "unit_price": 74, "currency": "INR"}, {"sub_supplier_id": tata, "sob_percent": 70, "unit_price": 72, "currency": "INR"}]).status_code, 200)
+        view = api.get(f"/api/planning/supplier-coverage/{link}").json()
+        by_code = {line["component"]["code"]: line for line in view["lines"]}
+        self.assertEqual((by_code["CV-ORE"]["depth"], by_code["CV-ORE"]["parent_line_id"], by_code["CV-ORE"]["quantity"], by_code["CV-COAL"]["quantity"]), (2, line_id, 1.7, 0.6))
+        self.assertEqual([src["sub_supplier"] for src in by_code["CV-ORE"]["sources"]], ["CV XYZ Mining"])
+        self.assertEqual(len(by_code["CV-STEEL0.7"]["sources"]), 2)
+        # steel is priced at what JGI / TATA charge (30% x 74 + 70% x 72 = 72.6), not from ore + coal
+        self.assertAlmostEqual(by_code["CV-STEEL0.7"]["unit_price"], 72.6)
 
     def test_supply_chain_rows_from_users_sheet(self):
         # The user's sheet: Supangita 40% / Savera 60% supply Base Front Beam; each buys steel

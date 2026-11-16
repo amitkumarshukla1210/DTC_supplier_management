@@ -553,3 +553,26 @@ tr.group-head th:first-child { border-left: 0; }
 #supplierPartTable tr[data-tree-depth="3"] > .tree-toggle-cell { padding-left: 56px; }
 #supplierPartTable tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
 #supplierPartTable td.sob-off { color: #b42318; }
+
+/* clickable cells (register -> relationship -> coverage) */
+td.cell-link { color: #1f6fb2; cursor: pointer; text-decoration: underline; text-decoration-color: #b9d4ea; text-underline-offset: 3px; }
+td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
+.crumbs { margin: 4px 0 12px; color: #5b6b7b; font-size: 14px; }
+.crumbs a { color: #1f6fb2; }
+.crumbs .crumb-action { margin-left: 12px; font-size: 13px; }
+/* coverage tree: like the Product Master BOM tree; suppliers of a line shown like alternate rows */
+#coverageTable .tree-toggle-cell, #coverageTable .tree-column-heading { width: 1%; white-space: nowrap; }
+#coverageTable tr[data-tree-depth="0"] > td { font-weight: 650; color: #12263a; background: #fff; }
+#coverageTable tr.cov-line > td { font-weight: 600; color: #12263a; }
+#coverageTable tr[data-tree-depth="1"] > td { background: #f7fafd; }
+#coverageTable tr[data-tree-depth="2"] > td { background: #f0f6fa; }
+#coverageTable tr[data-tree-depth="3"] > td { background: #e9f1f7; }
+#coverageTable tr[data-tree-depth="4"] > td { background: #e3edf5; }
+#coverageTable tr.tree-alternate > td { font-style: italic; color: #7a5a12; background: #fffaf0; font-weight: 400; }
+#coverageTable tr[data-tree-depth="1"] > .tree-toggle-cell { padding-left: 24px; }
+#coverageTable tr[data-tree-depth="2"] > .tree-toggle-cell { padding-left: 40px; }
+#coverageTable tr[data-tree-depth="3"] > .tree-toggle-cell { padding-left: 56px; }
+#coverageTable tr[data-tree-depth="4"] > .tree-toggle-cell { padding-left: 72px; }
+#coverageTable tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
+#coverageTable tr > td.sob-off { color: #b42318; }
+#coverageTable td { white-space: nowrap; }

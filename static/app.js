@@ -1138,78 +1138,195 @@ async function loadMaterialMasterPage(offset = 0) {
 }
 
 
-// Coverage as a tree panel (like the coverage sheet): your part -> its T1 suppliers -> their T2 -> T3.
-// Columns stay in T1 / T2 / T3 blocks; a row repeats its parents' values faded (so filters and sort
-// keep the context). +/- opens and closes a level; Edit (last column) opens that relationship.
-async function loadSupplierPartPage(offset = 0, search = state.supplierSearch) {
-  void offset;
-  state.supplierSearch = search;
-  const result = await api(`/api/planning/supplier-chain?${new URLSearchParams({ search })}`);
-  const links = new Map();
-  result.items.forEach((row) => ["t1", "t2", "t3"].forEach((key) => { if (row[key]) links.set(row[key].id, row[key]); }));
-  state.supplierParts = [...links.values()];
-  const target = $("#supplierPartTable");
-  if (!target) return;
-  const modeLabel = { spot: "Spot", fixed_monthly: "Fixed monthly", every_n_months: "Every N months" };
-  const priced = canSeePrices();
-  const price = (link) => (priced && link.unit_price !== undefined ? money(link.unit_price, link.currency) : "Restricted");
-  const codeCell = (link, cls = "") => `<td${cls}>${esc(link.material_code)}${link.code_master && link.code_master !== "T1" ? ` <small class="subtle">${esc(link.code_master)}</small>` : ""}</td>`;
-  const blank = (n) => "<td></td>".repeat(n);
-  const faded = ' class="chain-repeat"';
-  // T1 block: part code, part name, supplier code, supplier name, SOB, price; T2 / T3: supplier first
-  const t1Cells = (link, part = "", own = "") => `${codeCell(link, part)}<td${part}>${esc(link.material_name)}</td><td${own}>${esc(link.supplier_code)}</td><td${own}>${esc(link.supplier_name)}</td>`;
-  const tierCells = (link, own = "") => `<td${own}>${esc(link.supplier_code)}</td><td${own}>${esc(link.supplier_name)}</td>${codeCell(link, own)}<td${own}>${esc(link.material_name)}</td>`;
-  // terms of the supplier on this row: every level has its own
-  const terms = (link) => `<td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${esc(modeLabel[link.price_mode] || link.price_mode)}</td><td>${esc(link.price_status)}</td><td>${price(link)}</td><td>${priced ? esc(link.currency || "") : ""}</td>`;
-  const toggle = (open = true) => `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="${open}">${open ? "−" : "+"}</button>`;
-  const edit = (link, tier) => `<button class="text-button" data-edit-supplier-part="${link.id}">Edit ${tier}</button>`;
-  // add a supplier one level below this relationship (e.g. a 2nd steel supplier for Supangita's beam)
-  const addUnder = (link, tier) => `<button class="text-button" data-add-under-part="${link.id}">+ Add ${tier}</button>`;
-  // children per node, to know which rows get a +/- and the part summary (T1 suppliers, total SOB)
-  const t1ByPart = new Map(), hasChild = new Set();
-  result.items.forEach((row) => {
-    if (row.t1) {
-      const key = row.t1.material_code;
-      if (!t1ByPart.has(key)) t1ByPart.set(key, new Map());
-      t1ByPart.get(key).set(row.t1.id, row.t1);
-      if (row.t2) hasChild.add(`1:${row.t1.id}`);
-      if (row.t2 && row.t3) hasChild.add(`2:${row.t1.id}:${row.t2.id}`);
-    }
-  });
-  const seen = new Set();
-  const html = [];
-  result.items.forEach((row) => {
-    const { t1, t2, t3 } = row;
-    if (t1 && !seen.has(`p:${t1.material_code}`)) {
-      seen.add(`p:${t1.material_code}`);
-      const suppliers = [...t1ByPart.get(t1.material_code).values()];
-      const total = suppliers.reduce((sum, link) => sum + Number(link.sob_percent || 0), 0);
-      html.push(`<tr class="tree-has-children chain-part" data-tree-depth="0"><td class="tree-toggle-cell">${toggle()}</td>${codeCell(t1)}<td>${esc(t1.material_name)}</td><td></td><td>${suppliers.length} T1 supplier${suppliers.length === 1 ? "" : "s"}</td>${blank(8)}<td class="${Math.abs(total - 100) > 0.001 ? "sob-off" : ""}">${number(total, 1)}%</td>${blank(7)}<td></td></tr>`);
-    }
-    if (t1 && !seen.has(`1:${t1.id}`)) {
-      seen.add(`1:${t1.id}`);
-      html.push(`<tr class="${hasChild.has(`1:${t1.id}`) ? "tree-has-children" : ""}" data-tree-depth="1"><td class="tree-toggle-cell">${hasChild.has(`1:${t1.id}`) ? toggle() : ""}</td>${t1Cells(t1, faded)}${blank(8)}${terms(t1)}<td>${edit(t1, "T1")}${addUnder(t1, "T2")}</td></tr>`);
-    }
-    if (t2 && !seen.has(`2:${t1?.id}:${t2.id}`)) {
-      seen.add(`2:${t1?.id}:${t2.id}`);
-      const open = hasChild.has(`2:${t1?.id}:${t2.id}`);
-      html.push(`<tr class="${open ? "tree-has-children" : ""}" data-tree-depth="2"><td class="tree-toggle-cell">${open ? toggle() : ""}</td>${t1 ? t1Cells(t1, faded, faded) : blank(4)}${tierCells(t2)}${blank(4)}${terms(t2)}<td>${edit(t2, "T2")}${addUnder(t2, "T3")}</td></tr>`);
-    }
-    if (t3 && !seen.has(`3:${t1?.id}:${t2?.id}:${t3.id}`)) {
-      seen.add(`3:${t1?.id}:${t2?.id}:${t3.id}`);
-      html.push(`<tr data-tree-depth="3"><td class="tree-toggle-cell"></td>${t1 ? t1Cells(t1, faded, faded) : blank(4)}${t2 ? tierCells(t2, faded) : blank(4)}${tierCells(t3)}${terms(t3)}<td>${edit(t3, "T3")}</td></tr>`);
-    }
-  });
-  const headers = ["", "T1 Material code", "T1 Material name", "T1 Supplier code", "T1 Supplier name",
-    ...[2, 3].flatMap((tier) => ["Supplier code", "Supplier name", "Material code", "Material name"].map((label) => `T${tier} ${label}`)),
-    "SOB", "Lead time", "MOQ", "Buffer days", "Price mode", "Price status", "Unit price", "Currency", "Edit"];
-  target.innerHTML = table(headers, html.join(""), search ? "No supplier/material relationships match this search." : "No supplier/material relationships configured.").replace("<thead><tr>", `<thead>${chainGroupRow({ block: 4, terms: 8, leading: 1, trailing: 1, termsLabel: "Terms of the supplier on this row (each level has its own)" })}<tr>`)
-    + `<div class="table-toolbar pagination-toolbar"><span>${t1ByPart.size.toLocaleString()} part${t1ByPart.size === 1 ? "" : "s"} · ${links.size.toLocaleString()} relationship${links.size === 1 ? "" : "s"}</span></div>`;
+// Supplier/material relationship (T1: parts a supplier supplies you) and Supplier/material coverage
+// (one T1 relationship: the supplier's part BOM, L1 -> L3, with the suppliers of every line).
+// Whichever of the two pages is open is refreshed after an edit.
+async function loadSupplierPartPage() {
+  if ($("#coverageTable")) return loadCoverage();
+  if ($("#relListTable")) return loadRelList();
+  return null;
 }
 
-function renderSupplierPartsTable() { return loadSupplierPartPage(0); }
+async function loadRelList() {
+  const params = new URLSearchParams({ tier: "T1", limit: "1000", search: state.relSearch || "" });
+  if (state.relSupplierId) params.set("supplier_id", state.relSupplierId);
+  const result = await api(`/api/planning/supplier-parts?${params}`);
+  state.supplierParts = result.items;
+  const target = $("#relListTable");
+  if (!target) return;
+  const priced = canSeePrices();
+  const open = (link, text) => `<td class="cell-link" data-open-coverage="${link.id}" title="Open Supplier/material coverage">${text}</td>`;
+  const rows = result.items.map((link) => `<tr>${open(link, esc(link.supplier_code))}${open(link, esc(link.supplier_name))}${open(link, esc(link.material_code))}${open(link, esc(link.material_name))}${open(link, `${number(link.sob_percent, 1)}%`)}<td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${priced && link.unit_price !== undefined ? money(link.unit_price, link.currency) : "Restricted"}</td><td>${priced ? esc(link.currency || "") : ""}</td><td><button class="text-button" data-open-coverage="${link.id}">Coverage</button><button class="text-button" data-edit-supplier-part="${link.id}">Edit</button><button class="text-button button-danger" data-delete-supplier-part="${link.id}">Delete</button></td></tr>`).join("");
+  target.innerHTML = table(["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Lead time", "MOQ", "Buffer days", "Unit price", "Currency", "Action"], rows,
+    state.relSupplierId ? "This supplier supplies no part yet: add rows above." : "No supplier/material relationships yet.");
+}
 
-const SUPPLIER_TABS = ["Supplier register", "Supplier/material relationship", "Supplier/material coverage", "Upload supplier stock", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"];
+function t1EntryRow() {
+  const priced = canSeePrices();
+  return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell(false, "material")}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" placeholder="0" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" placeholder="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>${entryRemoveCell}</tr>`;
+}
+
+// ---- coverage page
+const PRICE_MODE_LABEL = { spot: "Spot", fixed_monthly: "Fixed monthly", every_n_months: "Every N months" };
+async function loadCoverage() {
+  const data = await api(`/api/planning/supplier-coverage/${state.coverageLinkId}`);
+  state.coverage = data;
+  state.supplierParts = [data.t1];
+  renderCoverageTable();
+}
+
+function renderCoverageTable() {
+  const target = $("#coverageTable");
+  const data = state.coverage;
+  if (!target || !data) return;
+  const { t1, lines } = data;
+  const priced = canSeePrices();
+  const needed = state.covRequirement?.[t1.id];
+  const hasNeed = needed !== undefined && needed !== "" && !Number.isNaN(Number(needed));
+  const share = hasNeed ? Number(needed) * Number(t1.sob_percent || 0) / 100 : null;  // pieces this supplier makes
+  const show = (value, unit = "") => (value === null ? "" : `${number(value, 2)}${unit ? ` ${esc(unit)}` : ""}`);
+  const byParent = new Map();
+  lines.forEach((line) => { const key = line.parent_line_id || 0; if (!byParent.has(key)) byParent.set(key, []); byParent.get(key).push(line); });
+  const toggle = '<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="true">−</button>';
+  const price = (value, currency) => (priced && value !== undefined ? money(value, currency) : "Restricted");
+  const terms = (item) => `<td>${number(item.lead_time_days, 0)} days</td><td>${number(item.moq)}</td><td>${number(item.buffer_days, 0)} days</td><td>${esc(PRICE_MODE_LABEL[item.price_mode] || item.price_mode || "")}</td><td>${esc(item.price_status || "")}</td><td>${price(item.unit_price, item.currency)}</td><td>${priced ? esc(item.currency || "") : ""}</td>`;
+  const html = [`<tr class="tree-has-children cov-t1" data-tree-depth="0"><td class="tree-toggle-cell">${lines.length ? toggle : ""}</td><td>T1</td><td>${esc(t1.supplier_code)}</td><td>${esc(t1.supplier_name)}</td><td>${esc(t1.material_code)}</td><td>${esc(t1.material_name)}</td><td>${number(t1.sob_percent, 1)}%</td><td>1</td><td>1</td><td>${esc(t1.uom || "")}</td><td>${show(share, t1.uom)}</td>${terms(t1)}<td><button class="text-button" data-edit-supplier-part="${t1.id}">Edit T1</button><button class="text-button" data-cov-add-line="">+ L1 material</button></td></tr>`];
+  const walk = (parentId, perParent, needParent) => {
+    (byParent.get(parentId) || []).forEach((line) => {
+      const depth = line.depth;  // 1 = L1
+      const perPiece = perParent * line.quantity;  // per one T1 part
+      const need = needParent === null ? null : needParent * line.quantity;
+      const unit = line.component.uom || "";
+      const sob = line.sources.reduce((sum, src) => sum + Number(src.sob_percent || 0), 0);
+      const kids = (byParent.get(line.id) || []).length || line.sources.length;
+      html.push(`<tr class="tree-has-children cov-line" data-tree-depth="${depth}"><td class="tree-toggle-cell">${kids ? toggle : ""}</td><td>L${depth} BOM</td><td></td><td></td><td>${esc(line.component.code)}${line.component.origin && line.component.origin !== "T1" ? ` <small class="subtle">${esc(line.component.origin)}</small>` : ""}</td><td>${esc(line.component.name)}</td><td class="${line.sources.length && Math.abs(sob - 100) > 0.001 ? "sob-off" : ""}">${line.sources.length ? `${number(sob, 1)}%` : "No supplier"}</td><td>${number(line.quantity, 4)}</td><td>${number(perPiece, 4)}</td><td>${esc(unit)}</td><td>${show(need, unit)}</td><td colspan="7"></td><td><button class="text-button" data-cov-add-source="${line.id}">+ T${depth + 1} supplier</button>${depth < 3 ? `<button class="text-button" data-cov-add-line="${line.id}">+ L${depth + 1} material</button>` : ""}<button class="text-button" data-cov-edit-line="${line.id}">Edit</button><button class="text-button button-danger" data-cov-delete-line="${line.id}">Delete</button></td></tr>`);
+      line.sources.forEach((src, index) => {
+        const code = src.alternate ? src.alternate.code : line.component.code;
+        const name = src.alternate ? `${src.alternate.name} · alternate code` : line.component.name;
+        html.push(`<tr class="tree-alternate cov-source" data-tree-depth="${depth + 1}"><td class="tree-toggle-cell"></td><td>T${depth + 1}</td><td>${esc(src.sub_supplier_code || "")}</td><td>${esc(src.sub_supplier || "")}</td><td>↳ ${esc(code)}</td><td>${esc(name)}</td><td>${number(src.sob_percent, 1)}%</td><td></td><td>${number(perPiece * src.sob_percent / 100, 4)}</td><td>${esc(unit)}</td><td>${show(need === null ? null : need * src.sob_percent / 100, unit)}</td>${terms(src)}<td><button class="text-button" data-cov-edit-source="${line.id}:${index}">Edit</button><button class="text-button button-danger" data-cov-delete-source="${line.id}:${index}">Delete</button></td></tr>`);
+      });
+      walk(line.id, perPiece, need);
+    });
+  };
+  walk(0, 1, share);
+  target.innerHTML = table(["", "Level", "Supplier Code", "Supplier Name", "Material code", "Material name", "SOB", "BOM qty", `Qty per ${t1.material_code}`, "Unit", "Requirement", "Lead time", "MOQ", "Buffer days", "Price mode", "Price status", "Unit price", "Currency", "Action"], html.join(""), "");
+  const note = $("#covShare");
+  if (note) note.textContent = hasNeed ? `${t1.supplier_name} makes ${number(t1.sob_percent, 1)}% = ${number(share, 2)} ${t1.uom || "pcs"} of ${number(Number(needed), 2)}` : "Type the requirement of the part to see the quantity of every material and supplier.";
+}
+
+function coverageLine(id) { return state.coverage.lines.find((line) => String(line.id) === String(id)); }
+
+// + L1 / L2 / L3 material: rows of part code (T1, T2 or T3 Material Master) and quantity per unit of the line above
+function openCoverageAddLine(parentId) {
+  const parent = parentId ? coverageLine(parentId) : null;
+  const t1 = state.coverage.t1;
+  const level = parent ? parent.depth + 1 : 1;
+  const per = parent ? `1 ${parent.component.uom || "unit"} of ${parent.component.code}` : `1 ${t1.uom || "piece"} of ${t1.material_code}`;
+  $("#modalTitle").textContent = `Add L${level} material ${parent ? `under ${parent.component.code}` : `to ${t1.material_code}`}`;
+  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">The BOM of ${esc(parent ? `${parent.component.code} ${parent.component.name}` : `${t1.material_code} ${t1.material_name}`)}: each material and the quantity needed for ${esc(per)} (e.g. 2 kg steel per beam; 1.7 kg iron ore per kg steel). Codes come from your T1, T2 or T3 Material Master. Add its suppliers after saving (+ T${level + 1} supplier).</p>${entryTable("covLineTable", ["Material code", "Material name", `Quantity per ${parent ? parent.component.code : t1.material_code}`])}<div class="modal-footer"><button type="button" class="button button-small" id="covLineAddRow">+ Add row</button><button type="button" class="button button-primary" id="covLineSave">Save</button></div></div>`;
+  modalLayer.hidden = false;
+  const entries = bindEntryTable("covLineTable", () => `<tr>${entryMaterialCell(true, "material")}<td><input class="form-control" type="number" min="0" step="any" data-f="quantity" placeholder="0" /></td>${entryRemoveCell}</tr>`);
+  $("#covLineAddRow").addEventListener("click", () => entries.add());
+  $("#covLineSave").addEventListener("click", async () => {
+    const rows = [];
+    for (const [index, row] of entries.rows().entries()) {
+      const typed = cellValue(row, '[data-pick-key="material"][data-pick-part="code"]').trim();
+      const item = Number(cellValue(row, '[data-row-material="material"]'));
+      const tierItem = Number(cellValue(row, '[data-row-tier-material="material"]'));
+      const quantity = Number(cellValue(row, '[data-f="quantity"]'));
+      if (!typed && !item && !tierItem) continue;
+      if (!item && !tierItem) return toast(`Row ${index + 1}: ${typed} is not found; pick the code from the hint list (T1, T2 or T3 Material Master).`, true);
+      if (!(quantity > 0)) return toast(`Row ${index + 1}: type the quantity (more than 0).`, true);
+      rows.push({ link_id: t1.id, parent_line_id: parent ? parent.id : null, item_id: item || null, tier_material_id: tierItem || null, quantity });
+    }
+    if (!rows.length) return toast("Fill in at least one row.", true);
+    let saved = 0;
+    for (const [index, body] of rows.entries()) {
+      try { await api("/api/planning/supplier-coverage/lines", { method: "POST", body: JSON.stringify(body) }); saved += 1; }
+      catch (error) { toast(`Row ${index + 1}: ${error.message}${saved ? ` (${saved} row${saved === 1 ? "" : "s"} above saved)` : ""}`, true); return loadCoverage(); }
+    }
+    modalLayer.hidden = true;
+    toast(`${saved} material line${saved === 1 ? "" : "s"} added`);
+    loadCoverage();
+  });
+}
+
+function openCoverageEditLine(line) {
+  $("#modalTitle").textContent = `Edit L${line.depth} ${line.component.code}`;
+  $("#modalBody").innerHTML = `<form id="covQtyForm" class="form-grid"><label class="field"><span>Quantity per unit of the line above (${esc(line.component.uom || "")})</span><input class="form-control" type="number" min="0" step="any" name="quantity" value="${line.quantity}" required /></label><div class="modal-footer"><button class="button button-primary" type="submit">Save</button></div></form>`;
+  modalLayer.hidden = false;
+  $("#covQtyForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const quantity = Number(new FormData(event.currentTarget).get("quantity"));
+    if (!(quantity > 0)) return toast("Quantity must be more than 0.", true);
+    try {
+      await api(`/api/planning/supplier-bom/lines/${line.id}`, { method: "PATCH", body: JSON.stringify({ quantity, unit_price: line.entered_price ?? null, currency: line.entered_currency ?? null }) });
+      modalLayer.hidden = true;
+      toast("Quantity saved");
+      loadCoverage();
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
+// suppliers of a line are saved together (SOB up to 100%)
+function sourcePayload(src) {
+  const out = { sub_supplier_id: src.sub_supplier_id, sob_percent: Number(src.sob_percent), lead_time_days: Number(src.lead_time_days || 0), moq: Number(src.moq || 0), buffer_days: Number(src.buffer_days || 0),
+    price_mode: src.price_mode || "spot", price_interval_months: Number(src.price_interval_months || 1), unit_price: Number(src.unit_price || 0), currency: src.currency || "INR" };
+  if (src.alternate) out[src.alternate.kind === "our" ? "item_id" : "supplier_material_id"] = src.alternate.id;
+  return out;
+}
+async function saveSources(line, sources, message) {
+  try {
+    await api(`/api/planning/supplier-bom/lines/${line.id}/sources`, { method: "PUT", body: JSON.stringify(sources) });
+    modalLayer.hidden = true;
+    toast(message);
+    state.suppliers = await api("/api/suppliers");
+    loadCoverage();
+  } catch (error) { toast(error.message, true); }
+}
+
+function openCoverageSource(line, index = null) {
+  if (!canSeePrices()) return toast("Price access is needed to change the suppliers of a line (their prices are saved with them).", true);
+  const tier = `T${line.depth + 1}`;
+  const editing = index === null ? null : line.sources[index];
+  const others = line.sources.filter((_, i) => i !== index);
+  const used = others.reduce((sum, src) => sum + Number(src.sob_percent || 0), 0);
+  $("#modalTitle").textContent = `${editing ? "Edit" : "Add"} ${tier} supplier of ${line.component.code}`;
+  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">${tier} suppliers of ${esc(line.component.code)} ${esc(line.component.name)}: ${others.length ? others.map((src) => `${esc(src.sub_supplier)} ${number(src.sob_percent, 1)}%`).join(", ") : "none yet"}${editing ? " (besides this one)" : ""}. SOB left: <strong>${number(Math.max(0, 100 - used), 1)}%</strong>.${editing ? "" : " Add one or more rows."}</p>${entryTable("covSourceTable", ["Supplier code", "Supplier name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Price mode", "Price interval (months)", "Unit price", "Currency"])}<div class="modal-footer">${editing ? "" : '<button type="button" class="button button-small" id="covSourceAddRow">+ Add row</button>'}<button type="button" class="button button-primary" id="covSourceSave">Save</button></div></div>`;
+  modalLayer.hidden = false;
+  const entries = bindEntryTable("covSourceTable", () => `<tr>${entrySupplierCell("supplier")}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" placeholder="0" /></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td><td><input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" placeholder="0" /></td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>${entryRemoveCell}</tr>`);
+  if (editing) {
+    const row = entries.rows()[0];
+    row.querySelector("[data-entry-remove]")?.remove();
+    const supplier = state.suppliers.find((item) => item.id === editing.sub_supplier_id);
+    if (supplier) setRowPick(row, "supplier", "supplier", supplier);
+    ["sob_percent", "lead_time_days", "moq", "buffer_days", "price_mode", "price_interval_months", "unit_price", "currency"].forEach((key) => { const input = row.querySelector(`[data-f="${key}"]`); if (input && editing[key] !== undefined && editing[key] !== null) input.value = editing[key]; });
+  } else {
+    $("#covSourceAddRow").addEventListener("click", () => entries.add());
+  }
+  $("#covSourceSave").addEventListener("click", async () => {
+    const typed = [];
+    for (const [rowIndex, row] of entries.rows().entries()) {
+      const supplierId = Number(cellValue(row, '[data-row-supplier="supplier"]'));
+      const code = cellValue(row, '[data-pick-key="supplier"][data-pick-part="code"]').trim();
+      if (!supplierId && !code) continue;
+      if (!supplierId) return toast(`Row ${rowIndex + 1}: ${code} is not in the Supplier register; pick the supplier from the hint list.`, true);
+      if (supplierId === line.sources.find((_, i) => i !== index && line.sources[i].sub_supplier_id === supplierId)?.sub_supplier_id) return toast(`Row ${rowIndex + 1}: this supplier is already a ${tier} supplier of ${line.component.code}; use its Edit.`, true);
+      const value = (key) => cellValue(row, `[data-f="${key}"]`);
+      const sob = value("sob_percent") === "" ? 100 : Number(value("sob_percent"));
+      if (!(sob > 0)) return toast(`Row ${rowIndex + 1}: SOB must be more than 0% (delete the supplier instead).`, true);
+      typed.push({ sub_supplier_id: supplierId, sob_percent: sob, lead_time_days: Number(value("lead_time_days") || 0), moq: Number(value("moq") || 0), buffer_days: Number(value("buffer_days") || 0),
+        price_mode: value("price_mode"), price_interval_months: Number(value("price_interval_months") || 1), unit_price: Number(value("unit_price") || 0), currency: value("currency"), alternate: editing?.alternate || null });
+    }
+    if (!typed.length) return toast("Fill in at least one row.", true);
+    const total = used + typed.reduce((sum, src) => sum + src.sob_percent, 0);
+    if (total > 100.0001) return toast(`SOB adds up to ${number(total, 2)}%: at most ${number(Math.max(0, 100 - used), 2)}% is left for ${line.component.code}. Lower another supplier's SOB with its Edit first.`, true);
+    const list = index === null ? [...line.sources.map(sourcePayload), ...typed.map(sourcePayload)] : line.sources.map((src, i) => sourcePayload(i === index ? typed[0] : src));
+    saveSources(line, list, `${tier} supplier${typed.length === 1 ? "" : "s"} saved for ${line.component.code}`);
+  });
+}
+
+const SUPPLIER_TABS = ["Supplier register", "Supplier/material relationship", "Upload supplier stock", "Supplier-to-supplier material transfer", "Transfer schedule", "Supplier materials", "Supplier BOM"];
 
 // ---- Excel-like entry tables (one row per entry, every field a column, + Add row, Save all)
 // Column headings have the same filter as other tables (sort, search, Select all, Clear all);
@@ -1352,23 +1469,6 @@ function relationshipEntryRow() {
   const priced = canSeePrices();
   return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell(true)}<td><select class="form-control" data-f="tier"><option value="T1">T1 (supplies you)</option><option value="T2">T2 (supplies a T1 supplier)</option><option value="T3">T3 (supplies a T2 supplier)</option></select></td>${entrySupplierCell("parent", true)}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" value="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" value="14" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" value="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" value="0" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" value="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td>${entryRemoveCell}</tr>`;
 }
-// Chain row (as in the coverage sheet): T1 supplier + part + SOB + price, then its T2, then T3, and the
-// terms of the last supplier in the row. Leave a block blank to continue the row above (e.g. a 2nd T2
-// under the same T1).
-// each level (T1, T2, T3) has its own terms
-const CHAIN_LEVEL_TERMS = ["SOB (%)", "lead time (days)", "MOQ", "buffer (days)", "price mode", "price interval (months)", "unit price", "currency"];
-const CHAIN_BLOCK = ["supplier code", "supplier name", "part code", "part name", ...CHAIN_LEVEL_TERMS];
-const CHAIN_T1_BLOCK = ["part code", "part name", "supplier code", "supplier name", ...CHAIN_LEVEL_TERMS];  // your part first
-function chainGroupRow({ block, terms = 0, leading = 0, trailing = 0, termsLabel = "" }) {
-  return `<tr class="group-head">${leading ? `<th colspan="${leading}"></th>` : ""}${["T1 Supplier (supplies you)", "T2 Supplier (supplies the T1)", "T3 Supplier (supplies the T2)"].map((label) => `<th colspan="${block}">${label}</th>`).join("")}${terms ? `<th colspan="${terms}">${termsLabel}</th>` : ""}${trailing ? `<th colspan="${trailing}"></th>` : ""}</tr>`;
-}
-function chainEntryRow() {
-  const priced = canSeePrices();
-  const terms = (tier) => `<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob${tier}" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days${tier}" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq${tier}" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days${tier}" placeholder="0" /></td><td><select class="form-control" data-f="price_mode${tier}"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months${tier}" value="1" /></td><td>${priced ? `<input class="form-control" type="number" min="0" step="0.0001" data-f="price${tier}" placeholder="0" />` : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency${tier}">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>`;
-  const block = (tier) => `${tier === 1 ? entryMaterialCell(false, "m1") + entrySupplierCell("s1") : entrySupplierCell(`s${tier}`) + entryMaterialCell(true, `m${tier}`)}${terms(tier)}`;
-  return `<tr>${block(1)}${block(2)}${block(3)}${entryRemoveCell}</tr>`;
-}
-
 function stockEntryRow() {
   return `<tr>${entrySupplierCell("supplier")}<td><select class="form-control" data-row-link><option value="">Choose supplier first</option></select></td><td><input class="form-control" type="number" min="0" step="any" data-f="quantity" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="available_quantity" placeholder="= quantity" /></td><td><input class="form-control" type="month" data-f="arrival_month" /></td>${entryRemoveCell}</tr>`;
 }
@@ -1406,52 +1506,6 @@ function openSupplierEdit(supplier) {
 
 // Edit a saved relationship: the whole row (supplier, part, tier, parent, SOB, lead time, MOQ,
 // buffer, price, agreement) in the same one-row table as Supplier/material relationship.
-// "+ Add T2" / "+ Add T3" from the coverage tree: a new supplier under that relationship (its part)
-function underEntryRow() {
-  const priced = canSeePrices();
-  return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell(true, "material")}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" placeholder="0" /></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" placeholder="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>${entryRemoveCell}</tr>`;
-}
-function openAddUnder(parent) {
-  if (!parent) return;
-  const tier = `T${Number(String(parent.tier).replace("T", "")) + 1}`;
-  const siblings = (state.supplierParts || []).filter((link) => link.parent_link_id === parent.id);
-  const used = siblings.reduce((sum, link) => sum + Number(link.sob_percent || 0), 0);
-  $("#modalTitle").textContent = `Add ${tier} supplier under ${parent.supplier_name} · ${parent.material_code}`;
-  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">${tier} suppliers already under ${esc(parent.supplier_name)} (${esc(parent.material_code)}): ${siblings.length ? siblings.map((link) => `${esc(link.supplier_name)} ${esc(link.material_code)} ${number(link.sob_percent, 1)}%`).join(", ") : "none"}. SOB left: <strong>${number(Math.max(0, 100 - used), 1)}%</strong> (lower another supplier's SOB with its Edit first if needed). Add one or more rows.</p>${entryTable("underTable", ["Supplier code", "Supplier name", "Part code", "Part name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Price mode", "Price interval (months)", "Unit price", "Currency"])}<div class="modal-footer"><button type="button" class="button button-small" id="underAddRow">+ Add row</button><button type="button" class="button button-primary" id="underSave">Save</button></div></div>`;
-  modalLayer.hidden = false;
-  const entries = bindEntryTable("underTable", underEntryRow);
-  $("#underAddRow").addEventListener("click", () => entries.add());
-  $("#underSave").addEventListener("click", async () => {
-    const rows = [];
-    for (const [index, row] of entries.rows().entries()) {
-      const typed = (part, key) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="${part}"]`).trim();
-      const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
-      const material = Number(cellValue(row, '[data-row-material="material"]'));
-      const tierMaterial = Number(cellValue(row, '[data-row-tier-material="material"]'));
-      if (!supplier && !material && !tierMaterial && !typed("code", "supplier") && !typed("code", "material")) continue;
-      if (!supplier) return toast(`Row ${index + 1}: pick the supplier from the hint list${typed("code", "supplier") ? ` (${typed("code", "supplier")} is not in the Supplier register)` : ""}.`, true);
-      if (!material && !tierMaterial) return toast(`Row ${index + 1}: pick the part code from the hint list${typed("code", "material") ? ` (${typed("code", "material")} is not found)` : ""}.`, true);
-      const value = (key) => cellValue(row, `[data-f="${key}"]`);
-      const count = (key) => (value(key) === "" ? 0 : Number(value(key)));
-      const body = { supplier_id: supplier, material_id: material || null, tier_material_id: tierMaterial || null, tier, parent_link_id: parent.id, parent_supplier_id: parent.supplier_id,
-        sob_percent: value("sob_percent") === "" ? 100 : Number(value("sob_percent")), lead_time_days: count("lead_time_days"), moq: count("moq"), buffer_days: count("buffer_days"),
-        price_mode: value("price_mode"), price_interval_months: Number(value("price_interval_months") || 1), currency: value("currency") };
-      if (row.querySelector('[data-f="unit_price"]')) body.unit_price = Number(value("unit_price") || 0);
-      rows.push(body);
-    }
-    if (!rows.length) return toast("Fill in at least one row.", true);
-    let saved = 0;
-    for (const [index, body] of rows.entries()) {
-      try { await api("/api/planning/supplier-parts", { method: "POST", body: JSON.stringify(body) }); saved += 1; }
-      catch (error) { toast(`Row ${index + 1}: ${error.message}${saved ? ` (${saved} row${saved === 1 ? "" : "s"} above saved)` : ""}`, true); state.suppliers = await api("/api/suppliers"); return loadSupplierPartPage(); }
-    }
-    modalLayer.hidden = true;
-    toast(`${saved} ${tier} supplier${saved === 1 ? "" : "s"} added under ${parent.supplier_name}`);
-    state.suppliers = await api("/api/suppliers");
-    loadSupplierPartPage();
-  });
-}
-
 function openSupplierPartEdit(link) {
   if (!link) return;
   $("#modalTitle").textContent = `Edit ${link.supplier_name} · ${link.material_code} (${link.tier})`;
@@ -1786,14 +1840,23 @@ async function renderSupplierControl() {
   state.suppliers = await api("/api/suppliers");
   const tabs = `<div class="tab-strip">${SUPPLIER_TABS.map((name) => `<button class="tab-button ${tab === name ? "active" : ""}" data-supplier-tab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
   let body = "";
-  if (tab === "Supplier/material relationship") {
-    body = `<section class="panel table-panel">${panelHeader("Supplier/material relationship", "Who supplies each part, in what share (SOB), at what price and lead time, along the chain: T1 supplier (supplies you) → its T2 → its T3, as in Supplier/material coverage. In the table, type your part, its T1 supplier, SOB and price, then (optional) the T2 supplier and its part, and T3, in the same row. Each level has its own SOB, lead time, MOQ, buffer, price mode, unit price and currency. Leave the T1 block blank on the next row to add another T2 under the same T1 (e.g. JGI 30% and TATA 70% steel for Supangita's Base Front Beam). Save all creates or updates the relationships. Or upload your own sheet as it is, or the template: one row per part and supplier. Needed: part code and supplier. Tier: T1 = supplies you (T1 Material Master code you buy); T2 = supplies a T1 supplier and T3 = supplies a T2 supplier (both need the parent supplier, and may use a T1, T2 or T3 Material Master code). Optional: Tier (blank = T1), SOB % (blank = 100), unit price, currency, lead time, MOQ, buffer days. SOB for a part at the same tier and parent is limited to 100%. T1 codes must be purchased parts (no in-house BOM, no negative BOM quantity). New supplier names in a file join the Supplier register; an existing relationship is updated. The whole file, or all typed rows, is rejected if any row is wrong. Saved lines are edited or deleted in Supplier/material coverage.")}
+  if (tab === "Supplier/material relationship" && state.coverageLinkId) {
+    body = `<nav class="crumbs" id="covCrumbs"></nav><section class="panel table-panel">${panelHeader("Supplier/material coverage", "The part as this supplier makes it: its BOM (L1 materials, their L2 BOM and L3 BOM, each with quantity per unit of the line above) and the suppliers of every material with SOB (T2 for L1, T3 for L2, T4 for L3). A part may have only the T1 supplier, or go down to L3: add what you know. Type the requirement of the part to see the quantity of every material and supplier: e.g. 60,000 beams × Savera 60% × 2 kg steel = 72,000 kg; JGI 30% = 21,600 kg, TATA 70% = 50,400 kg; × 1.7 kg ore per kg steel = 122,400 kg ore. + / − opens and closes a level.")}
+      <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Requirement of the part (all suppliers)</span><input class="form-control" type="number" min="0" step="any" id="covRequirement" placeholder="e.g. 60000" /></label><span class="subtle" id="covShare"></span></div><span class="toolbar-add"><button type="button" class="button button-small button-primary" data-cov-add-line="">+ L1 material</button></span></div>
+      <div id="coverageTable" class="coverage-tree"><div class="tree-loading">Loading…</div></div>
+    </section>`;
+  } else if (tab === "Supplier/material relationship") {
+    const chosen = state.suppliers.find((supplier) => supplier.id === state.relSupplierId) || null;
+    if (!chosen) state.relSupplierId = null;
+    body = `<nav class="crumbs"><a href="#" data-supplier-tab="Supplier register">Supplier register</a> › ${chosen ? `<strong>${esc(chosen.code)} ${esc(chosen.name)}</strong> <a href="#" class="crumb-action" data-rel-all>Show all suppliers</a>` : "<strong>All suppliers</strong>"}</nav>
+      <section class="panel table-panel">${panelHeader(`Supplier/material relationship${chosen ? ` · ${chosen.code} ${chosen.name}` : ""}`, `The parts ${chosen ? esc(chosen.name) : "each supplier"} supplies to you (T1): SOB, lead time, MOQ, buffer, price. One supplier can supply many parts; one part can have several suppliers (SOB up to 100% per part). Click the supplier or part (first 5 columns) to open its Supplier/material coverage: the part's BOM and the T2 / T3 suppliers of its materials. Type new rows below (+ Add row, Save all), or upload a workbook (one row per part and supplier; the template has all columns).`)}
         <form id="supplierPartUploadForm" class="panel-body inline-upload">
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload relationships</button><a class="button" href="/api/planning/templates/supplier-parts.xlsx">Download template</a>
         </form>
-        <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></div>
-        ${entryTable("relEntryTable", [...CHAIN_T1_BLOCK.map((label) => `T1 ${label}`), ...[2, 3].flatMap((tier) => CHAIN_BLOCK.map((label) => `T${tier} ${label}`))]).replace("<thead><tr>", `<thead>${chainGroupRow({ block: 12, trailing: 1 })}<tr>`)}
+        <div class="table-toolbar"><label class="search-field"><input class="form-control" id="relSearch" type="search" placeholder="Search supplier or part" value="${esc(state.relSearch || "")}" /></label><span class="toolbar-add"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></span></div>
+        ${entryTable("relEntryTable", ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer days", "Unit price", "Currency"])}
+        <div id="relListTable"><div class="tree-loading">Loading…</div></div>
       </section>`;
   } else if (tab === "Upload supplier stock") {
     body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
@@ -1807,18 +1870,13 @@ async function renderSupplierControl() {
       <h3 class="subtable-heading">Stock entered for the month</h3>
       <div id="stockListTable"></div>
     </section>`;
-  } else if (tab === "Supplier/material coverage") {
-    body = `<section class="panel table-panel">${panelHeader("Supplier/material coverage", "A tree for each part you buy: the part, then its T1 suppliers (with SOB; the part row shows the total), then the T2 suppliers of each T1 and their part, then T3. + / − opens and closes a level. One supplier can supply many parts, and one part can have several suppliers with SOB. Faded cells repeat the level above. Each level has its own SOB, lead time, MOQ, buffer days, price mode, price status, unit price and currency (columns at the end). Edit opens that relationship.")}
-      <div class="table-toolbar"><div class="toolbar-group"><label class="search-field"><input class="form-control" id="supplierPartSearch" type="search" placeholder="Search supplier or part code / name" /></label></div><div class="toolbar-group"><a class="button button-small" href="/api/planning/supplier-chain.xlsx" id="chainExcel">Download Excel</a><a class="button button-small" href="/api/planning/supplier-chain.pdf">Download PDF</a><button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div></div>
-      <div id="supplierPartTable"></div>
-    </section>`;
   } else if (tab === "Supplier register") {
     if (!SUPPLIER_TIER_TABS.some(([tier]) => tier === state.supplierTierTab)) state.supplierTierTab = "T1";
     const tierTab = state.supplierTierTab;
     const tierLabel = SUPPLIER_TIER_TABS.find(([tier]) => tier === tierTab)[1];
     const tierStrip = `<div class="tab-strip sub-tab-strip">${SUPPLIER_TIER_TABS.map(([tier, label]) => `<button class="tab-button ${tier === tierTab ? "active" : ""}" data-supplier-tier-tab="${tier}">${esc(label)} <span class="tab-count">${state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tier)).length}</span></button>`).join("")}</div>`;
-    const supplierRows = state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tierTab)).map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td>${esc(supplier.code)}</td><td>${esc(supplier.name)}</td><td>${esc((supplier.tiers || ["T1"]).join(", "))}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
-    body = `${tierStrip}<section class="panel table-panel">${panelHeader(tierLabel, `T1 = supplies you; T2 = supplies a T1 supplier; T3 = supplies a T2 supplier. One supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); a relationship saved at a tier adds the supplier to that tab. Add one supplier with Add supplier, or many with an Excel upload (your own headings are fine; uploaded here, suppliers join ${tierTab} unless the sheet has a Supplier tier column). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Supplier tier, Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.`)}
+    const supplierRows = state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tierTab)).map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td class="cell-link" data-open-supplier-rel="${supplier.id}" title="Open Supplier/material relationship">${esc(supplier.code)}</td><td class="cell-link" data-open-supplier-rel="${supplier.id}" title="Open Supplier/material relationship">${esc(supplier.name)}</td><td>${esc((supplier.tiers || ["T1"]).join(", "))}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
+    body = `${tierStrip}<section class="panel table-panel">${panelHeader(tierLabel, `Click a supplier's Code or name to open its Supplier/material relationship (the parts it supplies). T1 = supplies you; T2 = supplies a T1 supplier; T3 = supplies a T2 supplier. One supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); a relationship saved at a tier adds the supplier to that tab. Add one supplier with Add supplier, or many with an Excel upload (your own headings are fine; uploaded here, suppliers join ${tierTab} unless the sheet has a Supplier tier column). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Supplier tier, Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.`)}
       <form id="supplierUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier list workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload suppliers</button><a class="button" href="/api/planning/templates/suppliers.xlsx">Download template</a></form>
       <div class="table-toolbar"><span class="toolbar-add"><button class="button button-small button-primary" data-action="new-supplier">Add supplier</button></span><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Tiers", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, `No ${tierTab} suppliers yet.`)}</div></section>`;
   } else if (tab === "Supplier-to-supplier material transfer") {
@@ -1859,48 +1917,63 @@ async function renderSupplierControl() {
   content.innerHTML = `${heading("Supplier control", "Manage supplier tier, share of business, lead time through T2/Tn, MOQ, buffer, dynamic current price and stock availability.", "")}${tabs}${body}`;
   bindSupplierSearch(content);
 
-  if (tab === "Supplier/material relationship") {
-    const entries = bindEntryTable("relEntryTable", chainEntryRow);
-    $("#relAddRow").addEventListener("click", () => entries.add());
+  if (tab === "Supplier/material relationship" && state.coverageLinkId) {
+    try { await loadCoverage(); }
+    catch (error) { state.coverageLinkId = null; toast(error.message, true); return renderSupplierControl(); }
+    const { t1 } = state.coverage;
+    $("#covCrumbs").innerHTML = `<a href="#" data-supplier-tab="Supplier register">Supplier register</a> › <a href="#" data-open-supplier-rel="${t1.supplier_id}">${esc(t1.supplier_code)} ${esc(t1.supplier_name)}</a> › <strong>${esc(t1.material_code)} ${esc(t1.material_name)}</strong>`;
+    state.covRequirement = state.covRequirement || {};
+    const box = $("#covRequirement");
+    if (state.covRequirement[t1.id] !== undefined) box.value = state.covRequirement[t1.id];
+    renderCoverageTable();
+    box.addEventListener("input", () => { state.covRequirement[t1.id] = box.value; renderCoverageTable(); });
+  } else if (tab === "Supplier/material relationship") {
+    const chosen = state.suppliers.find((supplier) => supplier.id === state.relSupplierId) || null;
+    const entries = bindEntryTable("relEntryTable", t1EntryRow);
+    const prefill = () => { if (chosen) entries.rows().forEach((row) => { if (!cellValue(row, '[data-row-supplier="supplier"]')) setRowPick(row, "supplier", "supplier", chosen); }); };
+    prefill();
+    $("#relAddRow").addEventListener("click", () => { entries.add(); prefill(); });
     $("#relSaveAll").addEventListener("click", async () => {
       const rows = [];
       for (const [index, row] of entries.rows().entries()) {
-        const typed = (key, part) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="${part}"]`).trim();
-        const out = {};
-        for (const tier of [1, 2, 3]) {
-          const supplier = Number(cellValue(row, `[data-row-supplier="s${tier}"]`));
-          const material = Number(cellValue(row, `[data-row-material="m${tier}"]`));
-          const tierMaterial = Number(cellValue(row, `[data-row-tier-material="m${tier}"]`));
-          const anyTyped = typed(`s${tier}`, "code") || typed(`m${tier}`, "code") || cellValue(row, `[data-f="sob${tier}"]`);
-          if (!anyTyped && !supplier && !material && !tierMaterial) continue;
-          if (!supplier) return toast(typed(`s${tier}`, "code") ? `Row ${index + 1}: T${tier} supplier ${typed(`s${tier}`, "code")} is not in the Supplier register; pick it from the hint list.` : `Row ${index + 1}: type the T${tier} supplier.`, true);
-          if (!material && !tierMaterial) return toast(typed(`m${tier}`, "code") ? `Row ${index + 1}: T${tier} part ${typed(`m${tier}`, "code")} is not found${tier === 1 ? " as a purchased T1 code" : ""}; pick it from the hint list.` : `Row ${index + 1}: type the T${tier} part code.`, true);
-          const sob = cellValue(row, `[data-f="sob${tier}"]`);
-          const term = (key) => cellValue(row, `[data-f="${key}${tier}"]`);
-          const count = (key) => (term(key) === "" ? null : Number(term(key)));
-          out[`t${tier}`] = { supplier_id: supplier, material_id: material || null, tier_material_id: tierMaterial || null, sob_percent: sob === "" ? 100 : Number(sob), unit_price: Number(cellValue(row, `[data-f="price${tier}"]`) || 0),
-            lead_time_days: count("lead_time_days"), moq: count("moq"), buffer_days: count("buffer_days"), currency: term("currency"), price_mode: term("price_mode"), price_interval_months: Number(term("price_interval_months") || 1) };
-        }
-        if (!Object.keys(out).length) continue;  // empty row
+        const typed = (key) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="code"]`).trim();
+        const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
+        const material = Number(cellValue(row, '[data-row-material="material"]'));
+        const value = (key) => cellValue(row, `[data-f="${key}"]`);
+        if (!typed("material") && !material && !value("sob_percent")) continue;  // empty row (supplier may be prefilled)
+        if (!supplier) return toast(typed("supplier") ? `Row ${index + 1}: supplier ${typed("supplier")} is not in the Supplier register; pick it from the hint list.` : `Row ${index + 1}: type the supplier.`, true);
+        if (!material) return toast(typed("material") ? `Row ${index + 1}: part ${typed("material")} is not a purchased T1 code; pick it from the hint list.` : `Row ${index + 1}: type the T1 part code.`, true);
+        const out = { supplier_id: supplier, material_id: material, tier: "T1", sob_percent: value("sob_percent") === "" ? 100 : Number(value("sob_percent")),
+          lead_time_days: Number(value("lead_time_days") || 0), moq: Number(value("moq") || 0), buffer_days: Number(value("buffer_days") || 0), currency: value("currency") };
+        if (row.querySelector('[data-f="unit_price"]')) out.unit_price = Number(value("unit_price") || 0);
         rows.push(out);
       }
       if (!rows.length) return toast("Fill in at least one row.", true);
       try {
-        const result = await api("/api/planning/supplier-chain/rows", { method: "POST", body: JSON.stringify({ rows }) });
-        toast(`${result.rows} row${result.rows === 1 ? "" : "s"} saved (${result.relationships} supplier/material relationship${result.relationships === 1 ? "" : "s"})`);
+        const result = await api("/api/planning/supplier-parts/rows", { method: "POST", body: JSON.stringify({ rows }) });
+        toast(`${result.rows} supplier/material relationship${result.rows === 1 ? "" : "s"} saved`);
         entries.reset();
+        prefill();
         state.suppliers = await api("/api/suppliers");
+        loadRelList();
       } catch (error) { toast(error.message, true); }
     });
+    $("#relSearch").addEventListener("input", (event) => {
+      clearTimeout(state.searchTimer);
+      state.searchTimer = setTimeout(() => { state.relSearch = event.target.value; loadRelList(); }, 250);
+    });
+    loadRelList();
   }
   if (tab === "Supplier/material relationship") {
-    $("#supplierPartUploadForm").addEventListener("submit", async (event) => {
+    $("#supplierPartUploadForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.currentTarget;
       try {
         const result = await uploadExcel("/api/planning/supplier-parts/upload", new FormData(form).get("workbook"));
         toast(`${result.rows} row(s): ${result.added} added, ${result.updated} updated, ${result.suppliers_created} new supplier(s)`);
         form.reset();
+        state.suppliers = await api("/api/suppliers");
+        loadRelList();
       } catch (error) { toast(error.message, true); }
     });
   }
@@ -1961,14 +2034,6 @@ async function renderSupplierControl() {
       } catch (error) { toast(error.message, true); }
     });
     loadStockList();
-  }
-  if (tab === "Supplier/material coverage") {
-    state.supplierSearch = "";
-    await loadSupplierPartPage(0, "");
-    $("#supplierPartSearch").addEventListener("input", (event) => {
-      clearTimeout(state.searchTimer);
-      state.searchTimer = setTimeout(() => loadSupplierPartPage(0, event.target.value), 250);
-    });
   }
   if (tab === "Supplier register") {
     $("#supplierUploadForm").addEventListener("submit", async (event) => {
@@ -2680,7 +2745,10 @@ document.addEventListener("click", async (event) => {
   }
   const supplierTab = event.target.closest("[data-supplier-tab]");
   if (supplierTab) {
+    event.preventDefault();
     state.supplierTab = supplierTab.dataset.supplierTab;
+    state.coverageLinkId = null;
+    if (supplierTab.classList.contains("tab-button")) state.relSupplierId = null;
     return renderSupplierControl();
   }
   const treeExport = event.target.closest("[data-bom-tree-export]");
@@ -3005,8 +3073,34 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/suppliers/${supplierDelete.dataset.deleteSupplier}`, { method: "DELETE" }); toast("Supplier deleted"); return renderSupplierControl(); }
     catch (error) { toast(error.message, true); return; }
   }
-  const addUnder = event.target.closest("[data-add-under-part]");
-  if (addUnder) return openAddUnder((state.supplierParts || []).find((link) => String(link.id) === addUnder.dataset.addUnderPart));
+  const openRel = event.target.closest("[data-open-supplier-rel]");
+  if (openRel) { event.preventDefault(); state.supplierTab = "Supplier/material relationship"; state.relSupplierId = Number(openRel.dataset.openSupplierRel) || null; state.coverageLinkId = null; return renderSupplierControl(); }
+  const relAll = event.target.closest("[data-rel-all]");
+  if (relAll) { event.preventDefault(); state.relSupplierId = null; state.coverageLinkId = null; return renderSupplierControl(); }
+  const openCoverage = event.target.closest("[data-open-coverage]");
+  if (openCoverage) { state.supplierTab = "Supplier/material relationship"; state.coverageLinkId = Number(openCoverage.dataset.openCoverage); return renderSupplierControl(); }
+  const covAddLine = event.target.closest("[data-cov-add-line]");
+  if (covAddLine) return openCoverageAddLine(covAddLine.dataset.covAddLine || null);
+  const covAddSource = event.target.closest("[data-cov-add-source]");
+  if (covAddSource) return openCoverageSource(coverageLine(covAddSource.dataset.covAddSource));
+  const covEditLine = event.target.closest("[data-cov-edit-line]");
+  if (covEditLine) return openCoverageEditLine(coverageLine(covEditLine.dataset.covEditLine));
+  const covDeleteLine = event.target.closest("[data-cov-delete-line]");
+  if (covDeleteLine) {
+    const line = coverageLine(covDeleteLine.dataset.covDeleteLine);
+    if (!window.confirm(`Delete ${line.component.code}, its suppliers and every line below it?`)) return;
+    try { await api(`/api/planning/supplier-bom/lines/${line.id}`, { method: "DELETE" }); toast("Line deleted"); return loadCoverage(); }
+    catch (error) { toast(error.message, true); return; }
+  }
+  const covSource = event.target.closest("[data-cov-edit-source], [data-cov-delete-source]");
+  if (covSource) {
+    const [lineId, index] = (covSource.dataset.covEditSource || covSource.dataset.covDeleteSource).split(":");
+    const line = coverageLine(lineId);
+    if (covSource.dataset.covEditSource) return openCoverageSource(line, Number(index));
+    if (!canSeePrices()) return toast("Price access is needed to change the suppliers of a line.", true);
+    if (!window.confirm(`Remove ${line.sources[Number(index)].sub_supplier} as a supplier of ${line.component.code}?`)) return;
+    return saveSources(line, line.sources.filter((_, i) => i !== Number(index)).map(sourcePayload), "Supplier removed");
+  }
   const partEdit = event.target.closest("[data-edit-supplier-part]");
   if (partEdit) return openSupplierPartEdit((state.supplierParts || []).find((link) => String(link.id) === partEdit.dataset.editSupplierPart));
   const partDelete = event.target.closest("[data-delete-supplier-part]");
