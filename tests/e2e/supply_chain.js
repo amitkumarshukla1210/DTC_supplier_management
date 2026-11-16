@@ -160,10 +160,23 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForFunction(() => !document.querySelector("#coverageTable")?.textContent.includes("ABC Coal") && document.querySelector("#coverageTable tbody tr"));
   check("Delete a line removes it and its supplier", (await page.locator("#coverageTable tbody tr").count()) === 6);
   check("Requirement kept after the redraw", (await page.inputValue("#covRequirement")) === "60000");
+  // supplier-wise Excel: download the template (what is saved) and upload it back
+  const templateHref = await page.getAttribute("#coverageTemplate", "href");
+  check("Coverage template is for this supplier", /\/api\/planning\/coverage-workbook\/template\.xlsx\?supplier_id=\d+$/.test(templateHref), templateHref);
+  const file = require("path").join(require("os").tmpdir(), `coverage-${Date.now()}.xlsx`);
+  require("fs").writeFileSync(file, await (await page.request.get(BASE + templateHref)).body());
+  await page.setInputFiles('#coverageUploadForm input[type="file"]', file);
+  await clearToast();
+  await page.click('#coverageUploadForm button[type="submit"]');
+  await waitToast("saved");
+  check("Uploading the template back: 1 part, 2 material lines, 3 supplier rows", (await toastText()).includes("1 part: 2 material lines, 3 supplier rows saved"), await toastText());
+  const after = await read();
+  check("Tree unchanged after the round trip", JSON.stringify(after) === JSON.stringify([["T1", "Savera", "60%", "1", "36,000 Nos"], ["L1 BOM", "FL001STEEL0.7 T2", "90%", "2", "72,000 kg"], ["T2", "JGI STEEL", "20%", "0.4", "14,400 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"], ["L2 BOM", "ORE-01 T3", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"]]), JSON.stringify(after));
   // back via the breadcrumb, then all suppliers
   await page.locator('#covCrumbs a[data-open-supplier-rel]').click();
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);
+  check("Relationship template has Savera's rows", /supplier-relationships\/template\.xlsx\?supplier_id=\d+/.test(await page.getAttribute("#relTemplate", "href")) && (await page.textContent("#relTemplate")).includes("SUP-2013"));
   await page.click("[data-rel-all]");
   await page.waitForFunction(() => document.querySelector(".crumbs")?.textContent.includes("All suppliers"));
   check("Show all suppliers", true);

@@ -716,8 +716,9 @@ def _read_xlsx(raw: bytes) -> list[dict[str, Any]]:
 
 
 SUPPLIER_PART_COLUMN_ALIASES = {
-    "material_code": "material_code", "part_code": "material_code", "item_code": "material_code",
+    "material_code": "material_code", "part_code": "material_code", "item_code": "material_code", "t1_part_code": "material_code",
     "supplier_name": "supplier_name", "supplier": "supplier_name", "vendor": "supplier_name", "vendor_name": "supplier_name",
+    "supplier_code": "supplier_code", "vendor_code": "supplier_code",
     "tier": "tier", "parent_supplier_name": "parent_supplier_name", "parent_supplier": "parent_supplier_name",
     "sob_percent": "sob_percent", "sob": "sob_percent", "sob_%": "sob_percent", "sob_(%)": "sob_percent",
     "unit_price": "unit_price", "unit_cost": "unit_price", "price": "unit_price",
@@ -725,6 +726,18 @@ SUPPLIER_PART_COLUMN_ALIASES = {
     "lead_time_days": "lead_time_days", "lead_time": "lead_time_days", "lead_time_(days)": "lead_time_days",
     "moq": "moq", "buffer_days": "buffer_days", "buffer": "buffer_days",
     "price_mode": "price_mode", "price_interval_months": "price_interval_months",
+}
+# the relationship page's columns, in its order (template and download)
+RELATIONSHIP_SHEET_COLUMNS = ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Lead time", "MOQ", "Buffer days", "Unit price", "Currency"]
+# supplier-wise coverage workbook: every T1 part of a supplier, its BOM lines (L1-L3) and the suppliers of each line (T2-T4)
+COVERAGE_SHEET_COLUMNS = ["T1 Part Code", "T1 Part Name", "Level", "Material code", "Material name", "BOM qty", "Unit", "Supplier Code", "Supplier Name",
+                          "SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price interval months", "Unit price", "Currency"]
+COVERAGE_COLUMN_ALIASES = {
+    "t1_part_code": "part_code", "part_code": "part_code", "level": "level", "material_code": "material_code", "code": "material_code",
+    "bom_qty": "quantity", "quantity": "quantity", "qty": "quantity", "supplier_code": "supplier_code", "supplier_name": "supplier_name",
+    "sob_%": "sob_percent", "sob": "sob_percent", "sob_percent": "sob_percent", "lead_time_days": "lead_time_days", "lead_time": "lead_time_days",
+    "moq": "moq", "buffer_days": "buffer_days", "price_mode": "price_mode", "price_interval_months": "price_interval_months",
+    "unit_price": "unit_price", "price": "unit_price", "currency": "currency",
 }
 
 
@@ -3368,7 +3381,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         the Supplier register (Approved); an existing relationship is updated."""
         current_user(request)
         _check_supply_role(request)
-        rows = _read_supplier_part_sheet(await request.body())
+        rows = _read_supplier_part_sheet(await request.body(), required={"material_code"})
         can_price = _check_price_access(request)
         with open_db() as db:
             items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
@@ -3418,8 +3431,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             for row in rows:
                 row_number = row["_excel_row"]
                 code, name = text(row, "material_code"), text(row, "supplier_name")
+                supplier_code = text(row, "supplier_code")
+                if supplier_code:  # Supplier Code column: the register's supplier (its name in the sheet is only a label)
+                    known = suppliers.get(supplier_code.casefold())
+                    if not known and not name:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: supplier code {supplier_code} is not in the Supplier register")
+                    if known:
+                        name = known.name
                 if not code or not name:
-                    raise HTTPException(status_code=422, detail=f"Row {row_number}: material_code and supplier_name are required")
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: part code and supplier (code or name) are required")
                 try:
                     tier = _normalize_tier(text(row, "tier"))
                 except HTTPException as exc:
@@ -4445,6 +4465,254 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"line_id": line_id, "sources": len(payload)}
 
+    def styled_sheet(sheet, title: str, note: str, headers: list[str]) -> None:
+        sheet.append([title])
+        sheet.append([note])
+        sheet.append(headers)
+        sheet["A1"].font = Font(bold=True, size=13)
+        sheet["A2"].font = Font(italic=True, color="5B6B7B")
+        for cell in sheet[3]:
+            cell.fill, cell.font = PatternFill("solid", fgColor="12263A"), Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for index in range(1, len(headers) + 1):
+            sheet.column_dimensions[__import__("openpyxl").utils.get_column_letter(index)].width = 16
+        sheet.freeze_panes = "A4"
+
+    def xlsx_response(workbook, filename: str) -> StreamingResponse:
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/api/planning/supplier-relationships/template.xlsx")
+    def relationship_template(request: Request, supplier_id: int | None = None):
+        """The relationship page's columns; with supplier_id, that supplier's current T1 rows (edit and upload back)."""
+        current_user(request)
+        _check_supply_role(request)
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id) if supplier_id else None
+            statement = select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))
+            if supplier_id:
+                statement = statement.where(SupplierPart.supplier_id == supplier_id)
+            links = db.scalars(statement.order_by(SupplierPart.supplier_id, SupplierPart.material_id)).all() if supplier_id else []
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Relationships"
+            styled_sheet(sheet, f"Supplier/material relationship{f' · {supplier.code} {supplier.name}' if supplier else ''}",
+                         "One row per part and supplier. Needed: Supplier Code (or Supplier Name) and T1 Part Code. SOB blank = 100. A row already there is updated.",
+                         RELATIONSHIP_SHEET_COLUMNS)
+            for link in links:
+                item, who = db.get(Item, link.material_id), db.get(Supplier, link.supplier_id)
+                sheet.append([who.code, who.name, item.code, item.name, link.sob_percent, link.lead_time_days, link.moq, link.buffer_days,
+                              link.unit_price if can_price else None, link.currency])
+            if not links and supplier:
+                sheet.append([supplier.code, supplier.name])
+        return xlsx_response(workbook, f"supplier-relationships{f'-{supplier.code}' if supplier else ''}.xlsx")
+
+    def own_material_for(db: Session, supplier_id: int, item_id: int | None, tier_material_id: int | None) -> SupplierMaterial:
+        """The supplier's material master entry for a T1 / T2 / T3 code (added when missing)."""
+        column = SupplierMaterial.item_id if item_id else SupplierMaterial.tier_material_id
+        own = db.scalar(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id, column == (item_id or tier_material_id)))
+        if own:
+            return own
+        master = db.get(Item, item_id) if item_id else db.get(TierMaterial, tier_material_id)
+        if not master:
+            raise HTTPException(status_code=404, detail="Material code not found")
+        if db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.supplier_id == supplier_id, func.lower(SupplierMaterial.code) == master.code.lower())):
+            raise HTTPException(status_code=409, detail=f"{master.code} is already a code of the supplier's own material master")
+        own = SupplierMaterial(supplier_id=supplier_id, code=master.code, name=master.name, uom=master.uom or "ea",
+                               unit_price=getattr(master, "unit_cost", 0) or 0, currency=getattr(master, "currency", None) or "INR",
+                               item_id=item_id, tier_material_id=tier_material_id)
+        db.add(own)
+        db.flush()
+        return own
+
+    @app.get("/api/planning/coverage-workbook/template.xlsx")
+    def coverage_template(request: Request, supplier_id: int):
+        """Supplier-wise coverage workbook: each T1 part the supplier supplies, its BOM lines (L1-L3, quantity per
+        unit of the line above) and the suppliers of each line (T2-T4) - filled with what is saved now."""
+        current_user(request)
+        _check_supply_role(request)
+        can_price = _check_price_access(request)
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id)
+            if not supplier:
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == TOP_TIER,
+                                                          SupplierPart.material_id.is_not(None))).all()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Coverage"
+            styled_sheet(sheet, f"Supplier/material coverage · {supplier.code} {supplier.name}",
+                         "Level L1/L2/L3 = a material of the BOM (BOM qty per 1 unit of the line above; L1 per 1 part). Level T2/T3/T4 = a supplier of the line above it "
+                         "(T2 under L1, T3 under L2, T4 under L3) with SOB. T1 rows are for reading only. Uploading replaces the BOM of each part in the file.",
+                         COVERAGE_SHEET_COLUMNS)
+            mode_label = {"spot": "spot", "fixed_monthly": "fixed_monthly", "every_n_months": "every_n_months"}
+            for link in sorted(links, key=lambda l: db.get(Item, l.material_id).code):
+                item = db.get(Item, link.material_id)
+                sheet.append([item.code, item.name, "T1", item.code, item.name, 1, item.uom, supplier.code, supplier.name, link.sob_percent, link.lead_time_days,
+                              link.moq, link.buffer_days, link.price_mode, link.price_interval_months, link.unit_price if can_price else None, link.currency])
+                view = supplier_bom_view(db, supplier_id, link.material_id, can_price)
+                for line in view["lines"]:
+                    component = line["component"]
+                    sheet.append([item.code, item.name, f"L{line['depth']}", component["code"], component["name"], line["quantity"], component["uom"]])
+                    for src in line["sources"]:
+                        sheet.append([item.code, item.name, f"T{line['depth'] + 1}", component["code"], component["name"], None, component["uom"], src["sub_supplier_code"],
+                                      src["sub_supplier"], src["sob_percent"], src["lead_time_days"], src["moq"], src["buffer_days"],
+                                      mode_label.get(src["price_mode"], "spot"), src["price_interval_months"], src.get("unit_price") if can_price else None, src["currency"]])
+        return xlsx_response(workbook, f"supplier-coverage-{supplier.code}.xlsx")
+
+    @app.post("/api/planning/coverage-workbook/upload", status_code=201)
+    async def upload_coverage(request: Request, supplier_id: int):
+        """Replace the BOM (lines and their suppliers) of every T1 part in the file, for this supplier. All or nothing."""
+        current_user(request)
+        _check_supply_role(request)
+        can_price = _check_price_access(request)
+        rows = _read_supplier_part_sheet(await request.body(), COVERAGE_COLUMN_ALIASES, {"part_code", "level", "material_code"})
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id)
+            if not supplier:
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            links = {db.get(Item, link.material_id).code.casefold(): link for link in db.scalars(select(SupplierPart).where(
+                SupplierPart.supplier_id == supplier_id, SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all()}
+            items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
+            tier_codes = {code.code.casefold(): code for code in db.scalars(select(TierMaterial)).all()}
+            owns = {m.code.casefold(): m for m in db.scalars(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id)).all()}
+            register = {}
+            for who in db.scalars(select(Supplier)).all():
+                register[who.code.casefold()] = who
+                register.setdefault(who.name.strip().casefold(), who)
+
+            def text(row: dict, key: str) -> str:
+                value = row.get(key)
+                if isinstance(value, float) and value.is_integer():
+                    value = int(value)
+                return "" if value is None else str(value).strip()
+
+            def number(row: dict, key: str, default: float, row_number: int) -> float:
+                raw = text(row, key)
+                if raw == "":
+                    return default
+                try:
+                    value = float(raw.rstrip("%"))
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {key.replace('_', ' ')} must be a number") from exc
+                if not math.isfinite(value) or value < 0:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {key.replace('_', ' ')} must be zero or more")
+                return value
+
+            plan: dict[int, list[dict]] = {}  # link id -> lines (each with sources)
+            part_code = ""
+            last_line: dict[tuple[int, int], dict] = {}  # (link id, depth) -> last line at that depth
+            for row in rows:
+                row_number = row["_excel_row"]
+                part_code = text(row, "part_code") or part_code
+                level = text(row, "level").upper().replace(" ", "").replace("BOM", "")
+                if not part_code:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: T1 Part Code is missing")
+                link = links.get(part_code.casefold())
+                if not link:
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: {part_code} is not a part {supplier.name} supplies; add it in Supplier/material relationship first")
+                lines = plan.setdefault(link.id, [])
+                if level == "T1":
+                    continue  # for reading only
+                match = re.fullmatch(r"([LT])([1-4])", level)
+                if not match or (match.group(1) == "L" and match.group(2) == "4") or (match.group(1) == "T" and match.group(2) == "1"):
+                    raise HTTPException(status_code=422, detail=f"Row {row_number}: Level must be L1, L2, L3 (a material) or T2, T3, T4 (its supplier)")
+                depth = int(match.group(2))
+                code = text(row, "material_code")
+                if match.group(1) == "L":
+                    if not code:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: Material code is missing")
+                    quantity = number(row, "quantity", 0, row_number)
+                    if quantity <= 0:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: BOM qty must be more than 0")
+                    parent = None
+                    if depth > 1:
+                        parent = last_line.get((link.id, depth - 1))
+                        if parent is None:
+                            raise HTTPException(status_code=422, detail=f"Row {row_number}: an L{depth} line must come after the L{depth - 1} line it belongs to")
+                    found = items.get(code.casefold()) or tier_codes.get(code.casefold()) or owns.get(code.casefold())
+                    if not found:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is not in the T1, T2 or T3 Material Master")
+                    siblings = parent["children"] if parent else lines
+                    if any(other["code"].casefold() == code.casefold() for other in siblings):
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {code} is repeated at the same place in the BOM of {part_code}")
+                    line = {"code": code, "found": found, "quantity": quantity, "sources": [], "children": [], "row": row_number}
+                    siblings.append(line)
+                    last_line[(link.id, depth)] = line
+                    for deeper in range(depth + 1, 4):
+                        last_line.pop((link.id, deeper), None)
+                else:
+                    line = last_line.get((link.id, depth - 1))
+                    if line is None:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: a T{depth} supplier must come after the L{depth - 1} material it supplies")
+                    if code and code.casefold() != line["code"].casefold():
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: a T{depth} row supplies the line above ({line['code']}); its material code must be {line['code']} or blank")
+                    who_key = text(row, "supplier_code") or text(row, "supplier_name")
+                    who = register.get(who_key.casefold()) if who_key else None
+                    if who is None:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: supplier {who_key or '(blank)'} is not in the Supplier register" if who_key else f"Row {row_number}: Supplier Code is missing")
+                    if any(src["supplier"].id == who.id for src in line["sources"]):
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: {who.name} is repeated as a supplier of {line['code']}")
+                    sob = number(row, "sob_percent", 100, row_number)
+                    if sob <= 1 and text(row, "sob_percent") and "%" not in text(row, "sob_percent") and sob > 0 and isinstance(row.get("sob_percent"), float):
+                        sob *= 100  # Excel percent cell (0.3 = 30%)
+                    if not 0 < sob <= 100:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB must be more than 0 and at most 100")
+                    if sum(src["sob_percent"] for src in line["sources"]) + sob > 100.0001:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: SOB of the suppliers of {line['code']} adds up to more than 100%")
+                    price = number(row, "unit_price", 0, row_number)
+                    if price and not can_price:
+                        raise HTTPException(status_code=403, detail="Price access is required to upload prices")
+                    mode = text(row, "price_mode") or "spot"
+                    mode = {"spot": "spot", "fixed monthly": "fixed_monthly", "fixed_monthly": "fixed_monthly", "every n months": "every_n_months", "every_n_months": "every_n_months"}.get(mode.lower())
+                    if not mode:
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: Price mode must be spot, fixed_monthly or every_n_months")
+                    currency = (text(row, "currency") or "INR").upper()
+                    if not re.fullmatch(r"[A-Z]{3}", currency):
+                        raise HTTPException(status_code=422, detail=f"Row {row_number}: Currency must be a 3-letter code such as INR")
+                    line["sources"].append({"supplier": who, "depth": depth, "sob_percent": sob, "unit_price": price, "currency": currency, "price_mode": mode,
+                                            "lead_time_days": int(number(row, "lead_time_days", 0, row_number)), "moq": number(row, "moq", 0, row_number),
+                                            "buffer_days": int(number(row, "buffer_days", 0, row_number)),
+                                            "price_interval_months": max(1, int(number(row, "price_interval_months", 1, row_number)))})
+            if not plan:
+                raise HTTPException(status_code=422, detail="The sheet has no rows for this supplier's parts")
+            counts = {"parts": 0, "lines": 0, "suppliers": 0}
+            for link_id, lines in plan.items():
+                link = db.get(SupplierPart, link_id)
+                old = db.scalars(select(SupplierBOMLine.id).where(SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLine.product_material_id == link.material_id)).all()
+                if old:
+                    db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id.in_(old)))
+                    db.execute(sa_update(SupplierBOMLine).where(SupplierBOMLine.id.in_(old)).values(parent_line_id=None))
+                    db.execute(delete(SupplierBOMLine).where(SupplierBOMLine.id.in_(old)))
+                counts["parts"] += 1
+
+                def save(entries: list[dict], parent_id: int | None) -> None:
+                    for entry in entries:
+                        found = entry["found"]
+                        if isinstance(found, SupplierMaterial):
+                            own = found
+                        else:
+                            own = own_material_for(db, supplier_id, found.id if isinstance(found, Item) else None, found.id if isinstance(found, TierMaterial) else None)
+                        line = SupplierBOMLine(supplier_id=supplier_id, product_material_id=link.material_id, parent_line_id=parent_id,
+                                               supplier_material_id=own.id, quantity=entry["quantity"])
+                        db.add(line)
+                        db.flush()
+                        counts["lines"] += 1
+                        for src in entry["sources"]:
+                            who = src.pop("supplier")
+                            depth = src.pop("depth")
+                            db.add(SupplierBOMLineSource(line_id=line.id, sub_supplier_id=who.id, **src))
+                            add_supplier_tier(who, f"T{depth}")
+                            counts["suppliers"] += 1
+                        save(entry["children"], line.id)
+                save(lines, None)
+            db.commit()
+            return counts
+
     def coverage_link(db: Session, link_id: int) -> SupplierPart:
         link = db.get(SupplierPart, link_id)
         if not link or link.tier != TOP_TIER or not link.material_id:
@@ -4483,20 +4751,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 if not own or own.supplier_id != supplier_id:
                     raise HTTPException(status_code=422, detail="Material is not in this supplier's material master")
             else:
-                column = SupplierMaterial.item_id if payload.item_id else SupplierMaterial.tier_material_id
-                code_id = payload.item_id or payload.tier_material_id
-                own = db.scalar(select(SupplierMaterial).where(SupplierMaterial.supplier_id == supplier_id, column == code_id))
-                if not own:
-                    master = db.get(Item, code_id) if payload.item_id else db.get(TierMaterial, code_id)
-                    if not master:
-                        raise HTTPException(status_code=404, detail="Material code not found")
-                    if db.scalar(select(SupplierMaterial.id).where(SupplierMaterial.supplier_id == supplier_id, func.lower(SupplierMaterial.code) == master.code.lower())):
-                        raise HTTPException(status_code=409, detail=f"{master.code} is already a code of the supplier's own material master")
-                    own = SupplierMaterial(supplier_id=supplier_id, code=master.code, name=master.name, uom=master.uom or "ea",
-                                           unit_price=getattr(master, "unit_cost", 0) or 0, currency=getattr(master, "currency", None) or "INR",
-                                           item_id=payload.item_id, tier_material_id=payload.tier_material_id)
-                    db.add(own)
-                    db.flush()
+                own = own_material_for(db, supplier_id, payload.item_id, payload.tier_material_id)
             if payload.parent_line_id is not None:
                 parent = db.get(SupplierBOMLine, payload.parent_line_id)
                 if not parent or parent.supplier_id != supplier_id or parent.product_material_id != link.material_id:

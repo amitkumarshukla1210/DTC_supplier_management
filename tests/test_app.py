@@ -2069,6 +2069,92 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(api.delete(f"/api/planning/materials/{mat101}").status_code, 204)
         self.assertEqual(sqlite3.connect(Path(self.temp_dir.name) / "test.db").execute("SELECT COUNT(*) FROM material_requests WHERE item_id = ?", (mat101,)).fetchone()[0], 0)
 
+    def test_relationship_and_supplier_wise_coverage_excel(self):
+        api = self.client
+        xlsx_type = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+
+        def book(headers, rows, title=True):
+            workbook = Workbook()
+            sheet = workbook.active
+            if title:
+                sheet.append(["My sheet"])
+            sheet.append(list(headers))
+            for row in rows:
+                sheet.append(list(row))
+            content = io.BytesIO()
+            workbook.save(content)
+            return content.getvalue()
+
+        beam = api.post("/api/planning/materials", json={"code": "XL-BEAM", "name": "Base Front Beam", "uom": "Nos"}).json()["id"]
+        api.post("/api/planning/materials", json={"code": "XL-BRKT", "name": "Bracket", "uom": "Nos"})
+        api.post("/api/planning/tier-materials", json={"tier": "T2", "code": "XL-STEEL", "name": "STEEL0.7", "uom": "kg"})
+        for code, name in (("XL-ORE", "Iron ore"), ("XL-COAL", "Coal")):
+            api.post("/api/planning/tier-materials", json={"tier": "T3", "code": code, "name": name, "uom": "kg"})
+        sup = lambda code, name: api.post("/api/suppliers", json={"code": code, "name": name, "category": "Sheet Metal", "country": "India"}).json()
+        savera = sup("XL-1013", "XL Savera")
+        for code, name in (("XL-1004", "XL JGI"), ("XL-1014", "XL TATA"), ("XL-1030", "XL XYZ"), ("XL-1031", "XL ABC")):
+            sup(code, name)
+        # 1. relationship sheet with the screen's columns
+        columns = ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Lead time", "MOQ", "Buffer days", "Unit price", "Currency"]
+        up = api.post("/api/planning/supplier-parts/upload", headers=xlsx_type, content=book(columns, [
+            ["XL-1013", "any label", "XL-BEAM", "Base Front Beam", 60, 15, 100, 5, 85, "INR"], ["XL-1013", "", "XL-BRKT", "", 100, 7, 0, 0, 20, "INR"]]))
+        self.assertEqual(up.status_code, 201, up.text)
+        links = {r["material_code"]: r for r in api.get("/api/planning/supplier-parts", params={"supplier_id": savera["id"]}).json()["items"]}
+        self.assertEqual((links["XL-BEAM"]["supplier_name"], links["XL-BEAM"]["sob_percent"], links["XL-BEAM"]["lead_time_days"], links["XL-BEAM"]["moq"], links["XL-BEAM"]["buffer_days"], links["XL-BEAM"]["unit_price"], links["XL-BEAM"]["tier"]),
+                         ("XL Savera", 60, 15, 100, 5, 85, "T1"))
+        bad = api.post("/api/planning/supplier-parts/upload", headers=xlsx_type, content=book(columns, [["XL-9999", "", "XL-BEAM", "", 10, 0, 0, 0, 0, "INR"]]))
+        self.assertIn("XL-9999 is not in the Supplier register", bad.json()["detail"])
+        template = load_workbook(io.BytesIO(api.get("/api/planning/supplier-relationships/template.xlsx", params={"supplier_id": savera["id"]}).content)).active
+        self.assertEqual([c.value for c in template[3]], columns)
+        self.assertEqual([[c.value for c in row][:5] for row in template.iter_rows(min_row=4)], [["XL-1013", "XL Savera", "XL-BEAM", "Base Front Beam", 60], ["XL-1013", "XL Savera", "XL-BRKT", "Bracket", 100]])
+        # 2. supplier-wise coverage: beam needs 2 kg steel (JGI 30% as an Excel percent, TATA 70);
+        #    per kg steel 1.7 ore (XYZ) and 0.6 coal (ABC); bracket has no BOM
+        cov = ["T1 Part Code", "T1 Part Name", "Level", "Material code", "Material name", "BOM qty", "Unit", "Supplier Code", "Supplier Name", "SOB %", "Lead time days", "MOQ", "Buffer days", "Price mode", "Price interval months", "Unit price", "Currency"]
+        sheet_rows = [
+            ["XL-BEAM", "Base Front Beam", "T1", "XL-BEAM", "", 1, "Nos", "XL-1013", "", 60],
+            ["XL-BEAM", "", "L1", "XL-STEEL", "", 2, "kg"],
+            ["", "", "T2", "XL-STEEL", "", None, "", "XL-1004", "", 0.3, 10, 5000, 7, "fixed_monthly", 1, 74, "INR"],
+            ["", "", "T2", "", "", None, "", "", "XL TATA", 70, 20, None, None, "spot", None, 72, "INR"],
+            ["", "", "L2", "XL-ORE", "", 1.7, "kg"],
+            ["", "", "T3", "", "", None, "", "XL-1030", "", 100],
+            ["", "", "L2", "XL-COAL", "", 0.6, "kg"],
+            ["", "", "T3", "", "", None, "", "XL-1031", "", None],
+        ]
+        loaded = api.post(f"/api/planning/coverage-workbook/upload?supplier_id={savera['id']}", headers=xlsx_type, content=book(cov, sheet_rows))
+        self.assertEqual(loaded.status_code, 201, loaded.text)
+        self.assertEqual(loaded.json(), {"parts": 1, "lines": 3, "suppliers": 4})
+        view = api.get(f"/api/planning/supplier-coverage/{links['XL-BEAM']['id']}").json()
+        got = [(l["depth"], l["component"]["code"], l["quantity"], [(s["sub_supplier"], s["sob_percent"], s["lead_time_days"]) for s in l["sources"]]) for l in view["lines"]]
+        self.assertEqual(got, [(1, "XL-STEEL", 2, [("XL JGI", 30, 10), ("XL TATA", 70, 20)]), (2, "XL-ORE", 1.7, [("XL XYZ", 100, 0)]), (2, "XL-COAL", 0.6, [("XL ABC", 100, 0)])])
+        jgi_src = view["lines"][0]["sources"][0]
+        self.assertEqual((jgi_src["moq"], jgi_src["buffer_days"], jgi_src["price_mode"], jgi_src["unit_price"]), (5000, 7, "fixed_monthly", 74))
+        self.assertIn("T3", next(s for s in api.get("/api/suppliers").json() if s["code"] == "XL-1030")["tiers"])  # added to the T3 tier
+        # the template gives back what is saved, so it can be edited and uploaded again
+        back = load_workbook(io.BytesIO(api.get("/api/planning/coverage-workbook/template.xlsx", params={"supplier_id": savera["id"]}).content)).active
+        self.assertEqual([c.value for c in back[3]], cov)
+        levels = [(row[0].value, row[2].value, row[3].value, row[5].value, row[7].value, row[9].value) for row in back.iter_rows(min_row=4)]
+        self.assertEqual(levels, [("XL-BEAM", "T1", "XL-BEAM", 1, "XL-1013", 60), ("XL-BEAM", "L1", "XL-STEEL", 2, None, None), ("XL-BEAM", "T2", "XL-STEEL", None, "XL-1004", 30),
+                                  ("XL-BEAM", "T2", "XL-STEEL", None, "XL-1014", 70), ("XL-BEAM", "L2", "XL-ORE", 1.7, None, None), ("XL-BEAM", "T3", "XL-ORE", None, "XL-1030", 100),
+                                  ("XL-BEAM", "L2", "XL-COAL", 0.6, None, None), ("XL-BEAM", "T3", "XL-COAL", None, "XL-1031", 100), ("XL-BRKT", "T1", "XL-BRKT", 1, "XL-1013", 100)])
+        # errors name the row; nothing is saved
+        def refused(rows):
+            answer = api.post(f"/api/planning/coverage-workbook/upload?supplier_id={savera['id']}", headers=xlsx_type, content=book(cov, rows))
+            self.assertEqual(answer.status_code, 422, answer.text)
+            return answer.json()["detail"]
+        self.assertIn("Row 3: an L2 line must come after the L1 line", refused([["XL-BEAM", "", "L2", "XL-ORE", "", 1]]))
+        self.assertIn("Row 3: a T3 supplier must come after the L2 material", refused([["XL-BEAM", "", "T3", "", "", None, "", "XL-1030"]]))
+        self.assertIn("is not a part XL Savera supplies", refused([["XL-OTHER", "", "L1", "XL-STEEL", "", 1]]))
+        # a new L1 line closes the L2 lines of the one before: a T3 right after it has no L2 to supply
+        self.assertIn("Row 6: a T3 supplier must come after the L2 material", refused([["XL-BEAM", "", "L1", "XL-STEEL", "", 2], ["", "", "L2", "XL-ORE", "", 1.7],
+                                                                                      ["", "", "L1", "XL-COAL", "", 1], ["", "", "T3", "", "", None, "", "XL-1030"]]))
+        self.assertIn("adds up to more than 100%", refused([["XL-BEAM", "", "L1", "XL-STEEL", "", 2], ["", "", "T2", "", "", None, "", "XL-1004", "", 60], ["", "", "T2", "", "", None, "", "XL-1014", "", 50]]))
+        self.assertIn("must be XL-STEEL or blank", refused([["XL-BEAM", "", "L1", "XL-STEEL", "", 2], ["", "", "T2", "XL-ORE", "", None, "", "XL-1004", "", 60]]))
+        self.assertEqual(len(api.get(f"/api/planning/supplier-coverage/{links['XL-BEAM']['id']}").json()["lines"]), 3)
+        # uploading again replaces that part's BOM
+        again = api.post(f"/api/planning/coverage-workbook/upload?supplier_id={savera['id']}", headers=xlsx_type, content=book(cov, [["XL-BEAM", "", "L1", "XL-STEEL", "", 2.5]]))
+        self.assertEqual(again.json(), {"parts": 1, "lines": 1, "suppliers": 0})
+        self.assertEqual([(l["component"]["code"], l["quantity"]) for l in api.get(f"/api/planning/supplier-coverage/{links['XL-BEAM']['id']}").json()["lines"]], [("XL-STEEL", 2.5)])
+
     def test_supplier_coverage_part_bom_with_t2_suppliers(self):
         # The user's example: Savera supplies Base Front Beam (T1, 60%); 1 beam needs 2 kg steel
         # FL001STEEL0.7 (a T2 Material Master code) bought from JGI 30% and TATA 70%.

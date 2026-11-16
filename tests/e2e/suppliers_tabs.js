@@ -51,23 +51,25 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click("#supplierEditForm button");
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Spare Supplier Two"));
   check("Edit a supplier (name, approval)", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two")').textContent()).includes("On hold"));
-  // three Supplier Master tabs; Add supplier in the T2 tab makes a T2 supplier
-  const tierTabs = await page.locator("[data-supplier-tier-tab]").allTextContents();
-  check("Supplier register has T1 / T2 / T3 Supplier Master tabs", tierTabs.length === 3 && tierTabs[0].startsWith("T1 Supplier Master") && tierTabs[1].startsWith("T2 Supplier Master") && tierTabs[2].startsWith("T3 Supplier Master"), JSON.stringify(tierTabs));
-  await page.click('[data-supplier-tier-tab="T2"]');
-  await page.waitForSelector('[data-supplier-tier-tab="T2"].active');
+  // one Supplier Master page for T1, T2 and T3; a T2 supplier is ticked in Add supplier
+  check("One supplier page: no T1 / T2 / T3 tabs; heading counts the tiers", (await page.locator("[data-supplier-tier-tab]").count()) === 0 && /Supplier Master \(T1 \d+ · T2 \d+ · T3 \d+\)/.test(await page.locator("#pageContent").textContent()));
   await page.click('[data-action="new-supplier"]');
   await page.waitForSelector('#modalForm [name="tiers"]');
-  check("Add supplier in the T2 tab ticks T2", JSON.stringify(await page.locator('#modalForm [name="tiers"]:checked').evaluateAll((boxes) => boxes.map((b) => b.value))) === JSON.stringify(["T2"]));
+  check("Add supplier ticks T1 by default", JSON.stringify(await page.locator('#modalForm [name="tiers"]:checked').evaluateAll((boxes) => boxes.map((b) => b.value))) === JSON.stringify(["T1"]));
+  await page.uncheck('#modalForm [name="tiers"][value="T1"]');
+  await page.check('#modalForm [name="tiers"][value="T2"]');
   await page.fill('#modalForm [name="name"]', "ST Samicon");
   await page.selectOption("#modalForm #categorySelect", "Electronic Child Part");
   await page.fill('#modalForm [name="country"]', "India");
   await page.click("#modalForm .modal-footer button");
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Samicon"));
-  check("T2 supplier listed in the T2 tab with its tier", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Samicon") td').nth(2).textContent()) === "T2");
-  await page.click('[data-supplier-tier-tab="T1"]');
-  await page.waitForSelector('[data-supplier-tier-tab="T1"].active');
-  check("...and not in the T1 tab", !(await page.locator("#supplierRegisterTable").textContent()).includes("ST Samicon"));
+  check("T2 supplier listed in the same list with its tier", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Samicon") td').nth(2).textContent()) === "T2");
+  const tierFilter = page.locator("#supplierRegisterTable thead th").nth(2);
+  await tierFilter.locator("summary").click();
+  await tierFilter.locator('[data-column-value][value="T2"]').check();
+  await tierFilter.locator("[data-column-apply]").click();
+  check("Tiers filter shows T2 suppliers only", (await page.locator("#supplierRegisterTable tbody tr:visible").count()) === 1);
+  await page.click('[data-action="clear-table-filters"]');
   // change the supplier code; a used code is refused
   await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-edit-supplier]').click();
   await page.fill('#supplierEditForm [name="code"]', "SUP-1001");
@@ -96,7 +98,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Upload section on the relationship page: upload row, then + Add row / Save all, then the table", await page.evaluate(() => {
     const form = document.querySelector("#supplierPartUploadForm"), table = document.querySelector("#relEntryTable"), add = document.querySelector("#relAddRow");
     return form && form.closest("section") === table.closest("section") && !!(form.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(add.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
-  }) && await page.locator('#supplierPartUploadForm a[href="/api/planning/templates/supplier-parts.xlsx"]').isVisible());
+  }) && await page.locator('#supplierPartUploadForm a[href="/api/planning/supplier-relationships/template.xlsx"]').isVisible());
   // chain typing table: T1 block | T2 block | T3 block | terms of the last supplier
   check("Entry is a table row with every field as a column", (await page.locator("#relEntryTable thead th").count()) === 11 && (await page.locator("#relEntryTable tbody tr").count()) === 1);
   const relHeads = await page.locator("#relEntryTable thead th summary").allTextContents();

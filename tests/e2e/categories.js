@@ -65,7 +65,7 @@ const MY_LIST = ["Raw material", "Finished assembly", "Electrical components", "
   await page.selectOption("#modalForm #categorySelect", "Wire Harness");
   await page.fill('#modalForm [name="country"]', "India");
   await page.click("#modalForm .modal-footer button");
-  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable").textContent.includes("CAT Harness Works"));
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("CAT Harness Works"));
   check("Supplier added with category Wire Harness", (await page.locator('#supplierRegisterTable tbody tr:has-text("CAT Harness Works")').textContent()).includes("Wire Harness"));
   await page.locator('#supplierRegisterTable tbody tr:has-text("Koyo") [data-edit-supplier]').click();
   await page.waitForSelector("#supplierEditForm #categorySelect");
