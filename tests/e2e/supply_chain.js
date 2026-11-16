@@ -25,6 +25,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const steel = (await api("POST", "/api/planning/tier-materials", { tier: "T2", code: "FL001STEEL0.7", name: "STEEL0.7", uom: "kg" })).id;
   const sup = async (code, name) => (await api("POST", "/api/suppliers", { code, name, category: "Sheet Metal", country: "India" })).id;
   const supangita = await sup("SUP-2007", "Supangita"), savera = await sup("SUP-2013", "Savera"), jgi = await sup("SUP-2004", "JGI STEEL"), tata = await sup("SUP-2014", "TATA Steel");
+  await sup("SUP-2020", "Steel Trader");
   const t1 = (supplier, sob, price) => ({ supplier_id: supplier, material_id: beam, sob_percent: sob, unit_price: price });
   const t2 = (supplier, sob, price) => ({ supplier_id: supplier, tier_material_id: steel, sob_percent: sob, unit_price: price });
   const saved = await api("POST", "/api/planning/supplier-chain/rows", { rows: [
@@ -44,8 +45,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // expected, worked out from the sheet: the part, then its T1 suppliers by name (Savera < Supangita), each with its T2 by name (JGI < TATA);
   // T1 rows carry no terms (the terms were typed for the T2 at the end of each row)
   const expected = [[0, "UF220BFB010", "2 T1 suppliers", "", "100%", "", ""],
-    [1, "UF220BFB010", "Savera", "", "60%", "0 days", "Edit T1"], [2, "UF220BFB010", "Savera", "JGI STEEL", "30%", "12 days", "Edit T2"], [2, "UF220BFB010", "Savera", "TATA Steel", "70%", "20 days", "Edit T2"],
-    [1, "UF220BFB010", "Supangita", "", "40%", "0 days", "Edit T1"], [2, "UF220BFB010", "Supangita", "JGI STEEL", "30%", "12 days", "Edit T2"], [2, "UF220BFB010", "Supangita", "TATA Steel", "70%", "20 days", "Edit T2"]];
+    [1, "UF220BFB010", "Savera", "", "60%", "0 days", "Edit T1+ Add T2"], [2, "UF220BFB010", "Savera", "JGI STEEL", "30%", "12 days", "Edit T2+ Add T3"], [2, "UF220BFB010", "Savera", "TATA Steel", "70%", "20 days", "Edit T2+ Add T3"],
+    [1, "UF220BFB010", "Supangita", "", "40%", "0 days", "Edit T1+ Add T2"], [2, "UF220BFB010", "Supangita", "JGI STEEL", "30%", "12 days", "Edit T2+ Add T3"], [2, "UF220BFB010", "Supangita", "TATA Steel", "70%", "20 days", "Edit T2+ Add T3"]];
   check("Coverage tree matches the sheet: part -> T1 suppliers (SOB) -> T2 suppliers (SOB), each level with its own SOB and terms", JSON.stringify(rows) === JSON.stringify(expected), JSON.stringify(rows));
   const fade = await page.locator("#supplierPartTable tbody tr").evaluateAll((trs) => trs.slice(0, 3).map((tr) => [tr.cells[1].classList.contains("chain-repeat"), tr.cells[4].classList.contains("chain-repeat")]));
   check("Parent values repeat faded (T1 row: part faded; T2 row: part and T1 supplier faded)", JSON.stringify(fade) === JSON.stringify([[false, false], [true, false], [true, true]]), JSON.stringify(fade));
@@ -104,6 +105,37 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForFunction(() => document.querySelectorAll("#supplierPartTable tbody tr")[3]?.cells[13].textContent === "60%");
   const after = await api("GET", "/api/planning/supplier-chain");
   check("Edited T2 stays under the same T1 part (Savera) and Supangita's TATA is unchanged", after.items[1].t1.supplier_name === "Savera" && after.items[1].t2.sob_percent === 60 && after.items[3].t2.sob_percent === 70, JSON.stringify(after.items.map((r) => [r.t1.supplier_name, r.t2.supplier_name, r.t2.sob_percent])));
+
+  // "+ Add T2" on a T1 row: a further steel supplier under Savera's beam, linked to that T1
+  const saveraRow = () => page.locator('#supplierPartTable tbody tr[data-tree-depth="1"]', { hasText: "Savera" });
+  const addT2 = async () => {
+    await saveraRow().locator("[data-add-under-part]").click();
+    await page.waitForSelector("#underTable tbody tr");
+    const row = page.locator("#underTable tbody tr").first();
+    await row.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2020");
+    await row.locator('[data-pick-key="material"][data-pick-part="code"]').fill("FL001STEEL0.7");
+    await page.waitForFunction(() => document.querySelector('#underTable [data-row-tier-material="material"]').value !== "");
+    return row;
+  };
+  check("T1 rows have + Add T2, T2 rows have + Add T3", (await saveraRow().locator("[data-add-under-part]").textContent()) === "+ Add T2" && (await page.locator('#supplierPartTable tbody tr[data-tree-depth="2"] [data-add-under-part]').first().textContent()) === "+ Add T3");
+  let row = await addT2();
+  // Savera's steel: JGI 30% + TATA 60% (edited above) = 90% -> 10% left
+  check("The window lists the T2 suppliers already there and the SOB left", (await page.locator("#modalBody").textContent()).includes("SOB left: 10%"), await page.locator("#modalBody p").textContent());
+  await row.locator('[data-f="sob_percent"]').fill("20");
+  await page.evaluate(() => { document.querySelector("#toast").textContent = ""; });
+  await page.click("#underSave");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("Row 1"));
+  check("Too much SOB says how much is left", (await page.locator("#toast").textContent()).includes("at most 10% is left"), await page.locator("#toast").textContent());
+  row = page.locator("#underTable tbody tr").first();
+  if (!(await page.locator("#underTable").count())) row = await addT2();
+  await row.locator('[data-f="sob_percent"]').fill("10");
+  await row.locator('[data-f="lead_time_days"]').fill("25");
+  await page.click("#underSave");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("added under Savera"));
+  await page.waitForSelector('#supplierPartTable tbody tr:has-text("Steel Trader")');
+  const trader = (await api("GET", "/api/planning/supplier-chain?search=Steel Trader")).items.find((r) => r.t2 && r.t2.supplier_name === "Steel Trader");
+  check("Added as T2 under Savera's beam (10%, lead 25)", trader && trader.t1.supplier_name === "Savera" && trader.t2.tier === "T2" && trader.t2.sob_percent === 10 && trader.t2.lead_time_days === 25 && trader.t2.parent_link_id === trader.t1.id, JSON.stringify(trader?.t2));
+  check("Not added under Supangita", !(await api("GET", "/api/planning/supplier-chain?search=Steel Trader")).items.some((r) => r.t1?.supplier_name === "Supangita" && r.t2?.supplier_name === "Steel Trader"));
 
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();

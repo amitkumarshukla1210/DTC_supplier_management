@@ -3314,7 +3314,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             same_route.append(SupplierPart.id != exclude_id)
         share_total = db.scalar(select(func.coalesce(func.sum(SupplierPart.sob_percent), 0)).where(*same_route)) or 0
         if share_total + float(values.get("sob_percent", 100)) > 100 + 1e-9:
-            raise HTTPException(status_code=422, detail="Supplier SOB cannot exceed 100% within the same material tier and parent supplier")
+            left = max(0.0, 100 - share_total)
+            raise HTTPException(status_code=422, detail=f"Supplier SOB cannot exceed 100% within the same material tier and parent supplier: other suppliers already have {share_total:g}%, so at most {left:g}% is left. Lower another supplier's SOB first (Edit)")
         if db.scalar(select(SupplierPart.id).where(*same_route, SupplierPart.supplier_id == values["supplier_id"]).limit(1)):
             raise HTTPException(status_code=409, detail=f"{material.code} with this supplier, tier and parent already exists")
         return values

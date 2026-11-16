@@ -1163,6 +1163,8 @@ async function loadSupplierPartPage(offset = 0, search = state.supplierSearch) {
   const terms = (link) => `<td>${number(link.sob_percent, 1)}%</td><td>${number(link.lead_time_days, 0)} days</td><td>${number(link.moq)}</td><td>${number(link.buffer_days, 0)} days</td><td>${esc(modeLabel[link.price_mode] || link.price_mode)}</td><td>${esc(link.price_status)}</td><td>${price(link)}</td><td>${priced ? esc(link.currency || "") : ""}</td>`;
   const toggle = (open = true) => `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="${open}">${open ? "−" : "+"}</button>`;
   const edit = (link, tier) => `<button class="text-button" data-edit-supplier-part="${link.id}">Edit ${tier}</button>`;
+  // add a supplier one level below this relationship (e.g. a 2nd steel supplier for Supangita's beam)
+  const addUnder = (link, tier) => `<button class="text-button" data-add-under-part="${link.id}">+ Add ${tier}</button>`;
   // children per node, to know which rows get a +/- and the part summary (T1 suppliers, total SOB)
   const t1ByPart = new Map(), hasChild = new Set();
   result.items.forEach((row) => {
@@ -1186,12 +1188,12 @@ async function loadSupplierPartPage(offset = 0, search = state.supplierSearch) {
     }
     if (t1 && !seen.has(`1:${t1.id}`)) {
       seen.add(`1:${t1.id}`);
-      html.push(`<tr class="${hasChild.has(`1:${t1.id}`) ? "tree-has-children" : ""}" data-tree-depth="1"><td class="tree-toggle-cell">${hasChild.has(`1:${t1.id}`) ? toggle() : ""}</td>${t1Cells(t1, faded)}${blank(8)}${terms(t1)}<td>${edit(t1, "T1")}</td></tr>`);
+      html.push(`<tr class="${hasChild.has(`1:${t1.id}`) ? "tree-has-children" : ""}" data-tree-depth="1"><td class="tree-toggle-cell">${hasChild.has(`1:${t1.id}`) ? toggle() : ""}</td>${t1Cells(t1, faded)}${blank(8)}${terms(t1)}<td>${edit(t1, "T1")}${addUnder(t1, "T2")}</td></tr>`);
     }
     if (t2 && !seen.has(`2:${t1?.id}:${t2.id}`)) {
       seen.add(`2:${t1?.id}:${t2.id}`);
       const open = hasChild.has(`2:${t1?.id}:${t2.id}`);
-      html.push(`<tr class="${open ? "tree-has-children" : ""}" data-tree-depth="2"><td class="tree-toggle-cell">${open ? toggle() : ""}</td>${t1 ? t1Cells(t1, faded, faded) : blank(4)}${tierCells(t2)}${blank(4)}${terms(t2)}<td>${edit(t2, "T2")}</td></tr>`);
+      html.push(`<tr class="${open ? "tree-has-children" : ""}" data-tree-depth="2"><td class="tree-toggle-cell">${open ? toggle() : ""}</td>${t1 ? t1Cells(t1, faded, faded) : blank(4)}${tierCells(t2)}${blank(4)}${terms(t2)}<td>${edit(t2, "T2")}${addUnder(t2, "T3")}</td></tr>`);
     }
     if (t3 && !seen.has(`3:${t1?.id}:${t2?.id}:${t3.id}`)) {
       seen.add(`3:${t1?.id}:${t2?.id}:${t3.id}`);
@@ -1404,6 +1406,52 @@ function openSupplierEdit(supplier) {
 
 // Edit a saved relationship: the whole row (supplier, part, tier, parent, SOB, lead time, MOQ,
 // buffer, price, agreement) in the same one-row table as Supplier/material relationship.
+// "+ Add T2" / "+ Add T3" from the coverage tree: a new supplier under that relationship (its part)
+function underEntryRow() {
+  const priced = canSeePrices();
+  return `<tr>${entrySupplierCell("supplier")}${entryMaterialCell(true, "material")}<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" placeholder="0" /></td><td><select class="form-control" data-f="price_mode"><option value="spot">Spot</option><option value="fixed_monthly">Fixed monthly</option><option value="every_n_months">Every N months</option></select></td><td><input class="form-control" type="number" min="1" data-f="price_interval_months" value="1" /></td><td>${priced ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" placeholder="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>${entryRemoveCell}</tr>`;
+}
+function openAddUnder(parent) {
+  if (!parent) return;
+  const tier = `T${Number(String(parent.tier).replace("T", "")) + 1}`;
+  const siblings = (state.supplierParts || []).filter((link) => link.parent_link_id === parent.id);
+  const used = siblings.reduce((sum, link) => sum + Number(link.sob_percent || 0), 0);
+  $("#modalTitle").textContent = `Add ${tier} supplier under ${parent.supplier_name} · ${parent.material_code}`;
+  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">${tier} suppliers already under ${esc(parent.supplier_name)} (${esc(parent.material_code)}): ${siblings.length ? siblings.map((link) => `${esc(link.supplier_name)} ${esc(link.material_code)} ${number(link.sob_percent, 1)}%`).join(", ") : "none"}. SOB left: <strong>${number(Math.max(0, 100 - used), 1)}%</strong> (lower another supplier's SOB with its Edit first if needed). Add one or more rows.</p>${entryTable("underTable", ["Supplier code", "Supplier name", "Part code", "Part name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Price mode", "Price interval (months)", "Unit price", "Currency"])}<div class="modal-footer"><button type="button" class="button button-small" id="underAddRow">+ Add row</button><button type="button" class="button button-primary" id="underSave">Save</button></div></div>`;
+  modalLayer.hidden = false;
+  const entries = bindEntryTable("underTable", underEntryRow);
+  $("#underAddRow").addEventListener("click", () => entries.add());
+  $("#underSave").addEventListener("click", async () => {
+    const rows = [];
+    for (const [index, row] of entries.rows().entries()) {
+      const typed = (part, key) => cellValue(row, `[data-pick-key="${key}"][data-pick-part="${part}"]`).trim();
+      const supplier = Number(cellValue(row, '[data-row-supplier="supplier"]'));
+      const material = Number(cellValue(row, '[data-row-material="material"]'));
+      const tierMaterial = Number(cellValue(row, '[data-row-tier-material="material"]'));
+      if (!supplier && !material && !tierMaterial && !typed("code", "supplier") && !typed("code", "material")) continue;
+      if (!supplier) return toast(`Row ${index + 1}: pick the supplier from the hint list${typed("code", "supplier") ? ` (${typed("code", "supplier")} is not in the Supplier register)` : ""}.`, true);
+      if (!material && !tierMaterial) return toast(`Row ${index + 1}: pick the part code from the hint list${typed("code", "material") ? ` (${typed("code", "material")} is not found)` : ""}.`, true);
+      const value = (key) => cellValue(row, `[data-f="${key}"]`);
+      const count = (key) => (value(key) === "" ? 0 : Number(value(key)));
+      const body = { supplier_id: supplier, material_id: material || null, tier_material_id: tierMaterial || null, tier, parent_link_id: parent.id, parent_supplier_id: parent.supplier_id,
+        sob_percent: value("sob_percent") === "" ? 100 : Number(value("sob_percent")), lead_time_days: count("lead_time_days"), moq: count("moq"), buffer_days: count("buffer_days"),
+        price_mode: value("price_mode"), price_interval_months: Number(value("price_interval_months") || 1), currency: value("currency") };
+      if (row.querySelector('[data-f="unit_price"]')) body.unit_price = Number(value("unit_price") || 0);
+      rows.push(body);
+    }
+    if (!rows.length) return toast("Fill in at least one row.", true);
+    let saved = 0;
+    for (const [index, body] of rows.entries()) {
+      try { await api("/api/planning/supplier-parts", { method: "POST", body: JSON.stringify(body) }); saved += 1; }
+      catch (error) { toast(`Row ${index + 1}: ${error.message}${saved ? ` (${saved} row${saved === 1 ? "" : "s"} above saved)` : ""}`, true); state.suppliers = await api("/api/suppliers"); return loadSupplierPartPage(); }
+    }
+    modalLayer.hidden = true;
+    toast(`${saved} ${tier} supplier${saved === 1 ? "" : "s"} added under ${parent.supplier_name}`);
+    state.suppliers = await api("/api/suppliers");
+    loadSupplierPartPage();
+  });
+}
+
 function openSupplierPartEdit(link) {
   if (!link) return;
   $("#modalTitle").textContent = `Edit ${link.supplier_name} · ${link.material_code} (${link.tier})`;
@@ -2957,6 +3005,8 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/suppliers/${supplierDelete.dataset.deleteSupplier}`, { method: "DELETE" }); toast("Supplier deleted"); return renderSupplierControl(); }
     catch (error) { toast(error.message, true); return; }
   }
+  const addUnder = event.target.closest("[data-add-under-part]");
+  if (addUnder) return openAddUnder((state.supplierParts || []).find((link) => String(link.id) === addUnder.dataset.addUnderPart));
   const partEdit = event.target.closest("[data-edit-supplier-part]");
   if (partEdit) return openSupplierPartEdit((state.supplierParts || []).find((link) => String(link.id) === partEdit.dataset.editSupplierPart));
   const partDelete = event.target.closest("[data-delete-supplier-part]");
