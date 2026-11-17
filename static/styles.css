@@ -576,3 +576,16 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #coverageTable tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
 #coverageTable tr > td.sob-off { color: #b42318; }
 #coverageTable td { white-space: nowrap; }
+/* supply chain tree (Upload supplier stock) */
+#supplyTreeTable .tree-toggle-cell, #supplyTreeTable .tree-column-heading { width: 1%; white-space: nowrap; }
+#supplyTreeTable td { white-space: nowrap; }
+#supplyTreeTable tr.st-supplier > td { font-weight: 700; color: #12263a; background: #fff; }
+#supplyTreeTable tr.st-part > td { font-weight: 600; background: #f7fafd; }
+#supplyTreeTable tr.st-line > td { background: #f0f6fa; }
+#supplyTreeTable tr.tree-alternate > td { font-style: italic; color: #7a5a12; background: #fffaf0; }
+#supplyTreeTable tr[data-tree-depth="1"] > .tree-toggle-cell { padding-left: 24px; }
+#supplyTreeTable tr[data-tree-depth="2"] > .tree-toggle-cell { padding-left: 40px; }
+#supplyTreeTable tr[data-tree-depth="3"] > .tree-toggle-cell { padding-left: 56px; }
+#supplyTreeTable tr[data-tree-depth="4"] > .tree-toggle-cell { padding-left: 72px; }
+#supplyTreeTable tr[data-tree-depth="5"] > .tree-toggle-cell { padding-left: 88px; }
+#supplyTreeTable tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }

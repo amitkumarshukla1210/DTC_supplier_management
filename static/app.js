@@ -1214,6 +1214,30 @@ function renderCoverageTable() {
   if (note) note.textContent = hasNeed ? `${t1.supplier_name} makes ${number(t1.sob_percent, 1)}% = ${number(share, 2)} ${t1.uom || "pcs"} of ${number(Number(needed), 2)}` : "Type the requirement of the part to see the quantity of every material and supplier.";
 }
 
+// Upload supplier stock: the whole supply chain as a tree (closed to T1 suppliers at first; + / − per level,
+// Open all / Close all; search keeps the suppliers whose tree mentions the text, opened)
+function renderSupplyTree(open = false) {
+  const target = $("#supplyTreeTable");
+  const nodes = state.supplyTree || [];
+  if (!target) return;
+  const needle = ($("#supplyTreeSearch")?.value || "").trim().toLowerCase();
+  const groups = [];
+  nodes.forEach((node) => { if (node.depth === 0) groups.push([node]); else if (groups.length) groups[groups.length - 1].push(node); });
+  const shown = needle ? groups.filter((group) => group.some((node) => `${node.supplier_code || ""} ${node.supplier_name || ""} ${node.material_code || ""} ${node.material_name || ""}`.toLowerCase().includes(needle))) : groups;
+  const flat = shown.flat();
+  const hasKids = (index) => flat[index + 1] && flat[index + 1].depth > flat[index].depth;
+  const rows = flat.map((node, index) => {
+    const kids = hasKids(index);
+    const toggle = kids ? `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="${open}">${open ? "−" : "+"}</button>` : "";
+    const kind = node.depth === 0 ? "tree-has-children st-supplier" : node.level.endsWith("supplier") ? "tree-alternate st-source" : node.level === "T1 part" ? "st-part" : "st-line";
+    const material = node.depth === 0 ? `${node.parts} part${node.parts === 1 ? "" : "s"}` : esc(node.material_name || "");
+    const stockCell = (value) => (value === null || value === undefined ? "" : number(value));
+    return `<tr class="${kind}" data-tree-depth="${node.depth}" ${node.depth > 0 && !open ? "hidden" : ""}><td class="tree-toggle-cell">${toggle}</td><td>${esc(node.level)}</td><td>${esc(node.supplier_code || "")}</td><td>${esc(node.supplier_name || "")}</td><td>${node.level.endsWith("supplier") && node.depth > 0 ? "↳ " : ""}${esc(node.material_code || "")}</td><td>${material}</td><td>${node.sob_percent === null || node.sob_percent === undefined ? "" : `${number(node.sob_percent, 1)}%`}</td><td>${node.bom_qty === undefined ? "" : number(node.bom_qty, 4)}</td><td>${esc(node.uom || "")}</td><td>${stockCell(node.stock)}</td><td>${stockCell(node.available)}</td><td>${node.arrival_month ? esc(monthLabel(node.arrival_month)) : ""}</td></tr>`;
+  }).join("");
+  target.innerHTML = table(["", "Level", "Supplier Code", "Supplier Name", "Material code", "Material name", "SOB", "BOM qty", "Unit", "Stock quantity", "Available quantity", "Arrival month"], rows,
+    needle ? "No supplier or material matches this search." : "No supplier/material relationships yet.");
+}
+
 function coverageLine(id) { return state.coverage.lines.find((line) => String(line.id) === String(id)); }
 
 // + L1 / L2 / L3 material: rows of part code (T1, T2 or T3 Material Master) and quantity per unit of the line above
@@ -1849,7 +1873,7 @@ async function renderSupplierControl() {
   } else if (tab === "Supplier/material relationship") {
     const chosen = state.suppliers.find((supplier) => supplier.id === state.relSupplierId) || null;
     if (!chosen) state.relSupplierId = null;
-    body = `<nav class="crumbs"><a href="#" data-supplier-tab="Supplier register">Supplier register</a> › ${chosen ? `<strong>${esc(chosen.code)} ${esc(chosen.name)}</strong> <a href="#" class="crumb-action" data-rel-all>Show all suppliers</a>` : "<strong>All suppliers</strong>"}</nav>
+    body = `${chosen ? `<nav class="crumbs"><strong>${esc(chosen.code)} ${esc(chosen.name)}</strong> <a href="#" class="crumb-action" data-rel-all>Show all suppliers</a></nav>` : ""}
       <section class="panel table-panel">${panelHeader(`Supplier/material relationship${chosen ? ` · ${chosen.code} ${chosen.name}` : ""}`, `The parts ${chosen ? esc(chosen.name) : "each supplier"} supplies to you (T1): SOB, lead time, MOQ, buffer, price. One supplier can supply many parts; one part can have several suppliers (SOB up to 100% per part). Click the supplier or part (first 5 columns) to open its Supplier/material coverage: the part's BOM and the T2 / T3 suppliers of its materials. Type new rows below (+ Add row, Save all), or upload Excel with the same columns: Supplier Code, Supplier Name, T1 Part Code, T1 Part Name, SOB, Lead time, MOQ, Buffer days, Unit price, Currency (the template${chosen ? " has this supplier's rows: edit and upload back" : " has the columns"}). Needed: Supplier Code (or name) and T1 Part Code; a row already there is updated; the whole file is rejected if a row is wrong.`)}
         <form id="supplierPartUploadForm" class="panel-body inline-upload">
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
@@ -1860,8 +1884,12 @@ async function renderSupplierControl() {
         <div id="relListTable"><div class="tree-loading">Loading…</div></div>
       </section>`;
   } else if (tab === "Upload supplier stock") {
-    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
+    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "First the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
+      <h3 class="subtable-heading">Supply chain tree: T1 suppliers → parts → BOM materials → T2 suppliers → L2 materials → T3 suppliers</h3>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplyTreeSearch" type="search" placeholder="Search supplier or material" /></label><span class="toolbar-add"><button type="button" class="button button-small" id="supplyTreeOpen">Open all</button><button type="button" class="button button-small" id="supplyTreeClose">Close all</button></span></div>
+      <div id="supplyTreeTable" class="supply-tree"><div class="tree-loading">Loading…</div></div>
+      <h3 class="subtable-heading">Enter stock</h3>
       <form id="supplierStockForm" class="panel-body inline-upload">
         <label class="field"><span>Supplier stock workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
         <button class="button button-primary" type="submit">Upload supplier stock</button><a class="button" href="/api/planning/templates/supplier-stock.xlsx">Download template</a>
@@ -1933,7 +1961,7 @@ async function renderSupplierControl() {
         loadCoverage();
       } catch (error) { toast(error.message, true); }
     });
-    $("#covCrumbs").innerHTML = `<a href="#" data-supplier-tab="Supplier register">Supplier register</a> › <a href="#" data-open-supplier-rel="${t1.supplier_id}">${esc(t1.supplier_code)} ${esc(t1.supplier_name)}</a> › <strong>${esc(t1.material_code)} ${esc(t1.material_name)}</strong>`;
+    $("#covCrumbs").innerHTML = `<a href="#" data-open-supplier-rel="${t1.supplier_id}">${esc(t1.supplier_code)} ${esc(t1.supplier_name)}</a> › <strong>${esc(t1.material_code)} ${esc(t1.material_name)}</strong>`;
     state.covRequirement = state.covRequirement || {};
     const box = $("#covRequirement");
     if (state.covRequirement[t1.id] !== undefined) box.value = state.covRequirement[t1.id];
@@ -2012,6 +2040,18 @@ async function renderSupplierControl() {
       } catch (error) { toast(error.message, true); }
     });
     $("#stockAddRow").addEventListener("click", () => entries.add());
+    const loadTree = async () => {
+      try {
+        state.supplyTree = (await api(`/api/planning/supply-tree?${new URLSearchParams({ report_month: $("#stockMonth").value, workspace: workspaceOf() })}`)).items;
+        renderSupplyTree();
+      } catch (error) { toast(error.message, true); }
+    };
+    loadTree();
+    $("#stockMonth").addEventListener("change", loadTree);
+    content.querySelector('select[name="workspace"]')?.addEventListener("change", loadTree);
+    $("#supplyTreeOpen").addEventListener("click", () => renderSupplyTree(true));
+    $("#supplyTreeClose").addEventListener("click", () => renderSupplyTree(false));
+    $("#supplyTreeSearch").addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => renderSupplyTree(!!$("#supplyTreeSearch").value.trim()), 200); });
     $("#stockMonth").addEventListener("change", loadStockList);
     content.querySelector('select[name="workspace"]')?.addEventListener("change", loadStockList);
     $("#stockSaveAll").addEventListener("click", async () => {
@@ -2031,7 +2071,7 @@ async function renderSupplierControl() {
         const result = await api(`/api/planning/supplier-stock/${$("#stockMonth").value}?workspace=${state.workspace}`, { method: "POST", body: JSON.stringify({ rows }) });
         toast(`${result.rows} supplier stock row${result.rows === 1 ? "" : "s"} saved for ${monthLabel(result.report_month)}`);
         entries.reset();
-        loadStockList();
+        loadStockList(); loadTree();
       } catch (error) { toast(error.message, true); }
     });
     $("#supplierStockForm").addEventListener("submit", async (event) => {
@@ -2042,7 +2082,7 @@ async function renderSupplierControl() {
         const result = await uploadExcel(`/api/planning/supplier-stock/${$("#stockMonth").value}/upload?workspace=${state.workspace}`, new FormData(form).get("workbook"));
         toast(`${result.rows} supplier stock row(s) uploaded`);
         form.reset();
-        loadStockList();
+        loadStockList(); loadTree();
       } catch (error) { toast(error.message, true); }
     });
     loadStockList();

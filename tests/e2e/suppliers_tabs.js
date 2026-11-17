@@ -209,8 +209,6 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click("#covSourceSave");
   await page.waitForSelector('#coverageTable tr.cov-source:has-text("ST Samicon")');
   check("Coverage: ST-CHIP (T2 code) 3 per piece, T2 supplier ST Samicon 100%", await page.locator('#coverageTable tr.cov-source:has-text("ST Samicon")').evaluate((tr) => tr.cells[1].textContent === "T2" && tr.cells[6].textContent === "100%" && tr.cells[8].textContent === "3"));
-  await page.click('#covCrumbs a[data-supplier-tab="Supplier register"]');
-  await page.waitForSelector("#supplierRegisterTable");
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
   await page.waitForSelector('#relListTable tbody tr:has-text("ST-STEEL")');
 

@@ -5198,6 +5198,49 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"workspace": workspace, "report_month": report_month, "rows": len(payload.rows)}
 
+    @app.get("/api/planning/supply-tree")
+    def supply_tree(request: Request, report_month: str = "", workspace: str = "trial"):
+        """Every T1 supplier -> the parts it supplies you -> each part's BOM (L1-L3) and the suppliers of each
+        line (T2-T4), depth first, with the month's stock on the T1 parts (Upload supplier stock page)."""
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        month = _month_text(_month(report_month)) if report_month else _month_text(date.today())
+        with open_db() as db:
+            links = db.scalars(select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all()
+            suppliers = {who.id: who for who in db.scalars(select(Supplier)).all()}
+            items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_({link.material_id for link in links})))} if links else {}
+            stock = {row.supplier_part_id: row for row in db.scalars(select(SupplierStockSnapshot).where(
+                SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == month)).all()}
+            with_bom = set(db.execute(select(SupplierBOMLine.supplier_id, SupplierBOMLine.product_material_id).distinct()).all())
+            nodes: list[dict] = []
+            by_supplier: dict[int, list[SupplierPart]] = {}
+            for link in links:
+                by_supplier.setdefault(link.supplier_id, []).append(link)
+            for supplier_id in sorted(by_supplier, key=lambda sid: (suppliers[sid].code or "").casefold()):
+                who = suppliers[supplier_id]
+                parts = sorted(by_supplier[supplier_id], key=lambda link: items[link.material_id].code.casefold())
+                nodes.append({"depth": 0, "level": "T1 supplier", "supplier_code": who.code, "supplier_name": who.name, "parts": len(parts)})
+                for link in parts:
+                    item = items[link.material_id]
+                    snapshot = stock.get(link.id)
+                    nodes.append({"depth": 1, "level": "T1 part", "link_id": link.id, "supplier_code": who.code, "supplier_name": who.name,
+                                  "material_code": item.code, "material_name": item.name, "sob_percent": link.sob_percent, "uom": item.uom,
+                                  "stock": snapshot.quantity if snapshot else None, "available": snapshot.available_quantity if snapshot else None,
+                                  "arrival_month": snapshot.arrival_month if snapshot else None})
+                    if (supplier_id, link.material_id) not in with_bom:
+                        continue
+                    for line in supplier_bom_view(db, supplier_id, link.material_id, False)["lines"]:
+                        component = line["component"]
+                        nodes.append({"depth": line["depth"] + 1, "level": f"L{line['depth']} material", "material_code": component["code"],
+                                      "material_name": component["name"], "bom_qty": line["quantity"], "uom": component["uom"],
+                                      "sob_percent": sum(src["sob_percent"] for src in line["sources"]) if line["sources"] else None})
+                        for src in line["sources"]:
+                            nodes.append({"depth": line["depth"] + 2, "level": f"T{line['depth'] + 1} supplier", "supplier_code": src["sub_supplier_code"],
+                                          "supplier_name": src["sub_supplier"], "material_code": component["code"], "material_name": component["name"],
+                                          "sob_percent": src["sob_percent"], "uom": component["uom"], "lead_time_days": src["lead_time_days"]})
+            return {"report_month": month, "workspace": workspace, "items": nodes}
+
     @app.get("/api/planning/supplier-stock/{report_month}")
     def list_supplier_stock(report_month: str, request: Request, workspace: str = "trial"):
         current_user(request)

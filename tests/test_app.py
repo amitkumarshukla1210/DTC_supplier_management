@@ -2129,6 +2129,16 @@ class SupplierHubApiTests(unittest.TestCase):
         jgi_src = view["lines"][0]["sources"][0]
         self.assertEqual((jgi_src["moq"], jgi_src["buffer_days"], jgi_src["price_mode"], jgi_src["unit_price"]), (5000, 7, "fixed_monthly", 74))
         self.assertIn("T3", next(s for s in api.get("/api/suppliers").json() if s["code"] == "XL-1030")["tiers"])  # added to the T3 tier
+        # Upload supplier stock page: the whole tree, T1 supplier -> parts -> BOM and its suppliers, with the month's stock
+        api.post("/api/planning/supplier-stock/2026-11?workspace=trial", json={"rows": [{"supplier_part_id": links["XL-BEAM"]["id"], "quantity": 500, "available_quantity": 400}]})
+        tree = [n for n in api.get("/api/planning/supply-tree", params={"report_month": "2026-11"}).json()["items"]]
+        start = next(i for i, n in enumerate(tree) if n["depth"] == 0 and n["supplier_code"] == "XL-1013")
+        mine = tree[start:start + 10]
+        self.assertEqual([(n["depth"], n["level"], n.get("supplier_code"), n.get("material_code")) for n in mine], [
+            (0, "T1 supplier", "XL-1013", None), (1, "T1 part", "XL-1013", "XL-BEAM"), (2, "L1 material", None, "XL-STEEL"),
+            (3, "T2 supplier", "XL-1004", "XL-STEEL"), (3, "T2 supplier", "XL-1014", "XL-STEEL"), (3, "L2 material", None, "XL-ORE"),
+            (4, "T3 supplier", "XL-1030", "XL-ORE"), (3, "L2 material", None, "XL-COAL"), (4, "T3 supplier", "XL-1031", "XL-COAL"), (1, "T1 part", "XL-1013", "XL-BRKT")])
+        self.assertEqual((mine[1]["stock"], mine[1]["available"], mine[1]["sob_percent"], mine[2]["bom_qty"], mine[2]["sob_percent"], mine[9]["stock"]), (500, 400, 60, 2, 100, None))
         # the template gives back what is saved, so it can be edited and uploaded again
         back = load_workbook(io.BytesIO(api.get("/api/planning/coverage-workbook/template.xlsx", params={"supplier_id": savera["id"]}).content)).active
         self.assertEqual([c.value for c in back[3]], cov)

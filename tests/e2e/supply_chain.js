@@ -59,7 +59,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // 2. click the part: Supplier/material coverage
   await page.locator('#relListTable tbody tr:has-text("UF220BFB010") td[data-open-coverage]').nth(2).click();
   await page.waitForSelector("#coverageTable table");
-  check("Coverage page with breadcrumb register › supplier › part", (await page.locator("#covCrumbs").textContent()).replace(/\s+/g, " ").includes("Supplier register › SUP-2013 Savera › UF220BFB010 Base Front Beam"));
+  check("Coverage page with breadcrumb supplier › part", (await page.locator("#covCrumbs").textContent()).replace(/\s+/g, " ").trim().startsWith("SUP-2013 Savera › UF220BFB010 Base Front Beam"));
   check("Only the T1 row until materials are added", (await page.locator("#coverageTable tbody tr").count()) === 1);
   const fillMaterial = async (tableId, n, code, qty) => {
     if (n > 0) await page.click("#covLineAddRow");
@@ -178,8 +178,30 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);
   check("Relationship template has Savera's rows", /supplier-relationships\/template\.xlsx\?supplier_id=\d+/.test(await page.getAttribute("#relTemplate", "href")) && (await page.textContent("#relTemplate")).includes("SUP-2013"));
   await page.click("[data-rel-all]");
-  await page.waitForFunction(() => document.querySelector(".crumbs")?.textContent.includes("All suppliers"));
-  check("Show all suppliers", true);
+  await page.waitForFunction(() => !document.querySelector(".crumbs") && document.querySelector("#relListTable"));
+  check("Show all suppliers: no breadcrumb repeating the Supplier register tab", true);
+
+  // Upload supplier stock: the whole supply chain as a tree, closed to the T1 suppliers at first
+  await api("POST", `/api/planning/supplier-stock/${new Date().toISOString().slice(0, 7)}?workspace=trial`, { rows: [{ supplier_part_id: (await api("GET", "/api/planning/supplier-parts?tier=T1")).items[0].id, quantity: 500, available_quantity: 400 }] });
+  await page.click('[data-supplier-tab="Upload supplier stock"]');
+  await page.waitForSelector("#supplyTreeTable table");
+  const shownTree = () => page.locator("#supplyTreeTable tbody tr").evaluateAll((trs) => trs.filter((tr) => !tr.hidden).map((tr) => [tr.cells[1].textContent, tr.cells[3].textContent || tr.cells[4].textContent]));
+  check("Tree starts closed: only the T1 suppliers", JSON.stringify(await shownTree()) === JSON.stringify([["T1 supplier", "Savera"]]), JSON.stringify(await shownTree()));
+  await page.locator('#supplyTreeTable tr.st-supplier [data-sb-toggle]').click();
+  check("+ on Savera shows its part, and the whole branch below", (await shownTree()).length === 7);
+  await page.click("#supplyTreeClose");
+  check("Close all", (await shownTree()).length === 1);
+  await page.click("#supplyTreeOpen");
+  const all = await shownTree();
+  check("Open all: supplier -> part -> L1 steel -> T2 JGI / TATA -> L2 ore -> T3 XYZ", JSON.stringify(all) === JSON.stringify([["T1 supplier", "Savera"], ["T1 part", "Savera"], ["L1 material", "FL001STEEL0.7"], ["T2 supplier", "JGI STEEL"], ["T2 supplier", "TATA Steel"], ["L2 material", "ORE-01"], ["T3 supplier", "XYZ Mining"]]), JSON.stringify(all));
+  check("The part row shows the month's stock (500 / 400)", await page.locator("#supplyTreeTable tr.st-part").evaluate((tr) => tr.cells[9].textContent === "500" && tr.cells[10].textContent === "400"));
+  await page.locator('#supplyTreeTable tr.st-line:has-text("FL001STEEL0.7") [data-sb-toggle]').click();
+  check("− on steel closes its suppliers and L2 below", (await shownTree()).length === 3);
+  await page.fill("#supplyTreeSearch", "nothing-like-this");
+  await page.waitForFunction(() => document.querySelector("#supplyTreeTable")?.textContent.includes("No supplier or material matches"));
+  await page.fill("#supplyTreeSearch", "XYZ");
+  await page.waitForFunction(() => document.querySelectorAll("#supplyTreeTable tbody tr:not([hidden])").length === 7);
+  check("Search XYZ finds Savera's tree, opened", true);
 
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
