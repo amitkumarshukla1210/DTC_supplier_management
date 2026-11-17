@@ -2175,15 +2175,25 @@ class SupplierHubApiTests(unittest.TestCase):
         sup = lambda name: api.post("/api/suppliers", json={"name": name, "category": "Sheet Metal", "country": "India"}).json()["id"]
         savera, jgi, tata = sup("CV Savera"), sup("CV JGI Steel"), sup("CV TATA Steel")
         link = api.post("/api/planning/supplier-parts", json={"material_id": beam, "supplier_id": savera, "sob_percent": 60, "lead_time_days": 15, "unit_price": 85, "currency": "INR"}).json()["id"]
-        # T2 relationships typed earlier under this T1 part: they become the line's sources
+        # T2 relationships typed earlier (old chain page) are NOT copied into a new line: only what is typed
         for who, sob in ((jgi, 30), (tata, 70)):
             made = api.post("/api/planning/supplier-parts", json={"tier_material_id": steel, "supplier_id": who, "tier": "T2", "parent_link_id": link, "parent_supplier_id": savera, "sob_percent": sob, "lead_time_days": 10, "moq": 5000, "unit_price": 75, "currency": "INR"})
             self.assertEqual(made.status_code, 201, made.text)
         t1_only = api.get("/api/planning/supplier-parts", params={"supplier_id": savera, "tier": "T1"}).json()["items"]
         self.assertEqual([(r["material_code"], r["tier"]) for r in t1_only], [("CV-BEAM", "T1")])
-        added = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2})
+        src = lambda who, sob: {"sub_supplier_id": who, "sob_percent": sob, "lead_time_days": 10, "moq": 5000, "unit_price": 75, "currency": "INR"}
+        over = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2, "sources": [src(jgi, 30), src(tata, 80)]})
+        self.assertEqual((over.status_code, "adds up to more than 100%" in over.json()["detail"]), (422, True))
+        twice = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2, "sources": [src(jgi, 30), src(jgi, 70)]})
+        self.assertIn("entered twice", twice.json()["detail"])
+        self.assertEqual(api.get(f"/api/planning/supplier-coverage/{link}").json()["lines"], [])  # nothing saved by refused requests
+        bare = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2})
+        self.assertEqual((bare.status_code, bare.json()["sources"]), (201, 0))
+        self.assertEqual(api.get(f"/api/planning/supplier-coverage/{link}").json()["lines"][0]["sources"], [])  # earlier T2 rows not copied
+        api.delete(f"/api/planning/supplier-bom/lines/{bare.json()['id']}")
+        added = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2, "sources": [src(jgi, 30), src(tata, 70)]})
         self.assertEqual(added.status_code, 201, added.text)
-        self.assertEqual((added.json()["code"], added.json()["sources_copied"]), ("CV-STEEL0.7", 2))
+        self.assertEqual((added.json()["code"], added.json()["sources"]), ("CV-STEEL0.7", 2))
         self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 3}).status_code, 409)  # one line per code
         self.assertEqual(api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "item_id": paint, "quantity": 0.1}).status_code, 201)  # a T1 code, other unit
         view = api.get(f"/api/planning/supplier-coverage/{link}").json()

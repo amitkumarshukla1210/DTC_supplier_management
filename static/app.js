@@ -1240,37 +1240,97 @@ function renderSupplyTree(open = false) {
 
 function coverageLine(id) { return state.coverage.lines.find((line) => String(line.id) === String(id)); }
 
-// + L1 / L2 / L3 material: rows of part code (T1, T2 or T3 Material Master) and quantity per unit of the line above
+// + L1 / L2 / L3 material: each row = material, quantity, and (optional) one supplier with SOB and terms.
+// More suppliers of the same material: more rows with the same code. SOB blank = what is left (100% for
+// one supplier). If the suppliers of a material add up to less than 100%, Save first adds a row for the
+// balance (same material, SOB left) to pick its supplier; Remove it and Save again to keep less than 100%.
+const SUPPLIER_TERM_LABELS = ["SOB (%)", "Lead time (days)", "MOQ", "Buffer (days)", "Unit price", "Currency"];
+function supplierTermCells() {
+  return `<td><input class="form-control" type="number" min="0" max="100" step="0.01" data-f="sob_percent" placeholder="100" /></td><td><input class="form-control" type="number" min="0" data-f="lead_time_days" placeholder="0" /></td><td><input class="form-control" type="number" min="0" step="any" data-f="moq" placeholder="0" /></td><td><input class="form-control" type="number" min="0" data-f="buffer_days" placeholder="0" /></td><td>${canSeePrices() ? '<input class="form-control" type="number" min="0" step="0.0001" data-f="unit_price" placeholder="0" />' : '<span class="subtle">Restricted</span>'}</td><td><select class="form-control" data-f="currency">${["INR", "USD", "EUR", "GBP", "JPY"].map((c) => `<option>${c}</option>`).join("")}</select></td>`;
+}
+function supplierTerms(row) {
+  const value = (key) => cellValue(row, `[data-f="${key}"]`);
+  const out = { lead_time_days: Number(value("lead_time_days") || 0), moq: Number(value("moq") || 0), buffer_days: Number(value("buffer_days") || 0), price_mode: "spot", price_interval_months: 1, currency: value("currency") || "INR" };
+  if (row.querySelector('[data-f="unit_price"]')) out.unit_price = Number(value("unit_price") || 0);
+  return out;
+}
 function openCoverageAddLine(parentId) {
   const parent = parentId ? coverageLine(parentId) : null;
   const t1 = state.coverage.t1;
   const level = parent ? parent.depth + 1 : 1;
+  const tier = `T${level + 1}`;
   const per = parent ? `1 ${parent.component.uom || "unit"} of ${parent.component.code}` : `1 ${t1.uom || "piece"} of ${t1.material_code}`;
   $("#modalTitle").textContent = `Add L${level} material ${parent ? `under ${parent.component.code}` : `to ${t1.material_code}`}`;
-  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">The BOM of ${esc(parent ? `${parent.component.code} ${parent.component.name}` : `${t1.material_code} ${t1.material_name}`)}: each material and the quantity needed for ${esc(per)} (e.g. 2 kg steel per beam; 1.7 kg iron ore per kg steel). Codes come from your T1, T2 or T3 Material Master. Add its suppliers after saving (+ T${level + 1} supplier).</p>${entryTable("covLineTable", ["Material code", "Material name", `Quantity per ${parent ? parent.component.code : t1.material_code}`])}<div class="modal-footer"><button type="button" class="button button-small" id="covLineAddRow">+ Add row</button><button type="button" class="button button-primary" id="covLineSave">Save</button></div></div>`;
+  $("#modalBody").innerHTML = `<div class="part-edit"><p class="subtle">The BOM of ${esc(parent ? `${parent.component.code} ${parent.component.name}` : `${t1.material_code} ${t1.material_name}`)}: each material, the quantity needed for ${esc(per)} (e.g. 2 kg steel per beam; 1.7 kg iron ore per kg steel), and its ${tier} supplier with SOB (blank = 100%). Codes come from your T1, T2 or T3 Material Master. A second supplier of the same material: one more row with the same code. If the suppliers of a material add up to less than 100%, Save adds a row for the rest to pick its supplier.</p>${entryTable("covLineTable", ["Material code", "Material name", `Quantity per ${parent ? parent.component.code : t1.material_code}`, `${tier} Supplier Code`, `${tier} Supplier Name`, ...SUPPLIER_TERM_LABELS])}<div class="modal-footer"><button type="button" class="button button-small" id="covLineAddRow">+ Add row</button><button type="button" class="button button-primary" id="covLineSave">Save</button></div></div>`;
   modalLayer.hidden = false;
-  const entries = bindEntryTable("covLineTable", () => `<tr>${entryMaterialCell(true, "material")}<td><input class="form-control" type="number" min="0" step="any" data-f="quantity" placeholder="0" /></td>${entryRemoveCell}</tr>`);
+  const entries = bindEntryTable("covLineTable", () => `<tr>${entryMaterialCell(true, "material")}<td><input class="form-control" type="number" min="0" step="any" data-f="quantity" placeholder="0" /></td>${entrySupplierCell("supplier")}${supplierTermCells()}${entryRemoveCell}</tr>`);
   $("#covLineAddRow").addEventListener("click", () => entries.add());
+  let balanceOffered = false;
   $("#covLineSave").addEventListener("click", async () => {
-    const rows = [];
+    const groups = new Map();  // material -> {rows, item, quantity, sources}
     for (const [index, row] of entries.rows().entries()) {
-      const typed = cellValue(row, '[data-pick-key="material"][data-pick-part="code"]').trim();
+      const typedCode = cellValue(row, '[data-pick-key="material"][data-pick-part="code"]').trim();
       const item = Number(cellValue(row, '[data-row-material="material"]'));
       const tierItem = Number(cellValue(row, '[data-row-tier-material="material"]'));
-      const quantity = Number(cellValue(row, '[data-f="quantity"]'));
-      if (!typed && !item && !tierItem) continue;
-      if (!item && !tierItem) return toast(`Row ${index + 1}: ${typed} is not found; pick the code from the hint list (T1, T2 or T3 Material Master).`, true);
-      if (!(quantity > 0)) return toast(`Row ${index + 1}: type the quantity (more than 0).`, true);
-      rows.push({ link_id: t1.id, parent_line_id: parent ? parent.id : null, item_id: item || null, tier_material_id: tierItem || null, quantity });
+      const supplierId = Number(cellValue(row, '[data-row-supplier="supplier"]'));
+      const typedSupplier = cellValue(row, '[data-pick-key="supplier"][data-pick-part="code"]').trim();
+      const sobText = cellValue(row, '[data-f="sob_percent"]');
+      const qtyText = cellValue(row, '[data-f="quantity"]');
+      if (!typedCode && !item && !tierItem && !typedSupplier && !qtyText) continue;  // empty row
+      if (!item && !tierItem) return toast(`Row ${index + 1}: ${typedCode ? `${typedCode} is not found; pick the code from the hint list (T1, T2 or T3 Material Master).` : "type the material code."}`, true);
+      const key = item ? `i${item}` : `t${tierItem}`;
+      if (!groups.has(key)) {
+        if (!(Number(qtyText) > 0)) return toast(`Row ${index + 1}: type the quantity (more than 0).`, true);
+        groups.set(key, { rows: [], code: typedCode, quantity: Number(qtyText), item: item || null, tierItem: tierItem || null, sources: [], blanks: [] });
+      }
+      const group = groups.get(key);
+      if (qtyText !== "" && Number(qtyText) !== group.quantity) return toast(`Row ${index + 1}: ${group.code} has quantity ${number(group.quantity, 4)} on an earlier row; use the same quantity (or leave it blank).`, true);
+      group.rows.push(row);
+      if (!supplierId) {
+        if (typedSupplier) return toast(`Row ${index + 1}: ${typedSupplier} is not in the Supplier register; pick the supplier from the hint list.`, true);
+        if (sobText !== "" && group.rows.length > 1) return toast(`Row ${index + 1}: pick the supplier for this ${number(Number(sobText), 2)}% of ${group.code}, or Remove the row.`, true);
+        continue;  // a material without a supplier yet
+      }
+      if (group.sources.some((src) => src.sub_supplier_id === supplierId)) return toast(`Row ${index + 1}: this supplier is already on an earlier row of ${group.code}.`, true);
+      const source = { sub_supplier_id: supplierId, sob_percent: sobText === "" ? null : Number(sobText), ...supplierTerms(row) };
+      if (source.sob_percent !== null && !(source.sob_percent > 0)) return toast(`Row ${index + 1}: SOB must be more than 0%.`, true);
+      group.sources.push(source);
     }
-    if (!rows.length) return toast("Fill in at least one row.", true);
+    if (!groups.size) return toast("Fill in at least one row.", true);
+    for (const group of groups.values()) {
+      const typed = group.sources.filter((src) => src.sob_percent !== null).reduce((sum, src) => sum + src.sob_percent, 0);
+      const blanks = group.sources.filter((src) => src.sob_percent === null);
+      blanks.forEach((src) => { src.sob_percent = Math.max(0, 100 - typed) / blanks.length; });  // blank = what is left
+      if (blanks.some((src) => !(src.sob_percent > 0))) return toast(`${group.code}: no SOB is left for a supplier with blank SOB; type its SOB.`, true);
+      const total = group.sources.reduce((sum, src) => sum + src.sob_percent, 0);
+      if (total > 100.0001) return toast(`${group.code}: SOB of its suppliers adds up to ${number(total, 2)}%; at most 100%.`, true);
+      group.total = total;
+    }
+    // suppliers below 100%: first time, add a row for the balance (same material) to pick its supplier
+    const short = [...groups.values()].filter((group) => group.sources.length && group.total < 99.9999);
+    if (short.length && !balanceOffered) {
+      balanceOffered = true;
+      for (const group of short) {
+        const last = group.rows[group.rows.length - 1];
+        const pickItem = (group.rows[0].pickItems?.["material:material"] || []).find((hint) => (group.item ? hint.kind === "T1" && hint.id === group.item : hint.kind !== "T1" && hint.id === group.tierItem));
+        const row = entries.add();
+        last.after(row);
+        if (pickItem) setRowPick(row, "material", "material", pickItem);
+        row.querySelector('[data-f="quantity"]').value = group.quantity;
+        row.querySelector('[data-f="sob_percent"]').value = Number((100 - group.total).toFixed(4));
+        row.classList.add("balance-row");
+      }
+      return toast(`${short.map((group) => `${group.code}: ${number(group.total, 2)}%`).join(", ")}. A row for the remaining SOB is added: pick its ${tier} supplier and Save, or Remove that row and Save to keep less than 100%.`);
+    }
     let saved = 0;
-    for (const [index, body] of rows.entries()) {
+    for (const group of groups.values()) {
+      const body = { link_id: t1.id, parent_line_id: parent ? parent.id : null, item_id: group.item, tier_material_id: group.tierItem, quantity: group.quantity, sources: group.sources };
       try { await api("/api/planning/supplier-coverage/lines", { method: "POST", body: JSON.stringify(body) }); saved += 1; }
-      catch (error) { toast(`Row ${index + 1}: ${error.message}${saved ? ` (${saved} row${saved === 1 ? "" : "s"} above saved)` : ""}`, true); return loadCoverage(); }
+      catch (error) { toast(`${group.code}: ${error.message}${saved ? ` (${saved} material${saved === 1 ? "" : "s"} above saved)` : ""}`, true); state.suppliers = await api("/api/suppliers"); return loadCoverage(); }
     }
     modalLayer.hidden = true;
     toast(`${saved} material line${saved === 1 ? "" : "s"} added`);
+    state.suppliers = await api("/api/suppliers");
     loadCoverage();
   });
 }
@@ -1328,11 +1388,13 @@ function openCoverageSource(line, index = null) {
   } else {
     $("#covSourceAddRow").addEventListener("click", () => entries.add());
   }
+  let balanceOffered = false;
   $("#covSourceSave").addEventListener("click", async () => {
     const typed = [];
     for (const [rowIndex, row] of entries.rows().entries()) {
       const supplierId = Number(cellValue(row, '[data-row-supplier="supplier"]'));
       const code = cellValue(row, '[data-pick-key="supplier"][data-pick-part="code"]').trim();
+      if (!supplierId && !code && row.classList.contains("balance-row")) return toast(`Row ${rowIndex + 1}: pick the supplier for the remaining SOB, or Remove the row.`, true);
       if (!supplierId && !code) continue;
       if (!supplierId) return toast(`Row ${rowIndex + 1}: ${code} is not in the Supplier register; pick the supplier from the hint list.`, true);
       if (supplierId === line.sources.find((_, i) => i !== index && line.sources[i].sub_supplier_id === supplierId)?.sub_supplier_id) return toast(`Row ${rowIndex + 1}: this supplier is already a ${tier} supplier of ${line.component.code}; use its Edit.`, true);
@@ -1345,6 +1407,13 @@ function openCoverageSource(line, index = null) {
     if (!typed.length) return toast("Fill in at least one row.", true);
     const total = used + typed.reduce((sum, src) => sum + src.sob_percent, 0);
     if (total > 100.0001) return toast(`SOB adds up to ${number(total, 2)}%: at most ${number(Math.max(0, 100 - used), 2)}% is left for ${line.component.code}. Lower another supplier's SOB with its Edit first.`, true);
+    if (index === null && total < 99.9999 && !balanceOffered) {  // first time below 100%: a row for the balance
+      balanceOffered = true;
+      const row = entries.add();
+      row.querySelector('[data-f="sob_percent"]').value = Number((100 - total).toFixed(4));
+      row.classList.add("balance-row");
+      return toast(`${line.component.code}: ${number(total, 2)}%. A row for the remaining ${number(100 - total, 2)}% is added: pick its ${tier} supplier and Save, or Remove that row and Save to keep less than 100%.`);
+    }
     const list = index === null ? [...line.sources.map(sourcePayload), ...typed.map(sourcePayload)] : line.sources.map((src, i) => sourcePayload(i === index ? typed[0] : src));
     saveSources(line, list, `${tier} supplier${typed.length === 1 ? "" : "s"} saved for ${line.component.code}`);
   });

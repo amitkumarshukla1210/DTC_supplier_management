@@ -77,34 +77,51 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     await r.locator('[data-f="unit_price"]').fill("70");
   };
   const lineRow = (code) => page.locator("#coverageTable tbody tr.cov-line", { hasText: code });
-  // L1: 2 kg steel per beam
+  // L1: 2 kg steel per beam, with its T2 supplier in the same window: JGI 30% -> Save adds a row for the other 70%
   await page.click('.table-toolbar [data-cov-add-line=""]');
   await page.waitForSelector("#covLineTable tbody tr");
+  const lineHeads = await page.locator("#covLineTable thead th summary").allTextContents();
+  check("Material window has the supplier and SOB columns", JSON.stringify(lineHeads.slice(0, 6)) === JSON.stringify(["Material code", "Material name", "Quantity per UF220BFB010", "T2 Supplier Code", "T2 Supplier Name", "SOB (%)"]), JSON.stringify(lineHeads));
   await fillMaterial("covLineTable", 0, "FL001STEEL0.7", 2);
+  const r0 = page.locator("#covLineTable tbody tr").nth(0);
+  await r0.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2004");
+  await r0.locator('[data-f="sob_percent"]').fill("30");
+  await r0.locator('[data-f="lead_time_days"]').fill("10");
+  await r0.locator('[data-f="unit_price"]').fill("70");
+  await clearToast();
+  await page.click("#covLineSave");
+  await waitToast("remaining SOB");
+  const balance = page.locator("#covLineTable tbody tr").nth(1);
+  check("Save with 30% adds a balance row: same material and quantity, SOB 70, supplier blank", (await page.locator("#covLineTable tbody tr").count()) === 2
+    && (await balance.locator('[data-pick-key="material"][data-pick-part="code"]').inputValue()) === "FL001STEEL0.7" && (await balance.locator('[data-pick-key="material"][data-pick-part="name"]').inputValue()) === "STEEL0.7"
+    && (await balance.locator('[data-f="quantity"]').inputValue()) === "2" && (await balance.locator('[data-f="sob_percent"]').inputValue()) === "70"
+    && (await balance.locator('[data-pick-key="supplier"][data-pick-part="code"]').inputValue()) === "" && (await page.locator("#modalLayer").isVisible()));
+  check("Nothing saved yet", (await api("GET", `/api/planning/supplier-coverage/${(await api("GET", "/api/planning/supplier-parts?tier=T1")).items[0].id}`)).lines.length === 0);
+  await clearToast();
+  await page.click("#covLineSave");
+  await waitToast("pick the supplier for this 70%");
+  check("Balance row without a supplier is refused (pick it or Remove)", true);
+  await balance.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2014");
+  await balance.locator('[data-f="lead_time_days"]').fill("20");
+  await balance.locator('[data-f="unit_price"]').fill("70");
   await clearToast();
   await page.click("#covLineSave");
   await waitToast("added");
-  await lineRow("FL001STEEL0.7").waitFor();
-  // T2 suppliers of steel
-  await lineRow("FL001STEEL0.7").locator("[data-cov-add-source]").click();
-  await page.waitForSelector("#covSourceTable tbody tr");
-  check("Supplier window shows SOB left 100%", (await page.locator("#modalBody").textContent()).includes("SOB left: 100%"));
-  await fillSupplier(0, "SUP-2004", 30, 10);
-  await fillSupplier(1, "SUP-2014", 70, 20);
-  await clearToast();
-  await page.click("#covSourceSave");
-  await waitToast("saved");
   await page.waitForSelector('#coverageTable tr.cov-source:has-text("TATA Steel")');
+  check("Steel saved with JGI 30% and TATA 70% (nothing else added)", (await page.locator("#coverageTable tr.cov-source").count()) === 2 && (await lineRow("FL001STEEL0.7").locator("td").nth(6).textContent()) === "100%");
   // L2: steel's BOM, per kg steel: 1.7 kg ore, 0.6 kg coal
   await lineRow("FL001STEEL0.7").locator("[data-cov-add-line]").click();
   await page.waitForSelector("#covLineTable tbody tr");
   await fillMaterial("covLineTable", 0, "ORE-01", 1.7);
+  await page.locator("#covLineTable tbody tr").nth(0).locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2030");  // SOB left blank = 100%
   await fillMaterial("covLineTable", 1, "COAL-01", 0.6);
   await clearToast();
   await page.click("#covLineSave");
   await waitToast("2 material lines added");
   await lineRow("COAL-01").waitFor();
-  for (const [code, supplier] of [["ORE-01", "SUP-2030"], ["COAL-01", "SUP-2031"]]) {
+  check("Ore saved with XYZ at 100% (SOB blank = 100%, no balance row)", (await page.locator('#coverageTable tr.cov-source:has-text("XYZ Mining")').locator("td").nth(6).textContent()) === "100%");
+  check("A supplier used at T3 joins the T3 tier", (await api("GET", "/api/suppliers")).find((who) => who.code === "SUP-2030").tiers.includes("T3"));
+  for (const [code, supplier] of [["COAL-01", "SUP-2031"]]) {
     await lineRow(code).locator("[data-cov-add-source]").click();
     await page.waitForSelector("#covSourceTable tbody tr");
     await fillSupplier(0, supplier, 100);

@@ -566,6 +566,7 @@ class CoverageLineInput(BaseModel):
     tier_material_id: int | None = None
     supplier_material_id: int | None = None
     quantity: float = Field(gt=0, le=1_000_000_000, allow_inf_nan=False)
+    sources: list[SupplierBOMSourceInput] = []  # its suppliers, typed in the same window (SOB up to 100% in total)
 
 
 class NewPartBOMLine(BaseModel):
@@ -4737,8 +4738,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
 
     @app.post("/api/planning/supplier-coverage/lines", status_code=201)
     def add_coverage_line(payload: CoverageLineInput, request: Request):
-        """Add a material line (e.g. FL001STEEL0.7, 2 kg per beam). A T1/T2/T3 Material Master code joins
-        the supplier's material master. T2 suppliers saved earlier for this part and material become its sources."""
+        """Add a material line (e.g. FL001STEEL0.7, 2 kg per beam) with the suppliers typed for it. A T1/T2/T3
+        Material Master code joins the supplier's material master."""
         current_user(request)
         _check_supply_role(request)
         if sum(1 for value in (payload.item_id, payload.tier_material_id, payload.supplier_material_id) if value) != 1:
@@ -4766,18 +4767,26 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                    parent_line_id=payload.parent_line_id)
             db.add(line)
             db.flush()
-            # T2 relationships saved earlier under this T1 part for the same material -> sources of the line
-            earlier = [] if payload.parent_line_id else db.scalars(select(SupplierPart).where(SupplierPart.parent_link_id == link.id, SupplierPart.tier == "T2",
-                                                            (SupplierPart.material_id == own.item_id) if own.item_id else (SupplierPart.tier_material_id == own.tier_material_id))).all() if (own.item_id or own.tier_material_id) else []
-            copied = 0
-            for t2 in earlier:
-                if t2.sob_percent > 0:
-                    db.add(SupplierBOMLineSource(line_id=line.id, sub_supplier_id=t2.supplier_id, unit_price=t2.unit_price, currency=t2.currency,
-                                                 sob_percent=t2.sob_percent, lead_time_days=t2.lead_time_days, moq=t2.moq, buffer_days=t2.buffer_days,
-                                                 price_mode=t2.price_mode, price_interval_months=t2.price_interval_months, price_updated_month=t2.price_updated_month))
-                    copied += 1
+            # its suppliers, as typed (nothing is added that was not typed)
+            if sum(src.sob_percent for src in payload.sources) > 100.0001:
+                raise HTTPException(status_code=422, detail=f"SOB of the suppliers of {own.code} adds up to more than 100%")
+            if any(src.unit_price for src in payload.sources) and not _check_price_access(request):
+                raise HTTPException(status_code=403, detail="Price access is required to set a price")
+            seen_suppliers: set[int] = set()
+            depth = line_depth(db, line)
+            for number, src in enumerate(payload.sources, start=1):
+                who = db.get(Supplier, src.sub_supplier_id) if src.sub_supplier_id else None
+                if not who:
+                    raise HTTPException(status_code=422, detail=f"Supplier {number} of {own.code} is not in the Supplier register")
+                if who.id in seen_suppliers:
+                    raise HTTPException(status_code=422, detail=f"{who.name} is entered twice as a supplier of {own.code}")
+                seen_suppliers.add(who.id)
+                if src.item_id or src.supplier_material_id:
+                    check_component(db, supplier_id, src.item_id, src.supplier_material_id, f"Supplier {number} alternate")
+                db.add(SupplierBOMLineSource(line_id=line.id, **src.model_dump()))
+                add_supplier_tier(who, f"T{depth + 1}")
             db.commit()
-            return {"id": line.id, "code": own.code, "sources_copied": copied}
+            return {"id": line.id, "code": own.code, "sources": len(payload.sources)}
 
     @app.post("/api/planning/supplier-bom/upload", status_code=201)
     async def upload_supplier_bom(request: Request, supplier_id: int, material_id: int):

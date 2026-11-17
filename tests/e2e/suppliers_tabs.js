@@ -205,10 +205,16 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForSelector('#coverageTable tr.cov-line:has-text("ST-CHIP")');
   await page.locator('#coverageTable tr.cov-line:has-text("ST-CHIP") [data-cov-add-source]').click();
   await page.locator('#covSourceTable [data-pick-key="supplier"][data-pick-part="name"]').fill("ST Samicon");
+  await page.locator('#covSourceTable [data-f="sob_percent"]').fill("60");
+  await clearToast();
+  await page.click("#covSourceSave");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("remaining 40%"));
+  check("+ T2 supplier at 60%: Save adds a row for the remaining 40%", (await page.locator("#covSourceTable tbody tr").count()) === 2 && (await page.locator("#covSourceTable tbody tr").nth(1).locator('[data-f="sob_percent"]').inputValue()) === "40");
+  await page.locator("#covSourceTable tbody tr").nth(1).locator("[data-entry-remove]").click();
   await clearToast();
   await page.click("#covSourceSave");
   await page.waitForSelector('#coverageTable tr.cov-source:has-text("ST Samicon")');
-  check("Coverage: ST-CHIP (T2 code) 3 per piece, T2 supplier ST Samicon 100%", await page.locator('#coverageTable tr.cov-source:has-text("ST Samicon")').evaluate((tr) => tr.cells[1].textContent === "T2" && tr.cells[6].textContent === "100%" && tr.cells[8].textContent === "3"));
+  check("Removing the balance row and saving keeps 60%: ST-CHIP (T2 code) 3 per piece, ST Samicon 60%", await page.locator('#coverageTable tr.cov-source:has-text("ST Samicon")').evaluate((tr) => tr.cells[1].textContent === "T2" && tr.cells[6].textContent === "60%" && tr.cells[8].textContent === "1.8"));
   await page.click('[data-supplier-tab="Supplier/material relationship"]');
   await page.waitForSelector('#relListTable tbody tr:has-text("ST-STEEL")');
 
