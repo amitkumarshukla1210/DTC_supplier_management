@@ -2139,6 +2139,16 @@ class SupplierHubApiTests(unittest.TestCase):
             (3, "T2 supplier", "XL-1004", "XL-STEEL"), (3, "T2 supplier", "XL-1014", "XL-STEEL"), (3, "L2 material", None, "XL-ORE"),
             (4, "T3 supplier", "XL-1030", "XL-ORE"), (3, "L2 material", None, "XL-COAL"), (4, "T3 supplier", "XL-1031", "XL-COAL"), (1, "T1 part", "XL-1013", "XL-BRKT")])
         self.assertEqual((mine[1]["stock"], mine[1]["available"], mine[1]["sob_percent"], mine[2]["bom_qty"], mine[2]["sob_percent"], mine[9]["stock"]), (500, 400, 60, 2, 100, None))
+        # the same tree as Excel: one row per node, levels grouped (+ / - in Excel), stock on the part
+        sheet = load_workbook(io.BytesIO(api.get("/api/planning/supply-tree.xlsx", params={"report_month": "2026-11"}).content)).active
+        self.assertEqual([c.value for c in sheet[3]], ["Level", "Supplier Code", "Supplier Name", "Material code", "Material name", "SOB %", "BOM qty", "Unit", "Stock quantity", "Available quantity", "Arrival month"])
+        first = next(r for r in range(4, sheet.max_row + 1) if sheet.cell(r, 2).value == "XL-1013" and sheet.cell(r, 1).value.strip() == "T1 supplier")
+        got = [(sheet.cell(r, 1).value.strip(), sheet.cell(r, 2).value, sheet.cell(r, 4).value, sheet.cell(r, 6).value, sheet.cell(r, 7).value, sheet.cell(r, 9).value, sheet.row_dimensions[r].outline_level) for r in range(first, first + 5)]
+        self.assertEqual(got, [("T1 supplier", "XL-1013", None, None, None, None, 0), ("T1 part", "XL-1013", "XL-BEAM", 60, None, 500, 1), ("L1 material", None, "XL-STEEL", 100, 2, None, 2),
+                               ("T2 supplier", "XL-1004", "XL-STEEL", 30, None, None, 3), ("T2 supplier", "XL-1014", "XL-STEEL", 70, None, None, 3)])
+        self.assertEqual(sheet.cell(first, 5).value, "2 parts")
+        self.assertEqual(api.get("/api/planning/supply-tree.pdf").status_code, 200)
+        self.assertEqual(api.get("/api/planning/supply-tree.csv").status_code, 404)
         # the template gives back what is saved, so it can be edited and uploaded again
         back = load_workbook(io.BytesIO(api.get("/api/planning/coverage-workbook/template.xlsx", params={"supplier_id": savera["id"]}).content)).active
         self.assertEqual([c.value for c in back[3]], cov)

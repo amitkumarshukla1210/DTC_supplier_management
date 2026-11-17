@@ -1956,7 +1956,7 @@ async function renderSupplierControl() {
     body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "First the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
       <h3 class="subtable-heading">Supply chain tree: T1 suppliers → parts → BOM materials → T2 suppliers → L2 materials → T3 suppliers</h3>
-      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplyTreeSearch" type="search" placeholder="Search supplier or material" /></label><span class="toolbar-add"><button type="button" class="button button-small" id="supplyTreeOpen">Open all</button><button type="button" class="button button-small" id="supplyTreeClose">Close all</button></span></div>
+      <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplyTreeSearch" type="search" placeholder="Search supplier or material" /></label><span class="toolbar-add"><a class="button button-small" id="supplyTreeExcel" href="/api/planning/supply-tree.xlsx">Download Excel</a><a class="button button-small" id="supplyTreePdf" href="/api/planning/supply-tree.pdf">Download PDF</a><button type="button" class="button button-small" id="supplyTreeOpen">Open all</button><button type="button" class="button button-small" id="supplyTreeClose">Close all</button></span></div>
       <div id="supplyTreeTable" class="supply-tree"><div class="tree-loading">Loading…</div></div>
       <h3 class="subtable-heading">Enter stock</h3>
       <form id="supplierStockForm" class="panel-body inline-upload">
@@ -2110,6 +2110,9 @@ async function renderSupplierControl() {
     });
     $("#stockAddRow").addEventListener("click", () => entries.add());
     const loadTree = async () => {
+      const query = new URLSearchParams({ report_month: $("#stockMonth").value, workspace: workspaceOf() });
+      $("#supplyTreeExcel").href = `/api/planning/supply-tree.xlsx?${query}`;
+      $("#supplyTreePdf").href = `/api/planning/supply-tree.pdf?${query}`;
       try {
         state.supplyTree = (await api(`/api/planning/supply-tree?${new URLSearchParams({ report_month: $("#stockMonth").value, workspace: workspaceOf() })}`)).items;
         renderSupplyTree();

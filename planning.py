@@ -5250,6 +5250,46 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                           "sob_percent": src["sob_percent"], "uom": component["uom"], "lead_time_days": src["lead_time_days"]})
             return {"report_month": month, "workspace": workspace, "items": nodes}
 
+    @app.get("/api/planning/supply-tree.{file_format}")
+    def export_supply_tree(file_format: str, request: Request, report_month: str = "", workspace: str = "trial"):
+        """The supply chain tree of the Upload supplier stock page as Excel (grouped levels: + / - in Excel) or PDF."""
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        tree = supply_tree(request, report_month, workspace)
+        headers = ["Level", "Supplier Code", "Supplier Name", "Material code", "Material name", "SOB %", "BOM qty", "Unit", "Stock quantity", "Available quantity", "Arrival month"]
+        indent = "   "
+        values = [[indent * node["depth"] + node["level"], node.get("supplier_code") or "", node.get("supplier_name") or "", node.get("material_code") or "",
+                   (f'{node["parts"]} part{"s" if node["parts"] != 1 else ""}' if node["depth"] == 0 else node.get("material_name") or ""),
+                   node.get("sob_percent"), node.get("bom_qty"), node.get("uom") or "", node.get("stock"), node.get("available"), node.get("arrival_month") or ""]
+                  for node in tree["items"]]
+        title = f"Supply chain tree · stock {tree['report_month']} ({tree['workspace']})"
+        filename = f"supply-chain-tree-{tree['report_month']}"
+        if file_format == "pdf":
+            output = _generic_pdf(title, headers, values)
+            return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{filename}.pdf"'})
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Supply chain tree"
+        styled_sheet(sheet, title, "T1 supplier -> parts it supplies you -> BOM materials (L1-L3) -> their T2 / T3 / T4 suppliers. Use + / - at the left to open and close levels.", headers)
+        fills = {0: PatternFill("solid", fgColor="FFFFFF"), 1: PatternFill("solid", fgColor="F7FAFD")}
+        supplier_fill = PatternFill("solid", fgColor="FFFAF0")
+        for node, line in zip(tree["items"], values):
+            sheet.append(line)
+            row = sheet.max_row
+            if node["depth"]:
+                sheet.row_dimensions[row].outline_level = min(node["depth"], 7)
+            is_supplier = node["depth"] > 0 and node["level"].endswith("supplier")
+            for cell in sheet[row]:
+                if node["depth"] <= 1:
+                    cell.font = Font(bold=True)
+                if is_supplier:
+                    cell.fill, cell.font = supplier_fill, Font(italic=True, color="7A5A12")
+                elif node["depth"] in fills:
+                    cell.fill = fills[node["depth"]]
+        sheet.sheet_properties.outlinePr.summaryBelow = False
+        sheet.column_dimensions["A"].width = 28
+        return xlsx_response(workbook, f"{filename}.xlsx")
+
     @app.get("/api/planning/supplier-stock/{report_month}")
     def list_supplier_stock(report_month: str, request: Request, workspace: str = "trial"):
         current_user(request)

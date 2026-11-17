@@ -219,6 +219,12 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.fill("#supplyTreeSearch", "XYZ");
   await page.waitForFunction(() => document.querySelectorAll("#supplyTreeTable tbody tr:not([hidden])").length === 7);
   check("Search XYZ finds Savera's tree, opened", true);
+  const excelHref = await page.getAttribute("#supplyTreeExcel", "href");
+  const month = await page.inputValue("#stockMonth");
+  check("Download Excel follows the month and workspace", excelHref === `/api/planning/supply-tree.xlsx?report_month=${month}&workspace=trial`, excelHref);
+  const download = await page.request.get(BASE + excelHref);
+  check("Excel download works", download.status() === 200 && download.headers()["content-type"].includes("spreadsheetml") && download.headers()["content-disposition"].includes(`supply-chain-tree-${month}.xlsx`));
+  check("PDF download works", (await page.request.get(BASE + (await page.getAttribute("#supplyTreePdf", "href")))).status() === 200);
 
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
