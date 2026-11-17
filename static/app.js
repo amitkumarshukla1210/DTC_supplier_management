@@ -3179,7 +3179,16 @@ document.addEventListener("click", (event) => {
   event.stopPropagation();
 });
 
+// Filter lists and pickers close when you click anywhere outside them (or press Esc), even with nothing chosen
+const DROPDOWN_SELECTOR = "details.multi-filter[open], details.model-picker[open]";
+document.addEventListener("click", (event) => {
+  document.querySelectorAll(DROPDOWN_SELECTOR).forEach((dropdown) => { if (!dropdown.contains(event.target)) dropdown.open = false; });
+}, true);
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    const open = [...document.querySelectorAll(DROPDOWN_SELECTOR)];
+    if (open.length) { open.forEach((dropdown) => { dropdown.open = false; }); return; }
+  }
   if (event.key === "Escape" && !modalLayer.hidden) modalLayer.hidden = true;
   if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-plan-id]")) {
     event.preventDefault();
