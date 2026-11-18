@@ -2149,6 +2149,31 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(sheet.cell(first, 5).value, "2 parts")
         self.assertEqual(api.get("/api/planning/supply-tree.pdf").status_code, 200)
         self.assertEqual(api.get("/api/planning/supply-tree.csv").status_code, 404)
+        # stock template = the tree; stock typed on a T1 part row uploads back (other rows and blank stock skipped)
+        filled = load_workbook(io.BytesIO(api.get("/api/planning/supply-tree.xlsx", params={"report_month": "2026-12", "template": "true"}).content))
+        tree_sheet = filled.active
+        self.assertIn("Stock template", tree_sheet["A2"].value)
+        beam_row = next(r for r in range(4, tree_sheet.max_row + 1) if tree_sheet.cell(r, 1).value.strip() == "T1 part" and tree_sheet.cell(r, 4).value == "XL-BEAM")
+        tree_sheet.cell(beam_row, 9).value, tree_sheet.cell(beam_row, 10).value, tree_sheet.cell(beam_row, 11).value = 700, 650, date(2027, 1, 15)  # an Excel date cell
+        steel_row = next(r for r in range(4, tree_sheet.max_row + 1) if tree_sheet.cell(r, 4).value == "XL-STEEL")
+        tree_sheet.cell(steel_row, 9).value = 999  # an L1 material row: for reading only
+        content = io.BytesIO()
+        filled.save(content)
+        stock_up = api.post("/api/planning/supplier-stock/2026-12/upload?workspace=trial", headers=xlsx_type, content=content.getvalue())
+        self.assertEqual((stock_up.status_code, stock_up.json().get("rows")), (201, 1), stock_up.text)
+        listed_stock = [(r["supplier_code"], r["material_code"], r["quantity"], r["available_quantity"], r["arrival_month"]) for r in api.get("/api/planning/supplier-stock/2026-12", params={"workspace": "trial"}).json()["items"]]
+        self.assertEqual(listed_stock, [("XL-1013", "XL-BEAM", 700, 650, "2027-01")])
+        empty = load_workbook(io.BytesIO(api.get("/api/planning/supply-tree.xlsx", params={"report_month": "2026-10", "template": "true"}).content))
+        content = io.BytesIO()
+        empty.save(content)
+        self.assertIn("No stock typed", api.post("/api/planning/supplier-stock/2026-10/upload?workspace=trial", headers=xlsx_type, content=content.getvalue()).json()["detail"])
+        # relationship page download: the list in the upload's columns (one supplier or all, with its search)
+        rel = load_workbook(io.BytesIO(api.get("/api/planning/supplier-relationships.xlsx", params={"supplier_id": savera["id"]}).content)).active
+        self.assertEqual([c.value for c in rel[3]], columns)
+        self.assertEqual([[c.value for c in row] for row in rel.iter_rows(min_row=4)], [["XL-1013", "XL Savera", "XL-BEAM", "Base Front Beam", 60, 15, 100, 5, 85, "INR"], ["XL-1013", "XL Savera", "XL-BRKT", "Bracket", 100, 7, 0, 0, 20, "INR"]])
+        searched = load_workbook(io.BytesIO(api.get("/api/planning/supplier-relationships.xlsx", params={"search": "bracket"}).content)).active
+        self.assertEqual([row[2].value for row in searched.iter_rows(min_row=4)], ["XL-BRKT"])
+        self.assertEqual(api.get("/api/planning/supplier-relationships.pdf").status_code, 200)
         # the template gives back what is saved, so it can be edited and uploaded again
         back = load_workbook(io.BytesIO(api.get("/api/planning/coverage-workbook/template.xlsx", params={"supplier_id": savera["id"]}).content)).active
         self.assertEqual([c.value for c in back[3]], cov)

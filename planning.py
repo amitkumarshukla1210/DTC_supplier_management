@@ -4512,6 +4512,47 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 sheet.append([supplier.code, supplier.name])
         return xlsx_response(workbook, f"supplier-relationships{f'-{supplier.code}' if supplier else ''}.xlsx")
 
+    @app.get("/api/planning/supplier-relationships.{file_format}")
+    def export_relationships(file_format: str, request: Request, supplier_id: int | None = None, search: str = ""):
+        """The relationship page's list (one supplier or all, with its search) in the upload's columns, so the
+        Excel can be edited and uploaded back; or PDF."""
+        if file_format not in {"xlsx", "pdf"}:
+            raise HTTPException(status_code=404, detail="Export not found")
+        current_user(request)
+        _check_supply_role(request)
+        can_price = _check_price_access(request)
+        needle = search.strip().casefold()
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id) if supplier_id else None
+            statement = select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))
+            if supplier_id:
+                statement = statement.where(SupplierPart.supplier_id == supplier_id)
+            suppliers = {who.id: who for who in db.scalars(select(Supplier)).all()}
+            links = db.scalars(statement).all()
+            items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_({link.material_id for link in links})))} if links else {}
+            values = []
+            for link in sorted(links, key=lambda l: (suppliers[l.supplier_id].code.casefold(), items[l.material_id].code.casefold())):
+                who, item = suppliers[link.supplier_id], items[link.material_id]
+                if needle and needle not in f"{who.code} {who.name} {item.code} {item.name}".casefold():
+                    continue
+                values.append([who.code, who.name, item.code, item.name, link.sob_percent, link.lead_time_days, link.moq, link.buffer_days,
+                               link.unit_price if can_price else None, link.currency])
+        title = f"Supplier/material relationship{f' · {supplier.code} {supplier.name}' if supplier else ' · all suppliers'}"
+        filename = f"supplier-relationships{f'-{supplier.code}' if supplier else ''}"
+        headers = RELATIONSHIP_SHEET_COLUMNS if can_price else [h for h in RELATIONSHIP_SHEET_COLUMNS if h != "Unit price"]
+        if not can_price:
+            values = [row[:8] + row[9:] for row in values]
+        if file_format == "pdf":
+            output = _generic_pdf(title, headers, values)
+            return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{filename}.pdf"'})
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Relationships"
+        styled_sheet(sheet, title, "Same columns as the upload: edit and upload back (a row already there is updated).", headers)
+        for row in values:
+            sheet.append(row)
+        return xlsx_response(workbook, f"{filename}.xlsx")
+
     def own_material_for(db: Session, supplier_id: int, item_id: int | None, tier_material_id: int | None) -> SupplierMaterial:
         """The supplier's material master entry for a T1 / T2 / T3 code (added when missing)."""
         column = SupplierMaterial.item_id if item_id else SupplierMaterial.tier_material_id
@@ -5251,7 +5292,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             return {"report_month": month, "workspace": workspace, "items": nodes}
 
     @app.get("/api/planning/supply-tree.{file_format}")
-    def export_supply_tree(file_format: str, request: Request, report_month: str = "", workspace: str = "trial"):
+    def export_supply_tree(file_format: str, request: Request, report_month: str = "", workspace: str = "trial", template: bool = False):
         """The supply chain tree of the Upload supplier stock page as Excel (grouped levels: + / - in Excel) or PDF."""
         if file_format not in {"xlsx", "pdf"}:
             raise HTTPException(status_code=404, detail="Export not found")
@@ -5270,7 +5311,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Supply chain tree"
-        styled_sheet(sheet, title, "T1 supplier -> parts it supplies you -> BOM materials (L1-L3) -> their T2 / T3 / T4 suppliers. Use + / - at the left to open and close levels.", headers)
+        styled_sheet(sheet, title, ("Stock template: type Stock quantity, Available quantity and Arrival month (YYYY-MM, if not yet there) on the T1 part rows, "
+                                    "then Upload Excel on the Upload supplier stock page (other rows are for reading; a blank Stock quantity is skipped). ") if template else ""
+                     + "T1 supplier -> parts it supplies you -> BOM materials (L1-L3) -> their T2 / T3 / T4 suppliers. Use + / - at the left to open and close levels.", headers)
         fills = {0: PatternFill("solid", fgColor="FFFFFF"), 1: PatternFill("solid", fgColor="F7FAFD")}
         supplier_fill = PatternFill("solid", fgColor="FFFAF0")
         for node, line in zip(tree["items"], values):
@@ -5288,7 +5331,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     cell.fill = fills[node["depth"]]
         sheet.sheet_properties.outlinePr.summaryBelow = False
         sheet.column_dimensions["A"].width = 28
-        return xlsx_response(workbook, f"{filename}.xlsx")
+        return xlsx_response(workbook, f"{'supplier-stock-template' if template else filename}.xlsx")
 
     @app.get("/api/planning/supplier-stock/{report_month}")
     def list_supplier_stock(report_month: str, request: Request, workspace: str = "trial"):
@@ -5312,13 +5355,50 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                  "quantity": stock.quantity, "available_quantity": stock.available_quantity, "arrival_month": stock.arrival_month}
                 for stock, link, item, supplier in rows]}
 
+    def stock_rows_from_tree(raw: bytes) -> list[dict] | None:
+        """Rows of the supply chain tree workbook with stock typed on T1 part rows (None: not that workbook)."""
+        aliases = {"level": "level", "supplier_code": "supplier_code", "material_code": "material_code", "stock_quantity": "quantity",
+                   "available_quantity": "available_quantity", "arrival_month": "arrival_month"}
+        try:
+            rows = _read_supplier_part_sheet(raw, aliases, {"level", "supplier_code", "material_code", "quantity"})
+        except HTTPException:
+            return None
+        out = []
+        for row in rows:
+            if str(row.get("level") or "").strip().casefold() != "t1 part" or row.get("quantity") in (None, ""):
+                continue
+            arrival = row.get("arrival_month")
+            if hasattr(arrival, "strftime"):
+                arrival = arrival.strftime("%Y-%m")
+            try:
+                quantity = float(row["quantity"])
+                available = float(row["available_quantity"]) if row.get("available_quantity") not in (None, "") else None
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"Row {row['_excel_row']}: stock quantities must be numbers") from exc
+            out.append({"supplier_code": str(row["supplier_code"]).strip(), "material_code": str(row["material_code"]).strip(), "tier": "T1",
+                        "quantity": quantity, "available_quantity": available, "arrival_month": arrival or "", "_excel_row": row["_excel_row"]})
+        return out
+
     @app.post("/api/planning/supplier-stock/{report_month}/upload", status_code=201)
     async def upload_supplier_stock_excel(report_month: str, request: Request, workspace: str = "trial"):
         current_user(request)
         _check_supply_role(request)
         _validate_workspace(workspace)
         _month(report_month)
-        rows = _read_xlsx(await request.body())
+        raw = await request.body()
+        try:
+            rows = _read_xlsx(raw)
+            plain_error = None
+        except HTTPException as exc:  # e.g. the tree workbook's title rows
+            rows, plain_error = [], exc
+        if not rows or not {"supplier_code", "material_code", "quantity"} <= set(rows[0]):
+            tree_rows = stock_rows_from_tree(raw)  # the tree workbook (template / download), stock typed on T1 part rows
+            if tree_rows is not None:
+                rows = tree_rows
+                if not rows:
+                    raise HTTPException(status_code=422, detail="No stock typed: fill Stock quantity on the T1 part rows")
+            elif plain_error is not None:
+                raise plain_error
         _required_columns(rows, {"supplier_code", "material_code", "quantity"})
         with open_db() as db:
             links = db.scalars(select(SupplierPart)).all()

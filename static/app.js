@@ -1150,6 +1150,9 @@ async function loadSupplierPartPage() {
 async function loadRelList() {
   const params = new URLSearchParams({ tier: "T1", limit: "1000", search: state.relSearch || "" });
   if (state.relSupplierId) params.set("supplier_id", state.relSupplierId);
+  const exportQuery = new URLSearchParams({ search: state.relSearch || "" });  // the list shown: one supplier or all, with the search
+  if (state.relSupplierId) exportQuery.set("supplier_id", state.relSupplierId);
+  if ($("#relExcel")) { $("#relExcel").href = `/api/planning/supplier-relationships.xlsx?${exportQuery}`; $("#relPdf").href = `/api/planning/supplier-relationships.pdf?${exportQuery}`; }
   const result = await api(`/api/planning/supplier-parts?${params}`);
   state.supplierParts = result.items;
   const target = $("#relListTable");
@@ -1948,21 +1951,21 @@ async function renderSupplierControl() {
           <label class="field"><span>Relationship workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload relationships</button><a class="button" id="relTemplate" href="/api/planning/supplier-relationships/template.xlsx${chosen ? `?supplier_id=${chosen.id}` : ""}">Download template${chosen ? ` (${esc(chosen.code)}'s rows)` : ""}</a>
         </form>
-        <div class="table-toolbar"><label class="search-field"><input class="form-control" id="relSearch" type="search" placeholder="Search supplier or part" value="${esc(state.relSearch || "")}" /></label><span class="toolbar-add"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></span></div>
+        <div class="table-toolbar"><label class="search-field"><input class="form-control" id="relSearch" type="search" placeholder="Search supplier or part" value="${esc(state.relSearch || "")}" /></label><a class="button button-small" id="relExcel" href="#">Download Excel</a><a class="button button-small" id="relPdf" href="#">Download PDF</a><span class="toolbar-add"><button type="button" class="button button-small" id="relAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="relSaveAll">Save all</button></span></div>
         ${entryTable("relEntryTable", ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB (%)", "Lead time (days)", "MOQ", "Buffer days", "Unit price", "Currency"])}
         <div id="relListTable"><div class="tree-loading">Loading…</div></div>
       </section>`;
   } else if (tab === "Upload supplier stock") {
-    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "First the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
+    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload Excel: Download template gives the supply chain tree of the month with Stock quantity, Available quantity and Arrival month columns; type the stock on the T1 part rows and upload it (other rows are for reading). Then the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
+      <form id="supplierStockForm" class="panel-body inline-upload">
+        <label class="field"><span>Supplier stock workbook (the template below, or your sheet with supplier_code, material_code, quantity)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
+        <button class="button button-primary" type="submit">Upload Excel</button><a class="button" id="stockTemplate" href="#">Download template</a><a class="button button-small" href="/api/planning/templates/supplier-stock.xlsx">Simple template (one row per supplier)</a>
+      </form>
       <h3 class="subtable-heading">Supply chain tree: T1 suppliers → parts → BOM materials → T2 suppliers → L2 materials → T3 suppliers</h3>
       <div class="table-toolbar"><label class="search-field"><input class="form-control" id="supplyTreeSearch" type="search" placeholder="Search supplier or material" /></label><span class="toolbar-add"><a class="button button-small" id="supplyTreeExcel" href="/api/planning/supply-tree.xlsx">Download Excel</a><a class="button button-small" id="supplyTreePdf" href="/api/planning/supply-tree.pdf">Download PDF</a><button type="button" class="button button-small" id="supplyTreeOpen">Open all</button><button type="button" class="button button-small" id="supplyTreeClose">Close all</button></span></div>
       <div id="supplyTreeTable" class="supply-tree"><div class="tree-loading">Loading…</div></div>
       <h3 class="subtable-heading">Enter stock</h3>
-      <form id="supplierStockForm" class="panel-body inline-upload">
-        <label class="field"><span>Supplier stock workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
-        <button class="button button-primary" type="submit">Upload supplier stock</button><a class="button" href="/api/planning/templates/supplier-stock.xlsx">Download template</a>
-      </form>
       <div class="new-bom-actions entry-actions"><button type="button" class="button button-small" id="stockAddRow">+ Add row</button><button type="button" class="button button-small button-primary" id="stockSaveAll">Save all</button></div>
       ${entryTable("stockEntryTable", ["Supplier code", "Supplier name", "Supplier's material (relationship)", "Stock quantity", "Available quantity", "Arrival month (if not yet there)"])}
       <h3 class="subtable-heading">Stock entered for the month</h3>
@@ -2113,6 +2116,7 @@ async function renderSupplierControl() {
       const query = new URLSearchParams({ report_month: $("#stockMonth").value, workspace: workspaceOf() });
       $("#supplyTreeExcel").href = `/api/planning/supply-tree.xlsx?${query}`;
       $("#supplyTreePdf").href = `/api/planning/supply-tree.pdf?${query}`;
+      $("#stockTemplate").href = `/api/planning/supply-tree.xlsx?${query}&template=true`;
       try {
         state.supplyTree = (await api(`/api/planning/supply-tree?${new URLSearchParams({ report_month: $("#stockMonth").value, workspace: workspaceOf() })}`)).items;
         renderSupplyTree();

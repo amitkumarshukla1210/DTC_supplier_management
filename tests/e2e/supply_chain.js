@@ -193,6 +193,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.locator('#covCrumbs a[data-open-supplier-rel]').click();
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);
+  check("Relationship page: Download Excel / PDF of the list shown (Savera)", /^\/api\/planning\/supplier-relationships\.xlsx\?search=&supplier_id=\d+$/.test(await page.getAttribute("#relExcel", "href")) && (await page.request.get(BASE + await page.getAttribute("#relExcel", "href"))).status() === 200 && (await page.request.get(BASE + await page.getAttribute("#relPdf", "href"))).status() === 200, await page.getAttribute("#relExcel", "href"));
   check("Relationship template has Savera's rows", /supplier-relationships\/template\.xlsx\?supplier_id=\d+/.test(await page.getAttribute("#relTemplate", "href")) && (await page.textContent("#relTemplate")).includes("SUP-2013"));
   await page.click("[data-rel-all]");
   await page.waitForFunction(() => !document.querySelector(".crumbs") && document.querySelector("#relListTable"));
@@ -225,6 +226,26 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   const download = await page.request.get(BASE + excelHref);
   check("Excel download works", download.status() === 200 && download.headers()["content-type"].includes("spreadsheetml") && download.headers()["content-disposition"].includes(`supply-chain-tree-${month}.xlsx`));
   check("PDF download works", (await page.request.get(BASE + (await page.getAttribute("#supplyTreePdf", "href")))).status() === 200);
+  // Upload Excel with the template: the tree, stock typed on the part row (filled here with openpyxl from the project's .venv)
+  const templateUrl = await page.getAttribute("#stockTemplate", "href");
+  check("Stock template is the month's tree", templateUrl === `/api/planning/supply-tree.xlsx?report_month=${month}&workspace=trial&template=true`, templateUrl);
+  const os = require("os"), path = require("path"), fs = require("fs"), { spawnSync } = require("child_process");
+  const stockFile = path.join(os.tmpdir(), `stock-${Date.now()}.xlsx`);
+  fs.writeFileSync(stockFile, await (await page.request.get(BASE + templateUrl)).body());
+  const python = process.env.PYTHON || path.join(__dirname, "..", "..", ".venv", "bin", "python");
+  const filled = spawnSync(python, ["-c", `import sys, openpyxl
+wb = openpyxl.load_workbook(sys.argv[1]); ws = wb.active
+for r in range(4, ws.max_row + 1):
+    if (ws.cell(r, 1).value or "").strip() == "T1 part":
+        ws.cell(r, 9).value, ws.cell(r, 10).value, ws.cell(r, 11).value = 800, 750, "2027-02"
+wb.save(sys.argv[1])`, stockFile]);
+  check("Template filled", filled.status === 0, String(filled.stderr));
+  await page.setInputFiles('#supplierStockForm input[type="file"]', stockFile);
+  await clearToast();
+  await page.click('#supplierStockForm button[type="submit"]');
+  await page.waitForFunction(() => /row|Row|stock/.test(document.querySelector("#toast")?.textContent || ""));
+  await page.waitForFunction(() => document.querySelector("#supplyTreeTable tr.st-part")?.cells[9].textContent === "800");
+  check("Uploaded stock shows on the part row (800 / 750 / Feb 2027)", await page.locator("#supplyTreeTable tr.st-part").evaluate((tr) => tr.cells[10].textContent === "750" && tr.cells[11].textContent.includes("2027")));
 
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
