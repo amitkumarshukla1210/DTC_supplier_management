@@ -603,3 +603,8 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #ovTree tr[data-tree-depth="4"] > .tree-toggle-cell { padding-left: 72px; }
 #ovTree tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
 .ov-input { width: 100px; display: inline-block; }
+/* coverage rows edited in place */
+#coverageTable .cov-in { width: 110px; min-width: 0; padding: 6px 8px; }
+#coverageTable tr.cov-editing > td { background: #fff7e0 !important; font-style: normal; color: #12263a; }
+#coverageTable td.cov-actions { white-space: nowrap; }
+#relListTable .rel-in { width: 100px; } #relListTable tr.rel-editing > td { background: #fff7e0; }

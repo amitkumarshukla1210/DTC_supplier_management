@@ -594,6 +594,9 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual((parts["OV-BEAM"]["sob_percent"], parts["OV-BEAM"]["unit_price"], parts["OV-BEAM"]["stock"], parts["OV-BEAM"]["available"], parts["OV-BEAM"]["part_requirement"], parts["OV-BEAM"]["supplier_requirement"]),
                          (60, 85, 9000, 8000, 80000, 48000))
         self.assertEqual((parts["OV-TOPB"]["part_requirement"], parts["OV-TOPB"]["supplier_requirement"], parts["OV-TOPB"]["stock"]), (60000, 60000, None))
+        # the coverage page starts from the part's requirement in the month's plan (all suppliers: 80,000 beams)
+        coverage_plan = api.get(f"/api/planning/supplier-coverage/{beam_link}", params={"month": "2026-11"}).json()["plan"]
+        self.assertEqual((coverage_plan["revision"], coverage_plan["month"], coverage_plan["part_requirement"]), ("Rev.00", "2026-11", 80000))
         # same as the Shortage & excess report's plan demand for Savera's beam (worked out there separately)
         report = api.get("/api/planning/report", params={"start_month": "2026-11", "end_month": "2026-11"}).json()["items"]
         self.assertEqual(next(r["plan_demand"] for r in report if r["material_code"] == "OV-BEAM" and r["supplier_code"] == "OV-1013"), 48000)

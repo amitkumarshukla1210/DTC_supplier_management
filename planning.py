@@ -4900,7 +4900,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             t1["uom"] = item.uom if item else ""
             bom = supplier_bom_view(db, link.supplier_id, link.material_id, can_price)
             lines = bom["lines"]  # L1 materials, their L2 BOM and L3 BOM, each with its suppliers
-            return {"t1": t1, "lines": lines}
+            month = _month_text(_month(request.query_params.get("month") or _month_text(date.today())))
+            cycle, demand = month_material_demand(db, request.query_params.get("workspace") or "trial", month)
+            plan = {"month": month, "revision": f"Rev.{cycle.revision:02d}", "part_requirement": demand.get(link.material_id, 0.0)} if cycle else None
+            return {"t1": t1, "lines": lines, "plan": plan}
 
     @app.post("/api/planning/supplier-coverage/lines", status_code=201)
     def add_coverage_line(payload: CoverageLineInput, request: Request):

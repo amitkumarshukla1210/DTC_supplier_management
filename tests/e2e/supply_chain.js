@@ -64,75 +64,60 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForSelector("#coverageTable table");
   check("Coverage page with breadcrumb supplier › part", (await page.locator("#covCrumbs").textContent()).replace(/\s+/g, " ").trim().startsWith("SUP-2013 Savera › UF220BFB010 Base Front Beam"));
   check("Only the T1 row until materials are added", (await page.locator("#coverageTable tbody tr").count()) === 1);
-  const fillMaterial = async (tableId, n, code, qty) => {
-    if (n > 0) await page.click("#covLineAddRow");
-    const r = page.locator(`#${tableId} tbody tr`).nth(n);
-    await r.locator('[data-pick-key="material"][data-pick-part="code"]').fill(code);
-    await page.waitForFunction(([id, i]) => { const tr = document.querySelectorAll(`#${id} tbody tr`)[i]; return tr.querySelector('[data-row-material="material"]').value || tr.querySelector('[data-row-tier-material="material"]').value; }, [tableId, n]);
-    await r.locator('[data-f="quantity"]').fill(String(qty));
-  };
-  const fillSupplier = async (n, code, sob, lead) => {
-    if (n > 0) await page.click("#covSourceAddRow");
-    const r = page.locator("#covSourceTable tbody tr").nth(n);
-    await r.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill(code);
-    await r.locator('[data-f="sob_percent"]').fill(String(sob));
-    if (lead) await r.locator('[data-f="lead_time_days"]').fill(String(lead));
-    await r.locator('[data-f="unit_price"]').fill("70");
+  // everything is edited in the rows: no pop-up windows
+  const editRow = () => page.locator("#coverageTable tr.cov-editing");
+  const setIn = (name, value) => editRow().locator(`[data-c="${name}"]`).fill(String(value));
+  const saveRow = async (expect) => { await clearToast(); await editRow().locator("[data-cov-save]").click(); await waitToast(expect); };
+  const pickMaterial = async (code, name) => {
+    await setIn("material", code);
+    await page.waitForFunction((n) => document.querySelector("#coverageTable tr.cov-editing .cov-material-name")?.textContent === n, name);
   };
   const lineRow = (code) => page.locator("#coverageTable tbody tr.cov-line", { hasText: code });
-  // L1: 2 kg steel per beam, with its T2 supplier in the same window: JGI 30% -> Save adds a row for the other 70%
+  // L1: 2 kg steel per beam with its T2 supplier in the same new row: JGI 30% -> a new row for the other 70%
   await page.click('.table-toolbar [data-cov-add-line=""]');
-  await page.waitForSelector("#covLineTable tbody tr");
-  const lineHeads = await page.locator("#covLineTable thead th summary").allTextContents();
-  check("Material window has the supplier and SOB columns", JSON.stringify(lineHeads.slice(0, 6)) === JSON.stringify(["Material code", "Material name", "Quantity per UF220BFB010", "T2 Supplier Code", "T2 Supplier Name", "SOB (%)"]), JSON.stringify(lineHeads));
-  await fillMaterial("covLineTable", 0, "FL001STEEL0.7", 2);
-  const r0 = page.locator("#covLineTable tbody tr").nth(0);
-  await r0.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2004");
-  await r0.locator('[data-f="sob_percent"]').fill("30");
-  await r0.locator('[data-f="lead_time_days"]').fill("10");
-  await r0.locator('[data-f="unit_price"]').fill("70");
-  await clearToast();
-  await page.click("#covLineSave");
-  await waitToast("remaining SOB");
-  const balance = page.locator("#covLineTable tbody tr").nth(1);
-  check("Save with 30% adds a balance row: same material and quantity, SOB 70, supplier blank", (await page.locator("#covLineTable tbody tr").count()) === 2
-    && (await balance.locator('[data-pick-key="material"][data-pick-part="code"]').inputValue()) === "FL001STEEL0.7" && (await balance.locator('[data-pick-key="material"][data-pick-part="name"]').inputValue()) === "STEEL0.7"
-    && (await balance.locator('[data-f="quantity"]').inputValue()) === "2" && (await balance.locator('[data-f="sob_percent"]').inputValue()) === "70"
-    && (await balance.locator('[data-pick-key="supplier"][data-pick-part="code"]').inputValue()) === "" && (await page.locator("#modalLayer").isVisible()));
-  check("Nothing saved yet", (await api("GET", `/api/planning/supplier-coverage/${(await api("GET", "/api/planning/supplier-parts?tier=T1")).items[0].id}`)).lines.length === 0);
-  await clearToast();
-  await page.click("#covLineSave");
-  await waitToast("pick the supplier for this 70%");
-  check("Balance row without a supplier is refused (pick it or Remove)", true);
-  await balance.locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2014");
-  await balance.locator('[data-f="lead_time_days"]').fill("20");
-  await balance.locator('[data-f="unit_price"]').fill("70");
-  await clearToast();
-  await page.click("#covLineSave");
-  await waitToast("added");
-  await page.waitForSelector('#coverageTable tr.cov-source:has-text("TATA Steel")');
+  await editRow().waitFor();
+  check("+ L1 material adds an empty row in the table (no window)", (await page.locator("#coverageTable tr.cov-editing.cov-new").count()) === 1 && await page.locator("#modalLayer").isHidden());
+  await pickMaterial("FL001STEEL0.7", "STEEL0.7");
+  check("Typing the material code fills its name and unit", (await editRow().locator(".cov-material-unit").textContent()) === "kg");
+  await setIn("quantity", 2);
+  await setIn("supplier", "SUP-2004");
+  check("Typing the supplier code shows its name", (await editRow().locator(".cov-supplier-name").textContent()) === "JGI STEEL");
+  await setIn("sob_percent", 30);
+  await setIn("lead_time_days", 10);
+  await setIn("unit_price", 70);
+  await saveRow("remaining 70%");
+  await page.waitForSelector("#coverageTable tr.cov-editing.cov-source");
+  check("Saved at 30%: a new supplier row for the remaining 70% opens under steel", (await editRow().locator('[data-c="sob_percent"]').inputValue()) === "70" && (await editRow().locator('[data-c="supplier"]').inputValue()) === "" && (await editRow().textContent()).includes("FL001STEEL0.7"));
+  await saveRow("Type the supplier code");
+  check("The balance row needs its supplier (or Cancel)", true);
+  await setIn("supplier", "SUP-2014");
+  await setIn("lead_time_days", 20);
+  await setIn("unit_price", 70);
+  await saveRow("TATA Steel saved for FL001STEEL0.7");
+  await page.waitForFunction(() => !document.querySelector("#coverageTable tr.cov-editing"));
   check("Steel saved with JGI 30% and TATA 70% (nothing else added)", (await page.locator("#coverageTable tr.cov-source").count()) === 2 && (await lineRow("FL001STEEL0.7").locator("td").nth(6).textContent()) === "100%");
-  // L2: steel's BOM, per kg steel: 1.7 kg ore, 0.6 kg coal
+  // L2: steel's BOM, per kg steel: 1.7 kg ore (XYZ, SOB blank = 100%), 0.6 kg coal (supplier added after)
   await lineRow("FL001STEEL0.7").locator("[data-cov-add-line]").click();
-  await page.waitForSelector("#covLineTable tbody tr");
-  await fillMaterial("covLineTable", 0, "ORE-01", 1.7);
-  await page.locator("#covLineTable tbody tr").nth(0).locator('[data-pick-key="supplier"][data-pick-part="code"]').fill("SUP-2030");  // SOB left blank = 100%
-  await fillMaterial("covLineTable", 1, "COAL-01", 0.6);
-  await clearToast();
-  await page.click("#covLineSave");
-  await waitToast("2 material lines added");
+  check("+ L2 material: the new row sits under steel at L2", (await editRow().getAttribute("data-tree-depth")) === "2");
+  await pickMaterial("ORE-01", "Iron ore");
+  await setIn("quantity", 1.7);
+  await setIn("supplier", "SUP-2030");
+  await saveRow("ORE-01 added");
+  await lineRow("FL001STEEL0.7").locator("[data-cov-add-line]").click();
+  await pickMaterial("COAL-01", "Coal");
+  await setIn("quantity", 0.6);
+  await saveRow("COAL-01 added");
   await lineRow("COAL-01").waitFor();
-  check("Ore saved with XYZ at 100% (SOB blank = 100%, no balance row)", (await page.locator('#coverageTable tr.cov-source:has-text("XYZ Mining")').locator("td").nth(6).textContent()) === "100%");
+  check("Ore saved with XYZ at 100% (SOB blank = 100%, no balance row)", (await page.locator('#coverageTable tr.cov-source:has-text("XYZ Mining")').locator("td").nth(6).textContent()) === "100%" && (await page.locator("#coverageTable tr.cov-editing").count()) === 0);
   check("A supplier used at T3 joins the T3 tier", (await api("GET", "/api/suppliers")).find((who) => who.code === "SUP-2030").tiers.includes("T3"));
-  for (const [code, supplier] of [["COAL-01", "SUP-2031"]]) {
-    await lineRow(code).locator("[data-cov-add-source]").click();
-    await page.waitForSelector("#covSourceTable tbody tr");
-    await fillSupplier(0, supplier, 100);
-    await clearToast();
-    await page.click("#covSourceSave");
-    await waitToast("saved");
-  }
+  await lineRow("COAL-01").locator("[data-cov-add-source]").click();
+  check("+ T3 supplier: new row with the SOB left (100)", (await editRow().locator('[data-c="sob_percent"]').inputValue()) === "100");
+  await setIn("sob_percent", "");  // blank = what is left (100%)
+  await setIn("supplier", "ABC Coal");  // by name
+  await setIn("unit_price", 70);
+  await saveRow("ABC Coal saved");
   await page.waitForSelector('#coverageTable tr.cov-source:has-text("ABC Coal")');
+  check("Blank SOB saved as the SOB left (100%)", (await page.locator('#coverageTable tr.cov-source:has-text("ABC Coal")').locator("td").nth(6).textContent()) === "100%");
   // requirement 60,000 beams
   await page.fill("#covRequirement", "60000");
   const read = () => page.locator("#coverageTable tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[3].textContent || tr.cells[4].textContent, tr.cells[6].textContent, tr.cells[8].textContent, tr.cells[10].textContent]));
@@ -149,18 +134,17 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Levels like the Product Master tree (T1 0, L1 1, T2 2, L2 2, T3 3)", levels === "01222323", levels);
   check("Suppliers of a line shown like alternate rows (↳)", (await page.locator("#coverageTable tr.cov-source.tree-alternate").count()) === 4 && (await page.locator('#coverageTable tr.cov-source:has-text("JGI")').locator("td").nth(4).textContent()).startsWith("↳"));
   check("Each supplier has its own lead time (JGI 10, TATA 20)", (await page.locator('#coverageTable tr.cov-source:has-text("JGI")').locator("td").nth(11).textContent()) === "10 days" && (await page.locator('#coverageTable tr.cov-source:has-text("TATA")').locator("td").nth(11).textContent()) === "20 days");
-  // edit JGI to 20%: total 90% shown red; 40% is refused (only 30% left)
+  // edit JGI in its row: 40% is refused (only 30% left); 20% -> total 90% (a balance row is offered: Cancel)
   await page.locator('#coverageTable tr.cov-source:has-text("JGI")').locator("[data-cov-edit-source]").click();
-  await page.waitForSelector("#covSourceTable tbody tr");
-  check("Edit window: SOB left besides JGI is 30%", (await page.locator("#modalBody").textContent()).includes("SOB left: 30%"));
-  await page.locator('#covSourceTable [data-f="sob_percent"]').fill("40");
-  await clearToast();
-  await page.click("#covSourceSave");
-  await waitToast("at most 30%");
+  check("Edit turns the JGI row into boxes (no window)", (await editRow().locator('[data-c="sob_percent"]').inputValue()) === "30" && (await editRow().locator('[data-c="supplier"]').inputValue()) === "SUP-2004" && await page.locator("#modalLayer").isHidden());
+  await setIn("sob_percent", 40);
+  await saveRow("at most 30%");
   check("Too much SOB is refused with what is left", true);
-  await page.locator('#covSourceTable [data-f="sob_percent"]').fill("20");
-  await page.click("#covSourceSave");
-  await page.waitForFunction(() => [...document.querySelectorAll("#coverageTable tr.cov-line")].some((tr) => tr.cells[6].textContent === "90%"));
+  await setIn("sob_percent", 20);
+  await saveRow("remaining 10%");
+  await page.waitForSelector("#coverageTable tr.cov-editing.cov-new");
+  await editRow().locator("[data-cov-cancel]").click();
+  await page.waitForFunction(() => !document.querySelector("#coverageTable tr.cov-editing") && [...document.querySelectorAll("#coverageTable tr.cov-line")].some((tr) => tr.cells[6].textContent === "90%"));
   check("Steel SOB total 90% shown in red", await lineRow("FL001STEEL0.7").locator("td").nth(6).evaluate((td) => td.classList.contains("sob-off")));
   check("JGI requirement follows (72,000 x 20% = 14,400 kg)", (await page.locator('#coverageTable tr.cov-source:has-text("JGI")').locator("td").nth(10).textContent()) === "14,400 kg");
   // + / -
@@ -170,15 +154,26 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await lineRow("FL001STEEL0.7").locator("[data-sb-toggle]").click();
   check("+ opens them again", (await visible()) === 8);
   await page.screenshot({ path: __dirname + "/supply_chain.png" });
-  // edit a quantity, delete a line
+  // Edit T1 in its row
+  await page.click("[data-cov-edit-t1]");
+  await setIn("lead_time_days", 16);
+  await saveRow("T1 saved");
+  await page.waitForFunction(() => document.querySelector("#coverageTable tr.cov-t1")?.cells[11].textContent === "16 days");
+  check("Edit T1 in the row: lead time 16 days", true);
+  // edit a quantity (Enter saves), Esc cancels, delete a line
   await lineRow("COAL-01").locator("[data-cov-edit-line]").click();
-  await page.fill('#covQtyForm [name="quantity"]', "0.5");
-  await page.click('#covQtyForm button[type="submit"]');
+  await setIn("quantity", 0.5);
+  await clearToast();
+  await editRow().locator('[data-c="quantity"]').press("Enter");
   await page.waitForFunction(() => [...document.querySelectorAll("#coverageTable tr.cov-line")].some((tr) => tr.textContent.includes("COAL-01") && tr.cells[10].textContent === "36,000 kg"));
-  check("Coal 0.5 kg per kg steel -> 36,000 kg", true);
+  check("Coal 0.5 kg per kg steel -> 36,000 kg (Enter saves)", true);
+  await lineRow("COAL-01").locator("[data-cov-edit-line]").click();
+  await editRow().locator('[data-c="quantity"]').press("Escape");
+  check("Esc cancels the edit", (await page.locator("#coverageTable tr.cov-editing").count()) === 0);
   await lineRow("COAL-01").locator("[data-cov-delete-line]").click();
-  await page.waitForFunction(() => !document.querySelector("#coverageTable")?.textContent.includes("ABC Coal") && document.querySelector("#coverageTable tbody tr"));
+  await page.waitForFunction(() => document.querySelector("#coverageTable tbody") && !document.querySelector("#coverageTable tbody").textContent.includes("ABC Coal"));
   check("Delete a line removes it and its supplier", (await page.locator("#coverageTable tbody tr").count()) === 6);
+  check("No pop-up window was used on the coverage page", await page.locator("#modalLayer").isHidden());
   check("Requirement kept after the redraw", (await page.inputValue("#covRequirement")) === "60000");
   // supplier-wise Excel: download the template (what is saved) and upload it back
   const templateHref = await page.getAttribute("#coverageTemplate", "href");
@@ -196,7 +191,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.locator('#covCrumbs a[data-open-supplier-overview]').click();
   await page.waitForSelector('#ovParts tbody tr:has-text("UF220BFB010")');
   const ovPart = await page.locator('#ovParts tbody tr:has-text("UF220BFB010") td').allTextContents();
-  check("Overview 1: part, SOB 60%, rate, no plan -> requirement 0", ovPart[0] === "UF220BFB010" && ovPart[2] === "60%" && ovPart[3].includes("85") && ovPart[5] === "0" && ovPart[6] === "0", JSON.stringify(ovPart));
+  check("Overview 1: part, SOB 60%, rate, no plan -> requirement 0", ovPart[0] === "UF220BFB010" && ovPart[2] === "60%" && ovPart[3].includes("85") && ovPart[5] === "0", JSON.stringify(ovPart));
   check("Overview plan note when no plan", (await page.textContent("#ovPlan")).includes("no plan uploaded"));
   const ovTree = await page.locator("#ovTree tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[2].textContent, tr.cells[5].textContent, tr.cells[6].textContent]));
   check("Overview 2-3: part BOM with sub-supplier SOB", JSON.stringify(ovTree) === JSON.stringify([["T1 part", "UF220BFB010", "Savera", "60%"], ["L1 BOM", "FL001STEEL0.7", "", "90%"], ["T2 supplier", "↳ FL001STEEL0.7", "JGI STEEL", "20%"], ["T2 supplier", "↳ FL001STEEL0.7", "TATA Steel", "70%"], ["L2 BOM", "ORE-01", "", "100%"], ["T3 supplier", "↳ ORE-01", "XYZ Mining", "100%"]]), JSON.stringify(ovTree));
