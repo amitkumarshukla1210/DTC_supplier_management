@@ -1447,6 +1447,10 @@ async function loadSupplierOverview() {
   const priced = canSeePrices();
   const ddmm = (iso) => (iso ? iso.split("-").reverse().join("-") : "");
   $("#ovTitle").textContent = `${data.supplier.code} ${data.supplier.name}`;
+  const who = data.supplier.name;
+  $("#ovHead1").textContent = `1. ${who} · Parts supplied & Material Master (Rate, SOB, Requirement & Stock)`;
+  $("#ovHead2").textContent = `2. ${who} · Parts BOM (L2, L3) & Sub Supplier (T2, T3) Master (Qty, SOB)`;
+  $("#ovHead3").textContent = `3. ${who} · RM Master (Blended SOB, Requirement, Rate & Stock)`;
   $("#ovPlan").textContent = data.plan ? `${monthLabel(data.month)} · plan ${data.plan.revision}${data.plan.release_date ? ` of ${ddmm(data.plan.release_date)}` : ""}` : `${monthLabel(data.month)} · no plan uploaded: requirement 0`;
   const qty = (value) => (value === null || value === undefined ? "" : number(value));
   const rate = (item) => (priced && item.unit_price !== undefined ? money(item.unit_price, item.currency) : "Restricted");
@@ -2289,12 +2293,12 @@ async function renderSupplierControl() {
     body = `<nav class="crumbs"><a href="#" data-close-overview>Supplier register</a> › <strong id="ovTitle">Supplier</strong></nav>
       <section class="panel table-panel">${panelHeader("Supplier overview", "The parts this supplier makes for you with SOB, rate, FG stock and requirement (from the plan in force for the month × each model's BOM × SOB); each part's BOM with its sub-suppliers' SOB, rate, requirement and stock; and the sub-supplier list. Change data in Supplier/material relationship (parts) and the part's coverage (BOM and sub-suppliers).")}
         <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Month</span><input class="form-control" type="month" id="ovMonth" value="${state.overviewMonth || monthNow()}" /></label><span class="subtle" id="ovPlan"></span></div><span class="toolbar-add"><button type="button" class="button button-small" id="ovEditParts">Edit parts</button></span></div>
-        <h3 class="subtable-heading">1. Parts supplied: SOB, rate, FG stock and requirement</h3>
+        <h3 class="subtable-heading" id="ovHead1">1. Parts supplied & Material Master (Rate, SOB, Requirement & Stock)</h3>
         <div id="ovParts"><div class="tree-loading">Loading…</div></div>
-        <h3 class="subtable-heading">2–3. Part BOM and sub-supplier SOB, rate and requirement (from the net requirement)</h3>
+        <h3 class="subtable-heading" id="ovHead2">2. Parts BOM (L2, L3) & Sub Supplier (T2, T3) Master (Qty, SOB)</h3>
         <div class="table-toolbar"><span class="toolbar-add"><button type="button" class="button button-small" id="ovOpenAll">Open all</button><button type="button" class="button button-small" id="ovCloseAll">Close all</button></span></div>
         <div id="ovTree"></div>
-        <h3 class="subtable-heading">4–6. Sub-supplier list: one line per sub-supplier and material (blended over the parts); change SOB or rate and Save; type the stock and press Enter</h3>
+        <h3 class="subtable-heading" id="ovHead3">3. RM Master (Blended SOB, Requirement, Rate & Stock)</h3>
         <div id="ovSubs"></div>
       </section>`;
   } else if (tab === "Supplier register") {
