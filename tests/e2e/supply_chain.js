@@ -238,6 +238,8 @@ wb = openpyxl.load_workbook(sys.argv[1]); ws = wb.active
 for r in range(4, ws.max_row + 1):
     if (ws.cell(r, 1).value or "").strip() == "T1 part":
         ws.cell(r, 9).value, ws.cell(r, 10).value, ws.cell(r, 11).value = 800, 750, "2027-02"
+    if (ws.cell(r, 1).value or "").strip() == "T2 supplier" and ws.cell(r, 2).value == "SUP-2014":
+        ws.cell(r, 9).value, ws.cell(r, 10).value = 12000, 11000
 wb.save(sys.argv[1])`, stockFile]);
   check("Template filled", filled.status === 0, String(filled.stderr));
   await page.setInputFiles('#supplierStockForm input[type="file"]', stockFile);
@@ -245,6 +247,7 @@ wb.save(sys.argv[1])`, stockFile]);
   await page.click('#supplierStockForm button[type="submit"]');
   await page.waitForFunction(() => /row|Row|stock/.test(document.querySelector("#toast")?.textContent || ""));
   await page.waitForFunction(() => document.querySelector("#supplyTreeTable tr.st-part")?.cells[9].textContent === "800");
+  check("Stock typed on the T2 supplier row (TATA) shows on that row", await page.locator('#supplyTreeTable tr.st-source:has-text("TATA Steel")').evaluate((tr) => tr.cells[9].textContent === "12,000" && tr.cells[10].textContent === "11,000"));
   check("Uploaded stock shows on the part row (800 / 750 / Feb 2027)", await page.locator("#supplyTreeTable tr.st-part").evaluate((tr) => tr.cells[10].textContent === "750" && tr.cells[11].textContent.includes("2027")));
 
   check("No page errors", errors.length === 0, errors.join(" | "));

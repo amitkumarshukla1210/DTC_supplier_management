@@ -216,6 +216,7 @@ class PlanningCycle(Base):
     workspace: Mapped[str] = mapped_column(String(16), index=True)
     issue_month: Mapped[str] = mapped_column(String(7), index=True)
     revision: Mapped[int] = mapped_column(Integer)
+    release_date: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD from the plan sheet
     created_by: Mapped[int] = mapped_column(ForeignKey("app_users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -264,6 +265,24 @@ class SupplierStockSnapshot(Base):
     workspace: Mapped[str] = mapped_column(String(16), index=True)
     report_month: Mapped[str] = mapped_column(String(7), index=True)
     supplier_part_id: Mapped[int] = mapped_column(ForeignKey("supplier_parts.id", ondelete="CASCADE"), index=True)
+    quantity: Mapped[float] = mapped_column(Float, default=0)
+    available_quantity: Mapped[float] = mapped_column(Float, default=0)
+    arrival_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
+
+
+class SupplierSourceStock(Base):
+    """Stock at a T2 / T3 / T4 supplier for its place in a T1 part's BOM (Upload supplier stock tree): the
+    T1 supplier and part, the material line's code and the supplier of that line."""
+    __tablename__ = "supplier_source_stock"
+    __table_args__ = (UniqueConstraint("workspace", "report_month", "t1_supplier_id", "product_material_id", "material_code", "sub_supplier_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(16), index=True)
+    report_month: Mapped[str] = mapped_column(String(7), index=True)
+    t1_supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    product_material_id: Mapped[int] = mapped_column(ForeignKey("items.id"), index=True)
+    material_code: Mapped[str] = mapped_column(String(48))
+    sub_supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
     quantity: Mapped[float] = mapped_column(Float, default=0)
     available_quantity: Mapped[float] = mapped_column(Float, default=0)
     arrival_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
@@ -621,6 +640,8 @@ class SupplierStockRows(BaseModel):
 class PlanUpload(BaseModel):
     issue_month: str
     workspace: str = "trial"
+    revision: int | None = Field(default=None, ge=0, le=999)  # from the sheet's Plan revision (Rev.01); none = next
+    release_date: str | None = None  # YYYY-MM-DD
     rows: list[dict[str, Any]] = Field(min_length=1, max_length=250_000)
 
 
@@ -843,6 +864,95 @@ def _required_columns(rows: list[dict[str, Any]], required: set[str]) -> None:
     missing = required - set(rows[0])
     if missing:
         raise HTTPException(status_code=422, detail=f"Excel sheet is missing required columns: {', '.join(sorted(missing))}")
+
+
+def _sheet_date(value: Any) -> date | None:
+    """A date cell or text such as 01-01-2026 (DD-MM-YYYY), 2026-01-01 or 01/01/2026."""
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    for date_format in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(str(value).strip(), date_format).date()
+        except ValueError:
+            continue
+    raise HTTPException(status_code=422, detail=f"{value} is not a date; use DD-MM-YYYY")
+
+
+def _plan_blocks(raw: bytes) -> list[dict[str, Any]] | None:
+    """Plan sheet as in the template: blocks of Model Code | Model Name | Release date | Plan revision | one
+    column per month (01-01-2026 ...). A sheet may hold several blocks (one per revision). None: not this layout."""
+    try:
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        lines = list(workbook.active.iter_rows(values_only=True))
+        workbook.close()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Could not read the Excel workbook; use a valid .xlsx file") from exc
+
+    def key(value: Any) -> str:
+        return re.sub(r"\s+", "_", str(value or "").strip().lower())
+
+    blocks: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for number, line in enumerate(lines, start=1):
+        keys = [key(value) for value in line]
+        if "model_code" in keys and ("release_date" in keys or "plan_revision" in keys):
+            columns, months = {}, []
+            for index, value in enumerate(line):
+                if keys[index] in ("model_code", "model_name", "release_date", "plan_revision"):
+                    columns[keys[index]] = index
+                elif value is not None and str(value).strip():
+                    try:
+                        months.append((index, _month_text(_month(value))))
+                    except HTTPException:
+                        continue
+            if not months:
+                raise HTTPException(status_code=422, detail=f"Row {number}: the heading row has no month columns (01-01-2026 ...)")
+            if len({month for _, month in months}) != len(months):
+                raise HTTPException(status_code=422, detail=f"Row {number}: the same month is twice in the heading row")
+            current = {"row": number, "columns": columns, "months": months, "rows": []}
+            blocks.append(current)
+            continue
+        if current is None:
+            continue
+        if all(value is None or str(value).strip() == "" for value in line):
+            current = None  # a blank row ends the block
+            continue
+        cell = lambda name: line[current["columns"][name]] if name in current["columns"] and current["columns"][name] < len(line) else None
+        code = str(cell("model_code") or "").strip()
+        if not code:
+            continue
+        try:
+            released = _sheet_date(cell("release_date"))
+        except HTTPException as exc:
+            raise HTTPException(status_code=422, detail=f"Row {number}: Release date {exc.detail}") from exc
+        revision_text = str(cell("plan_revision") or "").strip()
+        found = re.search(r"\d+", revision_text)
+        quantities = {}
+        for index, month in current["months"]:
+            value = line[index] if index < len(line) else None
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                quantities[month] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"Row {number}: {value} is not a quantity") from exc
+        current["rows"].append({"row": number, "code": code, "name": str(cell("model_name") or "").strip(), "released": released,
+                                "revision": int(found.group()) if found else None, "quantities": quantities})
+    blocks = [block for block in blocks if block["rows"]]
+    if not blocks:
+        return None
+    for block in blocks:
+        dates = {row["released"] for row in block["rows"] if row["released"]}
+        revisions = {row["revision"] for row in block["rows"] if row["revision"] is not None}
+        if len(dates) > 1 or len(revisions) > 1:
+            raise HTTPException(status_code=422, detail=f"The block starting on row {block['row']} has more than one release date or revision; one block = one revision")
+        block["released"] = next(iter(dates), None)
+        block["revision"] = next(iter(revisions), None)
+    return blocks
 
 
 def _plan_rows_from_excel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1597,6 +1707,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                    ("price_updated_month", f"VARCHAR(7) NOT NULL DEFAULT '{_month_text(date.today())}'")):
             if column not in present:
                 db.execute(sa_text(f"ALTER TABLE supplier_bom_line_sources ADD COLUMN {column} {definition}"))
+        if "release_date" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("planning_cycles")}:
+            db.execute(sa_text("ALTER TABLE planning_cycles ADD COLUMN release_date VARCHAR(10)"))
         # bom_line_alternates gained from_month (SOB history); earlier SOB applies from the start
         if "from_month" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("bom_line_alternates")}:
             db.execute(sa_text("ALTER TABLE bom_line_alternates ADD COLUMN from_month VARCHAR(7) NOT NULL DEFAULT ''"))
@@ -4986,9 +5098,19 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         issue = _month(payload.issue_month)
         issue_month = _month_text(issue)
         with open_db() as db:
-            models_by_code = {m.code: m for m in db.scalars(select(ProductModel)).all()}
+            models_by_code: dict[str, list[ProductModel]] = {}
+            for model in db.scalars(select(ProductModel)).all():
+                models_by_code.setdefault(model.code, []).append(model)
             latest_revision = db.scalar(select(func.max(PlanningCycle.revision)).where(PlanningCycle.workspace == payload.workspace, PlanningCycle.issue_month == issue_month))
             revision = 0 if latest_revision is None else latest_revision + 1
+            if payload.revision is not None:
+                taken = db.scalar(select(PlanningCycle).where(PlanningCycle.workspace == payload.workspace, PlanningCycle.issue_month == issue_month,
+                                                              PlanningCycle.revision == payload.revision))
+                if taken:
+                    raise HTTPException(status_code=409, detail=f"Rev.{payload.revision:02d} of {issue_month} is already loaded"
+                                        + (f" (released {date.fromisoformat(taken.release_date).strftime('%d-%m-%Y')})" if taken.release_date else "")
+                                        + "; change the Plan revision in the sheet")
+                revision = payload.revision
             normalized = []
             seen = set()
             for row in payload.rows:
@@ -5000,24 +5122,58 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 quantity = float(row.get("quantity", 0))
                 if quantity < 0 or quantity > 1_000_000_000:
                     raise HTTPException(status_code=422, detail="Plan quantity must be between zero and one billion")
-                model = models_by_code.get(code)
-                if not model:
-                    raise HTTPException(status_code=422, detail=f"Unknown model code: {code}")
+                where = f"Row {row['_row']}: " if row.get("_row") else ""
+                matches = models_by_code.get(code, [])
+                name = str(row.get("model_name") or "").strip()
+                if len(matches) > 1 and name:  # a model code used by more than one model (e.g. FL12000 Eva / Serena): the name decides
+                    matches = [model for model in matches if model.name.strip().casefold() == name.casefold()]
+                if not matches:
+                    raise HTTPException(status_code=422, detail=f"{where}Unknown model code: {code}{f' ({name})' if name else ''}")
+                if len(matches) > 1:
+                    raise HTTPException(status_code=422, detail=f"{where}Model code {code} is used by {len(matches)} models; give the Model Name")
+                model = matches[0]
+                if name and " ".join(model.name.split()).casefold() != " ".join(name.split()).casefold():
+                    raise HTTPException(status_code=422, detail=f"{where}{code} is {model.name} in Product Master, not {name}; check the Model Code")
                 key = (target, model.id)
                 if key in seen:
                     raise HTTPException(status_code=422, detail=f"Duplicate plan row for model {code} in {target}")
                 seen.add(key)
                 normalized.append((target, model.id, quantity))
-            cycle = PlanningCycle(workspace=payload.workspace, issue_month=issue_month, revision=revision, created_by=user["id"])
+            cycle = PlanningCycle(workspace=payload.workspace, issue_month=issue_month, revision=revision, created_by=user["id"],
+                                  release_date=_sheet_date(payload.release_date).isoformat() if payload.release_date else None)
             db.add(cycle)
             db.flush()
             db.add_all(PlanLine(cycle_id=cycle.id, target_month=target, model_id=model_id, quantity=quantity) for target, model_id, quantity in normalized)
             db.commit()
-            return {"id": cycle.id, "workspace": cycle.workspace, "issue_month": cycle.issue_month, "revision": f"Rev.{revision:02d}", "revision_number": revision, "rows": len(normalized)}
+            return {"id": cycle.id, "workspace": cycle.workspace, "issue_month": cycle.issue_month, "revision": f"Rev.{revision:02d}", "revision_number": revision,
+                    "rows": len(normalized), "release_date": cycle.release_date}
 
     @app.post("/api/planning/plans/{issue_month}/upload", status_code=201)
-    async def upload_plan_excel(issue_month: str, request: Request, workspace: str = "trial"):
+    async def upload_plan_excel(issue_month: str, request: Request, workspace: str = "trial", release_date: str = ""):
         raw = await request.body()
+        blocks = _plan_blocks(raw)
+        if blocks is not None:  # the plan template: one revision per upload, picked by its release date
+            picked_date = _sheet_date(release_date) if release_date else None
+            if picked_date:
+                chosen = [block for block in blocks if block["released"] == picked_date]
+            else:
+                chosen = blocks if len(blocks) == 1 else []
+            shown = lambda day: day.strftime("%d-%m-%Y") if day else "(blank)"
+            if not chosen:
+                listed = ", ".join(f"{shown(block['released'])} (Rev.{block['revision']:02d})" if block["revision"] is not None else shown(block["released"]) for block in blocks)
+                raise HTTPException(status_code=422, detail=(f"No plan in the file is released on {shown(picked_date)}. " if picked_date else "The file has more than one plan. ")
+                                    + f"Plans in the file: {listed}. Pick that release date and upload again.")
+            if len(chosen) > 1:
+                raise HTTPException(status_code=422, detail=f"The file has {len(chosen)} plans released on {shown(picked_date)}; keep one")
+            block = chosen[0]
+            rows = [{"model_code": row["code"], "model_name": row["name"], "target_month": month, "quantity": quantity, "_row": row["row"]}
+                    for row in block["rows"] for month, quantity in row["quantities"].items()]
+            if not rows:
+                raise HTTPException(status_code=422, detail="The plan has no quantities")
+            released = block["released"] or picked_date
+            payload = PlanUpload(issue_month=block["months"][0][1], workspace=workspace, rows=rows, revision=block["revision"],
+                                 release_date=released.isoformat() if released else None)
+            return upload_plan(payload, request)
         rows = _read_xlsx(raw)
         payload = PlanUpload(issue_month=_month_text(_month(issue_month)), workspace=workspace, rows=_plan_rows_from_excel(rows))
         return upload_plan(payload, request)
@@ -5037,7 +5193,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 result.append({
                     "id": cycle.id, "workspace": cycle.workspace, "issue_month": cycle.issue_month,
                     "revision": f"Rev.{cycle.revision:02d}", "revision_number": cycle.revision,
-                    "created_at": cycle.created_at.isoformat(),
+                    "created_at": cycle.created_at.isoformat(), "release_date": cycle.release_date,
                     "row_count": db.scalar(select(func.count(PlanLine.id)).where(PlanLine.cycle_id == cycle.id)) or 0,
                 })
             return result
@@ -5145,7 +5301,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             saved = 0
             for row in payload.rows:
                 code = str(row.get("model_code", "")).strip()
-                model = models_by_code.get(code)
+                model = models_by_code.get(code)  # actuals: one model per code
                 if not model:
                     raise HTTPException(status_code=422, detail=f"Unknown model code: {code}")
                 quantity = float(row.get("actual_quantity", row.get("quantity", 0)))
@@ -5263,6 +5419,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             stock = {row.supplier_part_id: row for row in db.scalars(select(SupplierStockSnapshot).where(
                 SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == month)).all()}
             with_bom = set(db.execute(select(SupplierBOMLine.supplier_id, SupplierBOMLine.product_material_id).distinct()).all())
+            source_stock = {(row.t1_supplier_id, row.product_material_id, row.material_code.casefold(), row.sub_supplier_id): row
+                            for row in db.scalars(select(SupplierSourceStock).where(SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == month)).all()}
             nodes: list[dict] = []
             by_supplier: dict[int, list[SupplierPart]] = {}
             for link in links:
@@ -5286,9 +5444,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                       "material_name": component["name"], "bom_qty": line["quantity"], "uom": component["uom"],
                                       "sob_percent": sum(src["sob_percent"] for src in line["sources"]) if line["sources"] else None})
                         for src in line["sources"]:
+                            held = source_stock.get((supplier_id, link.material_id, component["code"].casefold(), src["sub_supplier_id"]))
                             nodes.append({"depth": line["depth"] + 2, "level": f"T{line['depth'] + 1} supplier", "supplier_code": src["sub_supplier_code"],
                                           "supplier_name": src["sub_supplier"], "material_code": component["code"], "material_name": component["name"],
-                                          "sob_percent": src["sob_percent"], "uom": component["uom"], "lead_time_days": src["lead_time_days"]})
+                                          "sob_percent": src["sob_percent"], "uom": component["uom"], "lead_time_days": src["lead_time_days"],
+                                          "stock": held.quantity if held else None, "available": held.available_quantity if held else None,
+                                          "arrival_month": held.arrival_month if held else None})
             return {"report_month": month, "workspace": workspace, "items": nodes}
 
     @app.get("/api/planning/supply-tree.{file_format}")
@@ -5349,11 +5510,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             ).all()
             rows = [(stock, link, db.get(Item, link.material_id) if link.material_id else db.get(TierMaterial, link.tier_material_id), supplier)
                     for stock, link, supplier in rows]
-            return {"report_month": report_month, "items": [
+            items = [
                 {"id": stock.id, "supplier_part_id": link.id, "supplier_code": supplier.code, "supplier_name": supplier.name,
                  "material_code": item.code, "material_name": item.name, "uom": item.uom, "tier": link.tier,
                  "quantity": stock.quantity, "available_quantity": stock.available_quantity, "arrival_month": stock.arrival_month}
-                for stock, link, item, supplier in rows]}
+                for stock, link, item, supplier in rows]
+            for held in db.scalars(select(SupplierSourceStock).where(SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == report_month)).all():
+                who, t1, part = db.get(Supplier, held.sub_supplier_id), db.get(Supplier, held.t1_supplier_id), db.get(Item, held.product_material_id)
+                own = db.scalar(select(SupplierMaterial).where(SupplierMaterial.supplier_id == held.t1_supplier_id, func.lower(SupplierMaterial.code) == held.material_code.casefold()))
+                items.append({"id": None, "supplier_part_id": None, "supplier_code": who.code, "supplier_name": who.name, "material_code": held.material_code,
+                              "material_name": own.name if own else "", "uom": own.uom if own else "", "tier": f"T2+ for {t1.name} · {part.code}",
+                              "quantity": held.quantity, "available_quantity": held.available_quantity, "arrival_month": held.arrival_month})
+            return {"report_month": report_month, "items": items}
 
     def stock_rows_from_tree(raw: bytes) -> list[dict] | None:
         """Rows of the supply chain tree workbook with stock typed on T1 part rows (None: not that workbook)."""
@@ -5364,9 +5532,18 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         except HTTPException:
             return None
         out = []
+        part: tuple[str, str] | None = None  # the T1 supplier and part above (for T2 / T3 supplier rows)
         for row in rows:
-            if str(row.get("level") or "").strip().casefold() != "t1 part" or row.get("quantity") in (None, ""):
+            level = str(row.get("level") or "").strip().casefold()
+            if level == "t1 supplier":
+                part = None
+            elif level == "t1 part":
+                part = (str(row.get("supplier_code") or "").strip(), str(row.get("material_code") or "").strip())
+            source = re.fullmatch(r"t([2-9]) supplier", level)
+            if (level != "t1 part" and not source) or row.get("quantity") in (None, ""):
                 continue
+            if source and part is None:
+                raise HTTPException(status_code=422, detail=f"Row {row['_excel_row']}: a {level.upper().replace(' SUPPLIER', '')} supplier row must be under its T1 part row")
             arrival = row.get("arrival_month")
             if hasattr(arrival, "strftime"):
                 arrival = arrival.strftime("%Y-%m")
@@ -5375,9 +5552,47 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 available = float(row["available_quantity"]) if row.get("available_quantity") not in (None, "") else None
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"Row {row['_excel_row']}: stock quantities must be numbers") from exc
-            out.append({"supplier_code": str(row["supplier_code"]).strip(), "material_code": str(row["material_code"]).strip(), "tier": "T1",
-                        "quantity": quantity, "available_quantity": available, "arrival_month": arrival or "", "_excel_row": row["_excel_row"]})
+            entry = {"supplier_code": str(row["supplier_code"]).strip(), "material_code": str(row["material_code"]).strip(), "tier": "T1",
+                     "quantity": quantity, "available_quantity": available, "arrival_month": arrival or "", "_excel_row": row["_excel_row"]}
+            if source:
+                entry.update(tier=f"T{source.group(1)}", t1_supplier_code=part[0], part_code=part[1])
+            out.append(entry)
         return out
+
+    def save_source_stock(db: Session, workspace: str, report_month: str, rows: list[dict]) -> int:
+        """Stock typed on T2 / T3 / T4 supplier rows of the tree: checked against the T1 part's BOM."""
+        suppliers = {who.code.casefold(): who for who in db.scalars(select(Supplier)).all()}
+        items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
+        saved = 0
+        for row in rows:
+            where = f"Row {row['_excel_row']}: "
+            t1, part, who = suppliers.get(row["t1_supplier_code"].casefold()), items.get(row["part_code"].casefold()), suppliers.get(row["supplier_code"].casefold())
+            if not t1 or not part:
+                raise HTTPException(status_code=422, detail=f"{where}T1 part {row['part_code']} of {row['t1_supplier_code']} is not found")
+            if not who:
+                raise HTTPException(status_code=422, detail=f"{where}supplier {row['supplier_code']} is not in the Supplier register")
+            supplies = db.scalar(select(SupplierBOMLineSource.id).join(SupplierBOMLine, SupplierBOMLine.id == SupplierBOMLineSource.line_id)
+                                 .join(SupplierMaterial, SupplierMaterial.id == SupplierBOMLine.supplier_material_id)
+                                 .where(SupplierBOMLine.supplier_id == t1.id, SupplierBOMLine.product_material_id == part.id,
+                                        func.lower(SupplierMaterial.code) == row["material_code"].casefold(), SupplierBOMLineSource.sub_supplier_id == who.id).limit(1))
+            if not supplies:
+                raise HTTPException(status_code=422, detail=f"{where}{who.name} is not a supplier of {row['material_code']} in the BOM of {part.code} ({t1.name})")
+            if row["quantity"] < 0 or (row["available_quantity"] is not None and row["available_quantity"] < 0):
+                raise HTTPException(status_code=422, detail=f"{where}stock cannot be negative")
+            arrival = _month_text(_month(row["arrival_month"])) if row["arrival_month"] else None
+            stock = db.scalar(select(SupplierSourceStock).where(
+                SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == report_month, SupplierSourceStock.t1_supplier_id == t1.id,
+                SupplierSourceStock.product_material_id == part.id, func.lower(SupplierSourceStock.material_code) == row["material_code"].casefold(),
+                SupplierSourceStock.sub_supplier_id == who.id))
+            if not stock:
+                stock = SupplierSourceStock(workspace=workspace, report_month=report_month, t1_supplier_id=t1.id, product_material_id=part.id,
+                                            material_code=row["material_code"], sub_supplier_id=who.id)
+                db.add(stock)
+            stock.quantity = row["quantity"]
+            stock.available_quantity = row["quantity"] if row["available_quantity"] is None else row["available_quantity"]
+            stock.arrival_month = arrival
+            saved += 1
+        return saved
 
     @app.post("/api/planning/supplier-stock/{report_month}/upload", status_code=201)
     async def upload_supplier_stock_excel(report_month: str, request: Request, workspace: str = "trial"):
@@ -5386,6 +5601,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         _validate_workspace(workspace)
         _month(report_month)
         raw = await request.body()
+        source_rows: list[dict] = []
         try:
             rows = _read_xlsx(raw)
             plain_error = None
@@ -5394,9 +5610,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         if not rows or not {"supplier_code", "material_code", "quantity"} <= set(rows[0]):
             tree_rows = stock_rows_from_tree(raw)  # the tree workbook (template / download), stock typed on T1 part rows
             if tree_rows is not None:
-                rows = tree_rows
+                rows = [row for row in tree_rows if row["tier"] == "T1"]
+                source_rows = [row for row in tree_rows if row["tier"] != "T1"]
+                if not tree_rows:
+                    raise HTTPException(status_code=422, detail="No stock typed: fill Stock quantity on the T1 part or T2 / T3 supplier rows")
                 if not rows:
-                    raise HTTPException(status_code=422, detail="No stock typed: fill Stock quantity on the T1 part rows")
+                    with open_db() as db:
+                        saved = save_source_stock(db, workspace, _month_text(_month(report_month)), source_rows)
+                        db.commit()
+                    return {"workspace": workspace, "report_month": _month_text(_month(report_month)), "rows": saved}
             elif plain_error is not None:
                 raise plain_error
         _required_columns(rows, {"supplier_code", "material_code", "quantity"})
@@ -5436,6 +5658,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 available = float(row.get("available_quantity")) if row.get("available_quantity") is not None else None
                 save_stock(db, workspace, report_month, link, quantity, available, str(row.get("arrival_month") or ""))
                 saved += 1
+            saved += save_source_stock(db, workspace, _month_text(_month(report_month)), source_rows)
             db.commit()
             return {"workspace": workspace, "report_month": report_month, "rows": saved}
 
@@ -5470,8 +5693,65 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         output = _report_pdf(rows, f"Shortage and excess · {start_month} to {end_month}")
         return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="dtc-analysis-{start_month}-{end_month}.pdf"'})
 
+    def plan_template_workbook(issue_month: str | None, release_date: str | None) -> StreamingResponse:
+        """Plan template as the user keeps it: logo and title, then Model Code | Model Name | Release date |
+        Plan revision | 20 months (DD-MM-YYYY), one row per model."""
+        first_month = _month(issue_month or _month_text(date.today()))
+        released = _sheet_date(release_date) if release_date else date.today()
+        with open_db() as db:
+            models = db.scalars(select(ProductModel).order_by(ProductModel.code, ProductModel.name)).all()
+            taken = db.scalar(select(func.max(PlanningCycle.revision)).where(PlanningCycle.workspace == "trial", PlanningCycle.issue_month == _month_text(first_month)))
+            rows = [(model.code, model.name) for model in models]
+        next_revision = 0 if taken is None else taken + 1
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Plan"
+        dark, white = PatternFill("solid", fgColor="12263A"), Font(bold=True, color="FFFFFF")
+        try:  # the app logo (needs Pillow; the template works without it)
+            from openpyxl.drawing.image import Image as SheetImage
+            logo = SheetImage(str(Path(__file__).resolve().parent / "static" / "logo.png"))
+            logo.width = logo.height = 48
+            sheet.add_image(logo, "A1")
+        except Exception:
+            pass
+        sheet.row_dimensions[1].height = 22
+        sheet.row_dimensions[2].height = 22
+        sheet["B1"] = "Design to Cost · Production plan"
+        sheet["B1"].font = Font(bold=True, size=14, color="12263A")
+        sheet["B2"] = (f"Plan from {first_month.strftime('%d-%m-%Y')} for 20 months · dates DD-MM-YYYY. One block = one revision; a sheet may hold several "
+                       "blocks (Rev.00, Rev.01 ...), each with its Release date. On upload pick the release date of the block to load.")
+        sheet["B2"].font = Font(italic=True, color="5B6B7B")
+        months = [_plus_months(first_month, offset) for offset in range(20)]
+        headers = ["Model Code", "Model Name", "Release date", "Plan revision"] + months
+        for index, value in enumerate(headers, start=1):
+            cell = sheet.cell(4, index, value)
+            cell.fill, cell.font = dark, white
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if index > 4:
+                cell.number_format = "DD-MM-YYYY"
+        for row_index, (code, name) in enumerate(rows or [("", "")], start=5):
+            sheet.cell(row_index, 1, code)
+            sheet.cell(row_index, 2, name)
+            released_cell = sheet.cell(row_index, 3, released)
+            released_cell.number_format = "DD-MM-YYYY"
+            sheet.cell(row_index, 4, f"Rev.{next_revision:02d}")
+            for column in range(5, 25):
+                sheet.cell(row_index, column).number_format = "#,##0.###"
+        sheet.column_dimensions["A"].width = 16
+        sheet.column_dimensions["B"].width = 26
+        sheet.column_dimensions["C"].width = 14
+        sheet.column_dimensions["D"].width = 13
+        for column in range(5, 25):
+            sheet.column_dimensions[__import__("openpyxl").utils.get_column_letter(column)].width = 12
+        sheet.freeze_panes = "E5"
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f'attachment; filename="plan-template-{first_month.strftime("%m-%Y")}.xlsx"'})
+
     @app.get("/api/planning/templates/{kind}.xlsx")
-    def planning_template(kind: str, request: Request, issue_month: str | None = None):
+    def planning_template(kind: str, request: Request, issue_month: str | None = None, release_date: str | None = None):
         current_user(request)
         templates = {
             "actuals": ["model_code", "actual_quantity", "oem_stock"],
@@ -5493,20 +5773,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         sheet = workbook.active
         sheet.title = kind[:31]
         if kind == "plan":
-            first_month = _month(issue_month or _month_text(date.today()))
-            headers: list[Any] = ["model_code", "model_MONTH"]
-            headers.extend(_plus_months(first_month, offset) for offset in range(24))
-            sheet.append(headers)
-            for column in range(3, 27):
-                sheet.cell(1, column).number_format = "mmm-yy"
-            sheet.freeze_panes = "C2"
-            sheet.column_dimensions["A"].width = 18
-            sheet.column_dimensions["B"].width = 26
-            for column in range(3, 27):
-                sheet.column_dimensions[__import__("openpyxl").utils.get_column_letter(column)].width = 14
-            for column in range(3, 27):
-                for row_index in range(2, 1002):
-                    sheet.cell(row_index, column).number_format = "#,##0.###"
+            return plan_template_workbook(issue_month, release_date)
         else:
             headers = bom_templates.get(kind, templates.get(kind, []))
             sheet.append(headers)

@@ -461,6 +461,59 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(transfer.status_code, 201, transfer.text)
         self.assertEqual(self.client.get("/api/planning/transfers?workspace=trial").json()[0]["quantity"], 3)
 
+    def test_plan_sheet_with_revisions_picked_by_release_date(self):
+        # The user's sheet: three blocks Rev.00 / Rev.01 / Rev.02 (released 01-01, 15-01, 17-01-2026), one per revision
+        api = self.client
+        product = api.post("/api/planning/products", json={"code": "RV-PRD", "name": "Fans"}).json()["id"]
+        product2 = api.post("/api/planning/products", json={"code": "RV-PRD2", "name": "Fans 2"}).json()["id"]
+        eva = api.post("/api/planning/models", json={"product_id": product, "code": "RV12000", "name": "Eva 8014"}).json()["id"]
+        serena = api.post("/api/planning/models", json={"product_id": product2, "code": "RV12001", "name": "Serena 8014"}).json()["id"]
+        months = [f"01-{m:02d}-2026" for m in range(1, 11)]
+
+        def block(released, revision, eva_qty, serena_qty):
+            return [[None], [None], ["Model Code", "Model Name", "Release date", "Plan revision"] + months,
+                    ["RV12000", "Eva 8014", released, revision] + eva_qty, ["RV12001", "Serena 8014", released, revision] + serena_qty]
+
+        workbook = Workbook()
+        sheet = workbook.active
+        rows = block("01-01-2026", "Rev.00", [20000, 15000, 20000, 16000, 20000, 40000, 15000, 20000, 20000, 35000], [20000] * 10) \
+            + block(date(2026, 1, 15), "Rev.01", [15000, 18000, 21600, 25920, 31104, 37325, 44790, 53748, 64498, 77398], [35000] * 10) \
+            + block("17-01-2026", "Rev.02", [17000] * 10, [30000] * 10) + [[None], ["Total", "", "", ""] + [47000] * 10]  # a total under the last block, after a blank row: not a model
+        for row in rows:
+            sheet.append(row)
+        content = io.BytesIO()
+        workbook.save(content)
+        xlsx = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        upload = lambda released: api.post(f"/api/planning/plans/2026-01/upload?workspace=trial&release_date={released}", content=content.getvalue(), headers=xlsx)
+        # without a date the file is ambiguous; a date not in the file lists the dates there
+        none = api.post("/api/planning/plans/2026-01/upload?workspace=trial", content=content.getvalue(), headers=xlsx)
+        self.assertIn("Plans in the file: 01-01-2026 (Rev.00), 15-01-2026 (Rev.01), 17-01-2026 (Rev.02)", none.json()["detail"])
+        self.assertIn("No plan in the file is released on 16-01-2026", upload("2026-01-16").json()["detail"])
+        # one revision per upload, picked by its release date
+        first = upload("2026-01-15")
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual((first.json()["revision"], first.json()["issue_month"], first.json()["release_date"], first.json()["rows"]), ("Rev.01", "2026-01", "2026-01-15", 20))
+        self.assertEqual(upload("2026-01-15").status_code, 409)  # Rev.01 already loaded
+        self.assertEqual(upload("2026-01-01").json()["revision"], "Rev.00")
+        self.assertEqual(upload("17-01-2026").json()["rows"], 20)  # the last block; its Total row is ignored
+        listed = {p["revision"]: p for p in api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-01"}).json()}
+        self.assertEqual((listed["Rev.00"]["release_date"], listed["Rev.01"]["release_date"]), ("2026-01-01", "2026-01-15"))
+        # quantities went to the right model
+        rows_view = api.get(f"/api/planning/plans/{first.json()['id']}/rows", params={"limit": 100}).json()["items"]
+        by_name = {item["model_name"]: item["quantities"] for item in rows_view}
+        self.assertEqual((by_name["Eva 8014"]["2026-03"], by_name["Eva 8014"]["2026-10"], by_name["Serena 8014"]["2026-03"]), (21600, 77398, 35000))
+        # a code given with another model's name (as FL12000 for both Eva and Serena) is reported, not guessed
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Model Code", "Model Name", "Release date", "Plan revision", "01-01-2026"])
+        sheet.append(["RV12000", "Eva 8014", "20-01-2026", "Rev.05", 10])
+        sheet.append(["RV12000", "Serena  8014", "20-01-2026", "Rev.05", 10])
+        content = io.BytesIO()
+        workbook.save(content)
+        wrong = api.post("/api/planning/plans/2026-01/upload?workspace=trial&release_date=20-01-2026", content=content.getvalue(), headers=xlsx)
+        self.assertIn("Row 3: RV12000 is Eva 8014 in Product Master, not Serena  8014", wrong.json()["detail"])
+        self.assertEqual(len(api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-01"}).json()), 3)  # nothing saved
+
     def test_wide_month_plan_template_and_month_formats_upload(self):
         product = self.client.post("/api/planning/products", json={"code": "MONTH-PRD", "name": "Month product"})
         model = self.client.post("/api/planning/models", json={
@@ -471,11 +524,14 @@ class SupplierHubApiTests(unittest.TestCase):
         template = self.client.get("/api/planning/templates/plan.xlsx?issue_month=2026-04")
         self.assertEqual(template.status_code, 200, template.text)
         template_sheet = load_workbook(io.BytesIO(template.content), data_only=False).active
-        self.assertEqual(template_sheet["A1"].value, "model_code")
-        self.assertEqual(template_sheet["B1"].value, "model_MONTH")
-        self.assertEqual(template_sheet["C1"].value.date(), date(2026, 4, 1))
-        self.assertEqual(template_sheet["C1"].number_format, "mmm-yy")
-        self.assertEqual(template_sheet["Z1"].value.date(), date(2028, 3, 1))
+        # the user's layout: logo + title, then Model Code | Model Name | Release date | Plan revision | 20 months (DD-MM-YYYY)
+        self.assertEqual(template_sheet["B1"].value, "Design to Cost · Production plan")
+        self.assertEqual(len(template_sheet._images), 1)  # the DC logo
+        self.assertEqual([template_sheet.cell(4, c).value for c in range(1, 5)], ["Model Code", "Model Name", "Release date", "Plan revision"])
+        self.assertEqual((template_sheet["E4"].value.date(), template_sheet["E4"].number_format), (date(2026, 4, 1), "DD-MM-YYYY"))
+        self.assertEqual(template_sheet["X4"].value.date(), date(2027, 11, 1))  # 20th month
+        self.assertIsNone(template_sheet["Y4"].value)
+        self.assertEqual((template_sheet["A5"].value, template_sheet["B5"].value, template_sheet["D5"].value, template_sheet["C5"].number_format), ("MONTH-12000", "Eva 8014", "Rev.00", "DD-MM-YYYY"))
 
         workbook = Workbook()
         sheet = workbook.active
@@ -2157,12 +2213,22 @@ class SupplierHubApiTests(unittest.TestCase):
         tree_sheet.cell(beam_row, 9).value, tree_sheet.cell(beam_row, 10).value, tree_sheet.cell(beam_row, 11).value = 700, 650, date(2027, 1, 15)  # an Excel date cell
         steel_row = next(r for r in range(4, tree_sheet.max_row + 1) if tree_sheet.cell(r, 4).value == "XL-STEEL")
         tree_sheet.cell(steel_row, 9).value = 999  # an L1 material row: for reading only
+        jgi_row = next(r for r in range(4, tree_sheet.max_row + 1) if tree_sheet.cell(r, 1).value.strip() == "T2 supplier" and tree_sheet.cell(r, 2).value == "XL-1004")
+        tree_sheet.cell(jgi_row, 9).value, tree_sheet.cell(jgi_row, 10).value = 12000, 11000  # stock at JGI (T2) for Savera's beam
         content = io.BytesIO()
         filled.save(content)
         stock_up = api.post("/api/planning/supplier-stock/2026-12/upload?workspace=trial", headers=xlsx_type, content=content.getvalue())
-        self.assertEqual((stock_up.status_code, stock_up.json().get("rows")), (201, 1), stock_up.text)
+        self.assertEqual((stock_up.status_code, stock_up.json().get("rows")), (201, 2), stock_up.text)
         listed_stock = [(r["supplier_code"], r["material_code"], r["quantity"], r["available_quantity"], r["arrival_month"]) for r in api.get("/api/planning/supplier-stock/2026-12", params={"workspace": "trial"}).json()["items"]]
-        self.assertEqual(listed_stock, [("XL-1013", "XL-BEAM", 700, 650, "2027-01")])
+        self.assertEqual(listed_stock, [("XL-1013", "XL-BEAM", 700, 650, "2027-01"), ("XL-1004", "XL-STEEL", 12000, 11000, None)])
+        t2_node = next(n for n in api.get("/api/planning/supply-tree", params={"report_month": "2026-12"}).json()["items"] if n["level"] == "T2 supplier" and n["supplier_code"] == "XL-1004")
+        self.assertEqual((t2_node["stock"], t2_node["available"]), (12000, 11000))
+        # a T2 row for a supplier who is not in that BOM is refused with its row
+        tree_sheet.cell(jgi_row, 2).value = "XL-1030"
+        content = io.BytesIO()
+        filled.save(content)
+        wrong = api.post("/api/planning/supplier-stock/2026-12/upload?workspace=trial", headers=xlsx_type, content=content.getvalue())
+        self.assertIn(f"Row {jgi_row}: XL XYZ is not a supplier of XL-STEEL in the BOM of XL-BEAM", wrong.json()["detail"])
         empty = load_workbook(io.BytesIO(api.get("/api/planning/supply-tree.xlsx", params={"report_month": "2026-10", "template": "true"}).content))
         content = io.BytesIO()
         empty.save(content)

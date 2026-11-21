@@ -371,14 +371,17 @@ async function renderPlans() {
   const month = monthNow();
   state.plans = await api(`/api/planning/plans?workspace=${state.workspace}`);
   const actuals = await api(`/api/planning/actuals?period=${month}&workspace=${state.workspace}`);
-  const planRows = state.plans.map((plan) => `<tr class="clickable-row" data-plan-id="${plan.id}" tabindex="0" title="Open ${esc(plan.revision)} to review or edit monthly quantities"><td>${monthLabel(plan.issue_month)}</td><td>${esc(plan.revision)}</td><td>${number(plan.row_count, 0)}</td><td>${new Date(plan.created_at).toLocaleString()}</td><td>${esc(plan.workspace)}</td></tr>`).join("");
-  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?issue_month=${month}">Plan template</a><a class="button" href="/api/planning/templates/actuals.xlsx">Actuals template</a>`)}
+  const ddmmyyyy = (iso) => (iso ? iso.split("-").reverse().join("-") : "");
+  const today = new Date().toISOString().slice(0, 10);
+  const planRows = state.plans.map((plan) => `<tr class="clickable-row" data-plan-id="${plan.id}" tabindex="0" title="Open ${esc(plan.revision)} to review or edit monthly quantities"><td>${monthLabel(plan.issue_month)}</td><td>${esc(plan.revision)}</td><td>${esc(ddmmyyyy(plan.release_date))}</td><td>${number(plan.row_count, 0)}</td><td>${(() => { const d = new Date(plan.created_at); const two = (n) => String(n).padStart(2, "0"); return `${two(d.getDate())}-${two(d.getMonth() + 1)}-${d.getFullYear()} ${two(d.getHours())}:${two(d.getMinutes())}`; })()}</td><td>${esc(plan.workspace)}</td></tr>`).join("");
+  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?issue_month=${month}&release_date=${today}">Plan template</a><a class="button" href="/api/planning/templates/actuals.xlsx">Actuals template</a>`)}
     <div class="planning-grid">
-      <section class="panel">${panelHeader("Upload plan revision", "Use one model per row and one forecast month per column from the Plan template. Long-form model_code, target_month, quantity workbooks are also accepted. Target months must fit within 24 months from the issue month.")}
+      <section class="panel">${panelHeader("Upload plan revision", "Plan template: logo and header, then Model Code, Model Name, Release date, Plan revision and 20 months (DD-MM-YYYY), one row per model. One revision per upload: pick its release date; if the file holds several blocks (Rev.00, Rev.01 ...), the block with that release date is loaded, and its first month is the plan start. Older sheets (one model per row, one month per column, from the start month) are also accepted.")}
         <form id="planUploadForm" class="panel-body form-grid">
-          ${field("Plan issue month", "issue_month", "month", { required: true, value: month })}
+          ${field("Plan start month", "issue_month", "month", { required: true, value: month })}
+          ${field("Plan release date", "release_date", "date", { required: true, value: today })}
           <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
-          <label class="field full"><span>24-month plan workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
+          <label class="field full"><span>Plan workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload as next revision</button>
         </form></section>
       <section class="panel">${panelHeader("Upload actual production & OEM stock", "Columns: model_code, actual_quantity, oem_stock. Actuals update that model and month; plans remain unchanged.")}
@@ -396,7 +399,7 @@ async function renderPlans() {
     <section id="planRevisionEditor" class="panel table-panel" hidden></section>
     <section class="panel table-panel">${panelHeader("Revision history", "Each issue month begins at Rev.00. Prior uploads are preserved for plan-versus-actual review.")}
       <div class="table-toolbar"><div class="toolbar-group" id="planFilters"></div><div class="toolbar-group">${tableExportLinks("plans", { workspace: state.workspace })}<button class="button button-small" data-action="clear-table-filters" data-table="planHistory">Clear all filters</button></div></div>
-      <div id="planHistory">${table(["Issue month", "Revision", "Rows", "Revision date", "Workspace"], planRows, "No monthly plans uploaded yet.")}</div>
+      <div id="planHistory">${table(["Issue month", "Revision", "Release date", "Rows", "Revision date", "Workspace"], planRows, "No monthly plans uploaded yet.")}</div>
     </section>`;
   $("#planUploadForm").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -405,14 +408,14 @@ async function renderPlans() {
     const uploadMonth = data.get("issue_month");
     state.workspace = data.get("workspace");
     try {
-      const result = await uploadExcel(`/api/planning/plans/${uploadMonth}/upload?workspace=${state.workspace}`, data.get("workbook"));
-      toast(`Plan saved as ${result.revision} for ${result.issue_month}`);
+      const result = await uploadExcel(`/api/planning/plans/${uploadMonth}/upload?workspace=${state.workspace}&release_date=${data.get("release_date") || ""}`, data.get("workbook"));
+      toast(`Plan saved as ${result.revision} for ${monthLabel(result.issue_month)}${result.release_date ? `, released ${ddmmyyyy(result.release_date)}` : ""}`);
       await renderPlans();
     } catch (error) { toast(error.message, true); }
   });
-  $('#planUploadForm [name="issue_month"]').addEventListener("change", (event) => {
-    $("#planTemplateLink").href = `/api/planning/templates/plan.xlsx?issue_month=${encodeURIComponent(event.target.value)}`;
-  });
+  const templateHref = () => { $("#planTemplateLink").href = `/api/planning/templates/plan.xlsx?issue_month=${encodeURIComponent($('#planUploadForm [name="issue_month"]').value)}&release_date=${encodeURIComponent($('#planUploadForm [name="release_date"]').value)}`; };
+  $('#planUploadForm [name="issue_month"]').addEventListener("change", templateHref);
+  $('#planUploadForm [name="release_date"]').addEventListener("change", templateHref);
   $("#actualUploadForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -434,7 +437,7 @@ async function renderPlans() {
       setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
     } catch (error) { toast(error.message, true); }
   });
-  setupTableFilters("#planHistory", "#planFilters", null, [{ title: "Issue month", index: 0 }, { title: "Revision", index: 1 }, { title: "Workspace", index: 4 }]);
+  setupTableFilters("#planHistory", "#planFilters", null, [{ title: "Issue month", index: 0 }, { title: "Revision", index: 1 }, { title: "Release date", index: 2 }, { title: "Workspace", index: 5 }]);
   setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
 }
 
@@ -1956,7 +1959,7 @@ async function renderSupplierControl() {
         <div id="relListTable"><div class="tree-loading">Loading…</div></div>
       </section>`;
   } else if (tab === "Upload supplier stock") {
-    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload Excel: Download template gives the supply chain tree of the month with Stock quantity, Available quantity and Arrival month columns; type the stock on the T1 part rows and upload it (other rows are for reading). Then the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
+    body = `<section class="panel table-panel">${panelHeader("Upload supplier stock", "Upload Excel: Download template gives the supply chain tree of the month with Stock quantity, Available quantity and Arrival month columns; type the stock on the T1 part rows and on the T2 / T3 supplier rows (stock at that supplier for that part) and upload it; material rows are for reading. Then the supply chain tree: every T1 supplier, the parts it supplies you, each part's BOM materials and their T2 / T3 suppliers (+ / − or Open all / Close all), with the stock entered for the month on each part. Then upload a workbook, or type each supplier's stock for the month in the table below (+ Add row, Save all; no Excel needed). Workbook columns: supplier_code, material_code, tier, parent_supplier_code, quantity, available_quantity, arrival_month; tier and parent identify the exact relationship when the same supplier/material exists at more than one level. One row per supplier and material; a row already reported for the month is updated.")}
       <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Report month</span><input class="form-control" type="month" id="stockMonth" required value="${monthNow()}" /></label><label class="field"><span>Workspace</span>${workspaceSelect()}</label></div></div>
       <form id="supplierStockForm" class="panel-body inline-upload">
         <label class="field"><span>Supplier stock workbook (the template below, or your sheet with supplier_code, material_code, quantity)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
