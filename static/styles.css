@@ -615,3 +615,14 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 .ov-stock { width: 110px; }
 .ov-upload { padding: 4px 0 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; } .ov-upload .form-control { max-width: 320px; }
 .cov-copy { display: inline-flex; gap: 6px; align-items: center; } .cov-copy select { max-width: 320px; }
+/* demand & PO plan */
+#dpTable td.dp-po small { display: block; color: #7a5a12; font-size: 11px; }
+#dpTable td.dp-po-due { background: #fff7e0; font-weight: 600; }
+/* demand & PO plan table: same sizes as the Suppliers tables */
+#dpTable table { border-collapse: separate; border-spacing: 0; white-space: normal; }
+#dpTable th { position: relative; padding: 11px 10px; border: 0; border-bottom: 1px solid #d3dde6; background: #f1f5f8; color: #2c4256; font-size: 12.5px; font-weight: 600; letter-spacing: 0; text-transform: none; white-space: nowrap; }
+#dpTable th + th { box-shadow: inset 1px 0 0 #e1e8ee; }
+#dpTable th .table-column-filter summary { min-height: 0; padding: 2px 0; color: #2c4256; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+#dpTable .table-heading { position: static; }
+#dpTable td { padding: 10px 10px; border: 0; border-bottom: 1px solid #ebf0f4; color: #1f3446; font-size: 13px; white-space: nowrap; }
+#dpTable tbody > tr:last-child > td { border-bottom: 0; }

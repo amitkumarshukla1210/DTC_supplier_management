@@ -2845,13 +2845,55 @@ function renderReportTable() {
   }));
 }
 
+// Demand & PO Plan: T1 / T2 / T3 Supplier part Planning, month-wise (requirement, stock used up month by month,
+// suggested PO rounded up to MOQ and ordered lead time ahead); the PO issue and register stay on the T1 tab
+const DEMAND_TABS = [["T1", "T1 Supplier part Planning", "parts your T1 suppliers supply to you (OEM)"], ["T2", "T2 Supplier part Planning", "materials T2 suppliers supply to each T1 supplier"], ["T3", "T3 Supplier part Planning", "materials T3 suppliers supply to the T2 suppliers"]];
+function demandPlanPanel(tab) {
+  const [, label, what] = DEMAND_TABS.find(([key]) => key === tab);
+  return `<section class="panel table-panel">${panelHeader(label, `${what}. Requirement per month: ${tab === "T1" ? "plan in force × model BOM × SOB" : "the T1 supplier's net requirement × part BOM qty × SOB"}. Stock (start month${tab === "T1" ? ") and open POs" : ")"} are used up month by month; Net = requirement − what is left; Suggested PO = net rounded up to MOQ, to order by the month shown (month − lead time).`)}
+    <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Start month</span><input class="form-control" type="month" id="dpStart" value="${state.dpStart || monthNow()}" /></label><label class="field"><span>Months</span><select class="form-control" id="dpMonths">${[3, 6, 12].map((n) => `<option ${n === (state.dpMonths || 6) ? "selected" : ""}>${n}</option>`).join("")}</select></label><label class="search-field"><input class="form-control" id="dpSearch" type="search" placeholder="Search supplier or part" value="${esc(state.dpSearch || "")}" /></label><span class="subtle" id="dpPlans"></span></div><span class="toolbar-add"><a class="button button-small" id="dpExcel" href="#">Download Excel</a></span></div>
+    <div id="dpTable"><div class="tree-loading">Loading…</div></div></section>`;
+}
+async function loadDemandPlan() {
+  const tab = state.dpTab || "T1";
+  state.dpStart = $("#dpStart").value || monthNow();
+  state.dpMonths = Number($("#dpMonths").value || 6);
+  state.dpSearch = $("#dpSearch").value.trim();
+  const query = new URLSearchParams({ tier: tab, start_month: state.dpStart, months: String(state.dpMonths), workspace: state.workspace || "trial", search: state.dpSearch });
+  $("#dpExcel").href = `/api/planning/demand-plan.xlsx?${query}`;
+  const ticket = (state.dpTicket = (state.dpTicket || 0) + 1);
+  try {
+    const result = await api(`/api/planning/demand-plan?${query}`);
+    if (ticket !== state.dpTicket || !$("#dpTable")) return;  // a newer request was made: keep its answer
+    const plans = [...new Set(Object.values(result.plans).filter(Boolean))];
+    $("#dpPlans").textContent = plans.length ? `plan ${plans.join(", ")}` : "no plan uploaded for these months: requirement 0";
+    const short = (month) => monthLabel(month).replace(/ (\d{2})(\d{2})$/, "-$2");
+    const rows = result.rows.map((row) => `<tr><td>${esc(row.supplier_code)}</td><td>${esc(row.supplier_name)}</td><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.for)}</td><td>${number(row.sob_percent, 1)}%</td><td>${number(row.lead_time_days, 0)} days</td><td>${number(row.moq)}</td><td>${row.stock === null || row.stock === undefined ? "" : number(row.stock)}</td><td>${esc(row.uom || "")}</td>${row.months.map((cell) => `<td>${number(cell.requirement)}</td><td class="dp-po${cell.po ? " dp-po-due" : ""}" title="${cell.po ? `Net ${number(cell.net)}; order by ${monthLabel(cell.order_by)}` : "Covered by stock"}">${cell.po ? `${number(cell.po)}<small>by ${esc(short(cell.order_by))}</small>` : "—"}</td>`).join("")}</tr>`).join("");
+    const headers = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB", "Lead time", "MOQ", "Opening stock", "Unit", ...result.months.flatMap((month) => [`${short(month)} Requirement`, `${short(month)} Suggested PO`])];
+    $("#dpTable").innerHTML = table(headers, rows, state.dpSearch ? "Nothing matches this search." : `No ${tab} supplier parts yet.`);
+  } catch (error) { toast(error.message, true); }
+}
+function bindDemandPlan() {
+  $("#dpStart").addEventListener("change", loadDemandPlan);
+  $("#dpMonths").addEventListener("change", loadDemandPlan);
+  $("#dpSearch").addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(loadDemandPlan, 250); });
+  loadDemandPlan();
+}
+
 async function renderPurchaseOrders() {
+  state.dpTab = state.dpTab || "T1";
+  const tabStrip = `<div class="tab-strip">${DEMAND_TABS.map(([key, label]) => `<button class="tab-button ${key === state.dpTab ? "active" : ""}" data-dp-tab="${key}">${esc(label)}</button>`).join("")}</div>`;
+  const pageHeading = heading("Demand & PO Plan", "Month-wise demand and suggested POs for T1, T2 and T3 supplier parts, from the plan in force and each part's BOM and SOB.", `<a class="button" href="/api/planning/templates/supplier-stock.xlsx">Stock template</a>`);
+  if (state.dpTab !== "T1") {
+    content.innerHTML = `${pageHeading}${tabStrip}${demandPlanPanel(state.dpTab)}`;
+    return bindDemandPlan();
+  }
   const end = monthNow();
   const start = monthOffset(end, -11);
   const orders = await api(`/api/planning/purchase-orders?start_month=${start}&end_month=${end}&workspace=${state.workspace}`);
   const links = (await api("/api/planning/supplier-parts?offset=0&limit=500")).items;
   state.supplierParts = links;
-  content.innerHTML = `${heading("PO schedule", "Issue direct-price purchase orders, preserve NCNR commitments, and request delivery preponement or postponement.", `<a class="button" href="/api/planning/templates/supplier-stock.xlsx">Stock template</a>`)}
+  content.innerHTML = `${pageHeading}${tabStrip}${demandPlanPanel("T1")}
     <section class="panel">${panelHeader("Issue a planning purchase order", "The current supplier/material price is copied to the PO and will not change when the master price is updated.")}
       <form id="poForm" class="panel-body form-grid">
         <label class="field"><span>Search supplier/material</span><input class="form-control" id="poPartSearch" type="search" placeholder="Type part, supplier, or tier" /></label>
@@ -2866,6 +2908,7 @@ async function renderPurchaseOrders() {
       <div class="table-toolbar"><div class="toolbar-group">${field("Start month", "po_start", "month", { value: start })}${field("End month", "po_end", "month", { value: end })}<label class="search-field"><input class="form-control" id="poSearch" type="search" placeholder="Search PO or supplier" /></label><div id="poFilters"></div></div><div class="toolbar-group">${tableExportLinks("purchase-orders", { start_month: start, end_month: end, workspace: state.workspace })}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div></div>
       <div id="poTable">${table(["PO", "Material", "Supplier / tier", "Quantity", "Expected arrival", "Value", "Commitment", "Status", "Actions"], orders.map((po) => `<tr><td>${esc(po.po_number)}</td><td>${esc(po.material_code)} · ${esc(po.material_name)}</td><td>${esc(po.supplier_name)} · ${esc(po.tier)}</td><td>${number(po.quantity_ordered)}</td><td>${monthLabel(po.expected_month)}</td><td>${po.unit_price === undefined ? "Restricted" : money(po.total, po.currency)}</td><td>${po.ncnr ? "NCNR" : "Cancelable"}</td><td>${esc(po.status)}</td><td><button class="text-button" data-reschedule-po="${po.id}" data-current-month="${esc(po.expected_month)}">Advance / postpone</button>${po.status !== "Received" ? `<button class="text-button" data-receive-po="${po.id}" data-remaining="${po.quantity_ordered - po.quantity_received}">Record receipt</button>` : ""}</td></tr>`).join(""), "No planning POs in this period.")}</div></section>`;
   setupTableFilters("#poTable", "#poFilters", $("#poSearch"), [{ title: "Supplier / tier", index: 2 }, { title: "Status", index: 7 }, { title: "Commitment", index: 6 }]);
+  bindDemandPlan();
   $("#poSearch").addEventListener("input", applyTableSearch);
   $("#poPartSearch").addEventListener("input", (event) => {
     clearTimeout(state.searchTimer);
@@ -3577,6 +3620,8 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/suppliers/${supplierDelete.dataset.deleteSupplier}`, { method: "DELETE" }); toast("Supplier deleted"); return renderSupplierControl(); }
     catch (error) { toast(error.message, true); return; }
   }
+  const dpTab = event.target.closest("[data-dp-tab]");
+  if (dpTab) { state.dpTab = dpTab.dataset.dpTab; return renderPurchaseOrders(); }
   const openOverview = event.target.closest("[data-open-supplier-overview]");
   if (openOverview) { event.preventDefault(); state.supplierTab = "Supplier register"; state.overviewSupplierId = Number(openOverview.dataset.openSupplierOverview); state.coverageLinkId = null; return renderSupplierControl(); }
   const closeOverview = event.target.closest("[data-close-overview]");

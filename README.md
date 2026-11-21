@@ -95,6 +95,15 @@ Tabs, in order: **Supplier register** (first), Supplier/material relationship, S
 - **Supplier register** has three tabs: **T1 / T2 / T3 Supplier Master**. A supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); tick the tiers in Add / Edit supplier. A relationship saved at a tier adds that tier to the supplier (and the tier above to its parent supplier); tiers are never removed automatically. Supplier list uploads join the open tab unless the sheet has a Supplier tier column.
 - **Relationships**: tier is a drop-down (T1, T2, T3); T2/T3 rows need the parent supplier and may use a **T1, T2 or T3 Material Master code** (hints are labelled); T1 rows use T1 codes you buy. Your BOM price uses T1 rows only; POs are issued for T1 codes only. Coverage shows **Code from** (T1/T2/T3) and **Edit** opens the whole row (supplier, part, tier, parent, SOB, lead time, MOQ, buffer, price).
 
+## Demand & PO Plan (was PO schedule)
+
+Three tabs, month-wise from a start month (3, 6 or 12 months), one row per supplier and part:
+- **T1 Supplier part Planning**: parts your T1 suppliers supply to you (OEM). Requirement = plan in force × model BOM × SOB.
+- **T2 Supplier part Planning**: materials T2 suppliers supply to each T1 supplier. Requirement = the T1 supplier's **net** requirement × part BOM qty × SOB (as on the Supplier overview).
+- **T3 Supplier part Planning**: materials T3 suppliers supply to the T2 suppliers (from the L2 BOM).
+
+The start month's stock (and open POs for T1) is used up month by month: Net = requirement − what is left; **Suggested PO** = net rounded up to MOQ, with **Order by** = month − lead time. Search, Download Excel. The PO issue and register stay on the T1 tab.
+
 ## Production plan (Plans & actuals)
 
 - **Plan template**: the DC logo and a title, then **Model Code | Model Name | 24 months** (dates **DD-MM-YYYY**, from the month of the chosen plan date), one row per model. No date or revision columns: the app sets them.

@@ -5817,6 +5817,147 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"rows": changed, "month": stock_month}
 
+    def demand_plan(db: Session, workspace: str, start: str, months: int, tier: str, can_price: bool) -> dict:
+        """Month-wise demand and PO plan for one tier. T1: plan in force x model BOM x SOB, per T1 supplier and part.
+        T2 / T3: the T1 supplier's net requirement x part BOM quantity x SOB, per sub-supplier, material and T1 supplier.
+        Stock (and open POs for T1) is used up month by month; suggested PO = net requirement rounded up to MOQ,
+        to be ordered lead time ahead."""
+        month_list = [_month_text(_plus_months(_month(start), offset)) for offset in range(months)]
+        demand_by_month, plans = {}, {}
+        for month in month_list:
+            cycle, demand = month_material_demand(db, workspace, month)
+            demand_by_month[month] = demand
+            plans[month] = f"Rev.{cycle.revision:02d}" if cycle else None
+        suppliers = {who.id: who for who in db.scalars(select(Supplier)).all()}
+        links = db.scalars(select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all()
+        items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_({link.material_id for link in links})))} if links else {}
+        lead_months = lambda days: math.ceil((days or 0) / 30.4375)
+
+        def roll(requirements: list[float], stock: float, incoming: list[float], moq: float, lead_days: int) -> list[dict]:
+            out, available = [], stock
+            for month, need, extra in zip(month_list, requirements, incoming):
+                available += extra
+                net = max(0.0, need - available)
+                available = max(0.0, available - need)
+                po = math.ceil(net / moq) * moq if net > 0 and moq and moq > 0 else net
+                out.append({"month": month, "requirement": need, "net": net, "po": po, "order_by": _month_text(_plus_months(_month(month), -lead_months(lead_days))) if po else None})
+            return out
+
+        # T1 rows (and each T1 part's net requirement, which drives T2 / T3)
+        t1_rows, t1_net = [], {}
+        stock = {row.supplier_part_id: row.quantity for row in db.scalars(select(SupplierStockSnapshot).where(
+            SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == start)).all()}
+        open_po: dict[tuple[int, str], float] = {}
+        for po in db.scalars(select(PlanningPO).where(PlanningPO.workspace == workspace, PlanningPO.status.in_(["Planned", "Issued", "Partially received"]),
+                                                     PlanningPO.expected_month.in_(month_list))).all():
+            open_po[(po.supplier_part_id, po.expected_month)] = open_po.get((po.supplier_part_id, po.expected_month), 0) + max(0, po.quantity_ordered - po.quantity_received)
+        for link in links:
+            item, who = items[link.material_id], suppliers[link.supplier_id]
+            needs = [demand_by_month[m].get(item.id, 0.0) * (link.sob_percent or 0) / 100 for m in month_list]
+            plan = roll(needs, stock.get(link.id, 0.0), [open_po.get((link.id, m), 0.0) for m in month_list], link.moq, link.lead_time_days)
+            t1_net[link.id] = [cell["net"] for cell in plan]
+            row = {"supplier_code": who.code, "supplier_name": who.name, "code": item.code, "name": item.name, "uom": item.uom, "for": "OEM",
+                   "sob_percent": link.sob_percent, "lead_time_days": link.lead_time_days, "moq": link.moq, "stock": stock.get(link.id), "months": plan}
+            if can_price:
+                row.update(unit_price=link.unit_price, currency=link.currency)
+            t1_rows.append(row)
+        if tier == "T1":
+            rows = t1_rows
+        else:
+            depth_wanted = 1 if tier == "T2" else 2  # T2 supply L1 materials, T3 supply L2 materials
+            with_bom = set(db.execute(select(SupplierBOMLine.supplier_id, SupplierBOMLine.product_material_id).distinct()).all())
+            groups: dict[tuple[int, str, int], dict] = {}
+            for link in links:
+                if (link.supplier_id, link.material_id) not in with_bom:
+                    continue
+                part = items[link.material_id]
+                per_unit: dict[int, float] = {}
+                for line in supplier_bom_view(db, link.supplier_id, link.material_id, can_price)["lines"]:
+                    per_piece = line["quantity"] * (per_unit.get(line["parent_line_id"], 1.0) if line["parent_line_id"] else 1.0)
+                    per_unit[line["id"]] = per_piece
+                    if line["depth"] != depth_wanted:
+                        continue
+                    component = line["component"]
+                    for src in line["sources"]:
+                        key = (src["sub_supplier_id"], component["code"].casefold(), link.supplier_id)
+                        group = groups.setdefault(key, {"sub_supplier_id": src["sub_supplier_id"], "supplier_code": src["sub_supplier_code"], "supplier_name": src["sub_supplier"],
+                                                        "code": component["code"], "name": component["name"], "uom": component["uom"], "t1_supplier_id": link.supplier_id,
+                                                        "for": suppliers[link.supplier_id].name, "parts": [], "needs": [0.0] * months, "lead_time_days": 0, "moq": 0.0,
+                                                        "_rates": []})
+                        share = [net * per_piece * src["sob_percent"] / 100 for net in t1_net[link.id]]
+                        group["needs"] = [a + b for a, b in zip(group["needs"], share)]
+                        group["parts"].append({"part_code": part.code, "sob_percent": src["sob_percent"]})
+                        group["lead_time_days"] = max(group["lead_time_days"], src["lead_time_days"] or 0)
+                        group["moq"] = max(group["moq"], src["moq"] or 0)
+                        if can_price:
+                            group["_rates"].append((src.get("unit_price") or 0, sum(share), src["currency"]))
+            source_stock: dict[tuple[int, str, int], float] = {}
+            for held in db.scalars(select(SupplierSourceStock).where(SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == start)).all():
+                key = (held.sub_supplier_id, held.material_code.casefold(), held.t1_supplier_id)
+                source_stock[key] = source_stock.get(key, 0.0) + held.quantity
+            material_total: dict[tuple[str, int], float] = {}
+            for (sub_id, code, t1_id), group in groups.items():
+                material_total[(code, t1_id)] = material_total.get((code, t1_id), 0.0) + sum(group["needs"])
+            rows = []
+            for key, group in sorted(groups.items(), key=lambda item: (item[1]["supplier_code"].casefold(), item[1]["code"].casefold(), item[1]["for"].casefold())):
+                total = material_total[(key[1], key[2])]
+                sobs = [part["sob_percent"] for part in group["parts"]]
+                group["sob_percent"] = round(sum(group["needs"]) * 100 / total, 4) if total else round(sum(sobs) / len(sobs), 4)
+                group["stock"] = source_stock.get(key)
+                group["months"] = roll(group.pop("needs"), group["stock"] or 0.0, [0.0] * months, group["moq"], group["lead_time_days"])
+                rates = group.pop("_rates")
+                if can_price and rates:
+                    weight = sum(need for _, need, _ in rates)
+                    group["unit_price"] = round(sum(price * need for price, need, _ in rates) / weight, 4) if weight else round(sum(price for price, _, _ in rates) / len(rates), 4)
+                    group["currency"] = rates[0][2] if len({currency for _, _, currency in rates}) == 1 else "mixed"
+                rows.append(group)
+        return {"tier": tier, "months": month_list, "plans": plans, "rows": rows}
+
+    @app.get("/api/planning/demand-plan")
+    def get_demand_plan(request: Request, tier: str = "T1", start_month: str = "", months: int = 6, workspace: str = "trial", search: str = ""):
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        if tier not in {"T1", "T2", "T3"}:
+            raise HTTPException(status_code=422, detail="Tier must be T1, T2 or T3")
+        if not 1 <= months <= 24:
+            raise HTTPException(status_code=422, detail="Months must be 1 to 24")
+        start = _month_text(_month(start_month)) if start_month else _month_text(date.today())
+        with open_db() as db:
+            result = demand_plan(db, workspace, start, months, tier, _check_price_access(request))
+        needle = search.strip().casefold()
+        if needle:
+            result["rows"] = [row for row in result["rows"] if needle in f"{row['supplier_code']} {row['supplier_name']} {row['code']} {row['name']} {row['for']}".casefold()]
+        return result
+
+    @app.get("/api/planning/demand-plan.xlsx")
+    def demand_plan_excel(request: Request, tier: str = "T1", start_month: str = "", months: int = 6, workspace: str = "trial", search: str = ""):
+        result = get_demand_plan(request, tier, start_month, months, workspace, search)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = f"{tier} planning"
+        fixed = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB %", "Lead time days", "MOQ", "Opening stock", "Unit"]
+        sheet.append([f"Design to Cost · {tier} Supplier part Planning · from {result['months'][0]}"])
+        sheet.append(["Requirement = plan in force x BOM x SOB (T2 / T3 from the T1 supplier's net requirement); stock is used month by month; suggested PO = net rounded up to MOQ, ordered lead time ahead."])
+        group = fixed + [cell for month in result["months"] for cell in (month, None, None)]
+        sheet.append(group)
+        sheet.append([None] * len(fixed) + [label for _ in result["months"] for label in ("Requirement", "Suggested PO", "Order by")])
+        for index in range(len(result["months"])):
+            column = len(fixed) + 1 + index * 3
+            sheet.merge_cells(start_row=3, start_column=column, end_row=3, end_column=column + 2)
+        for column in range(1, len(fixed) + 1):
+            sheet.merge_cells(start_row=3, start_column=column, end_row=4, end_column=column)
+        for row_cells in sheet.iter_rows(min_row=3, max_row=4):
+            for cell in row_cells:
+                cell.fill, cell.font = PatternFill("solid", fgColor="12263A"), Font(bold=True, color="FFFFFF")
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for row in result["rows"]:
+            sheet.append([row["supplier_code"], row["supplier_name"], row["code"], row["name"], row["for"], row["sob_percent"], row["lead_time_days"], row["moq"], row["stock"], row["uom"]]
+                         + [value for cell in row["months"] for value in (round(cell["requirement"], 4), round(cell["po"], 4), cell["order_by"])])
+        sheet["A1"].font = Font(bold=True, size=13)
+        sheet.freeze_panes = "E5"
+        return xlsx_response(workbook, f"{tier}-supplier-part-planning-{result['months'][0]}.xlsx")
+
     @app.get("/api/planning/actuals/template.xlsx")
     def actual_template(request: Request, as_of: str = "", workspace: str = "trial"):
         """Actual production template like the plan template: logo and title, the month and as-on date, then the

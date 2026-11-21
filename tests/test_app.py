@@ -554,6 +554,56 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("Row 6: AC12001 is Serena 8014 in Product Master, not Eva 8014", api.post("/api/planning/actuals/2026-11/upload?as_of=2026-11-26", content=content.getvalue(), headers=xlsx).json()["detail"])
         self.assertIn("No actual production typed", api.post("/api/planning/actuals", json={"period": "2026-11", "rows": [{"model_code": "AC12000", "actual_quantity": ""}]}).json()["detail"])
 
+    def test_demand_and_po_plan_t1_t2_t3_month_wise(self):
+        # Plan: Eva 60,000 in Nov-26 and 30,000 in Dec-26, 1 beam each. Savera makes the beam at 60% (MOQ 5,000, lead 45 days,
+        # FG stock 9,000 in Nov, open PO 5,000 due Dec). Beam: 2 kg steel from JGI 30% (MOQ 10,000, lead 20 days, stock 5,000)
+        # and TATA 70%; per kg steel 1.7 kg ore from XYZ.
+        api = self.client
+        xlsx = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        beam = api.post("/api/planning/materials", json={"code": "DP-BEAM", "name": "Base Front Beam", "uom": "Nos"}).json()["id"]
+        steel = api.post("/api/planning/tier-materials", json={"tier": "T2", "code": "DP-STEEL", "name": "STEEL0.7", "uom": "kg"}).json()["id"]
+        ore = api.post("/api/planning/tier-materials", json={"tier": "T3", "code": "DP-ORE", "name": "Iron ore", "uom": "kg"}).json()["id"]
+        product = api.post("/api/planning/products", json={"code": "DP-PRD", "name": "Fans"}).json()["id"]
+        eva = api.post("/api/planning/models", json={"product_id": product, "code": "DP12000", "name": "Eva 8014"}).json()["id"]
+        api.post(f"/api/planning/model-bom/{eva}", json={"material_id": beam, "quantity": 1, "uom": "Nos"})
+        sup = lambda code, name: api.post("/api/suppliers", json={"code": code, "name": name, "category": "Sheet Metal", "country": "India"}).json()["id"]
+        savera, jgi, tata, xyz = sup("DP-1013", "DP Savera"), sup("DP-1004", "DP JGI"), sup("DP-1014", "DP TATA"), sup("DP-1030", "DP XYZ")
+        link = api.post("/api/planning/supplier-parts", json={"material_id": beam, "supplier_id": savera, "sob_percent": 60, "moq": 5000, "lead_time_days": 45, "unit_price": 85, "currency": "INR"}).json()["id"]
+        steel_line = api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "tier_material_id": steel, "quantity": 2, "sources": [
+            {"sub_supplier_id": jgi, "sob_percent": 30, "moq": 10000, "lead_time_days": 20, "unit_price": 74, "currency": "INR"}, {"sub_supplier_id": tata, "sob_percent": 70, "unit_price": 72, "currency": "INR"}]}).json()["id"]
+        api.post("/api/planning/supplier-coverage/lines", json={"link_id": link, "parent_line_id": steel_line, "tier_material_id": ore, "quantity": 1.7, "sources": [{"sub_supplier_id": xyz, "sob_percent": 100}]})
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Model Code", "Model Name", "01-11-2026", "01-12-2026"])
+        sheet.append(["DP12000", "Eva 8014", 60000, 30000])
+        content = io.BytesIO()
+        workbook.save(content)
+        self.assertEqual(api.post("/api/planning/plans/2026-11/upload?workspace=trial&release_date=2026-11-10", content=content.getvalue(), headers=xlsx).status_code, 201)
+        api.post("/api/planning/supplier-stock/2026-11?workspace=trial", json={"rows": [{"supplier_part_id": link, "quantity": 9000}]})
+        api.post("/api/planning/supplier-source-stock/2026-11?workspace=trial", json={"rows": [{"t1_supplier_code": "DP-1013", "part_code": "DP-BEAM", "material_code": "DP-STEEL", "supplier_code": "DP-1004", "quantity": 5000}]})
+        self.assertEqual(api.post("/api/planning/purchase-orders", json={"supplier_part_id": link, "quantity_ordered": 5000, "expected_month": "2026-12", "workspace": "trial", "ncnr": False}).status_code, 201)
+        plan = lambda tier: api.get("/api/planning/demand-plan", params={"tier": tier, "start_month": "2026-11", "months": 2, "search": "DP-"}).json()
+        cells = lambda row: [(c["month"], c["requirement"], c["net"], c["po"], c["order_by"]) for c in row["months"]]
+        # T1: Nov 36,000 - stock 9,000 = 27,000 -> PO 30,000 (MOQ 5,000) by Sep (45 days = 2 months); Dec 18,000 - PO 5,000 = 13,000 -> 15,000 by Oct
+        t1 = plan("T1")
+        self.assertEqual((t1["months"], t1["plans"]), (["2026-11", "2026-12"], {"2026-11": "Rev.00", "2026-12": "Rev.00"}))
+        self.assertEqual([(r["supplier_code"], r["code"], r["for"], r["stock"]) for r in t1["rows"]], [("DP-1013", "DP-BEAM", "OEM", 9000)])
+        self.assertEqual(cells(t1["rows"][0]), [("2026-11", 36000, 27000, 30000, "2026-09"), ("2026-12", 18000, 13000, 15000, "2026-10")])
+        # T2 from Savera's net (27,000 / 13,000) x 2 kg: JGI 30% = 16,200 / 7,800, stock 5,000 -> net 11,200 -> PO 20,000 (MOQ 10,000) by Oct; Dec 7,800 -> 10,000 by Nov
+        t2 = {r["supplier_code"]: r for r in plan("T2")["rows"]}
+        self.assertEqual((t2["DP-1004"]["for"], t2["DP-1004"]["code"], t2["DP-1004"]["stock"], round(t2["DP-1004"]["sob_percent"], 4), t2["DP-1004"]["unit_price"]), ("DP Savera", "DP-STEEL", 5000, 30, 74))
+        self.assertEqual(cells(t2["DP-1004"]), [("2026-11", 16200, 11200, 20000, "2026-10"), ("2026-12", 7800, 7800, 10000, "2026-11")])
+        self.assertEqual(cells(t2["DP-1014"]), [("2026-11", 37800, 37800, 37800, "2026-11"), ("2026-12", 18200, 18200, 18200, "2026-12")])  # no MOQ, no lead time
+        # T3: ore 1.7 kg per kg steel = 3.4 kg per beam x Savera's net
+        t3 = plan("T3")["rows"]
+        self.assertEqual([(r["supplier_code"], r["code"]) for r in t3], [("DP-1030", "DP-ORE")])
+        self.assertEqual([c["requirement"] for c in t3[0]["months"]], [91800, 44200])
+        # Excel: month groups with Requirement / Suggested PO / Order by
+        book = load_workbook(io.BytesIO(api.get("/api/planning/demand-plan.xlsx", params={"tier": "T2", "start_month": "2026-11", "months": 2, "search": "DP-"}).content)).active
+        self.assertEqual((book["K3"].value, book["K4"].value, book["L4"].value, book["M4"].value, book["N3"].value), ("2026-11", "Requirement", "Suggested PO", "Order by", "2026-12"))
+        self.assertEqual([book.cell(5, c).value for c in (1, 3, 5, 11, 12, 13)], ["DP-1004", "DP-STEEL", "DP Savera", 16200, 20000, "2026-10"])
+        self.assertEqual(api.get("/api/planning/demand-plan", params={"tier": "T9"}).status_code, 422)
+
     def test_supplier_overview_parts_bom_sub_suppliers_rates_and_requirement(self):
         # Savera makes Base Front Beam (60%) and Top Beam (100%). Plan Nov-26: Eva 60,000 (1 beam + 1 top beam each),
         # Serena 10,000 (2 beams each). Beam: 2 kg steel (JGI 30% @74, TATA 70% @72), per kg steel 1.7 kg ore (XYZ 100%).
