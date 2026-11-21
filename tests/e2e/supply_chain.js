@@ -129,6 +129,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
     ["L2 BOM", "ORE-01", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"],
     ["L2 BOM", "COAL-01", "100%", "1.2", "43,200 kg"], ["T3", "ABC Coal", "100%", "1.2", "43,200 kg"]];
   check("Tree and requirement: T1 36,000; steel 72,000 kg (JGI 21,600 / TATA 50,400); ore 122,400 kg; coal 43,200 kg", JSON.stringify(rows) === JSON.stringify(expected), JSON.stringify(rows));
+  const covHeads = await page.locator("#coverageTable thead th summary").allTextContents();
+  check("Coverage has no Price mode / Price status columns", !covHeads.includes("Price mode") && !covHeads.includes("Price status") && covHeads.slice(-6).join("|") === "Lead time|MOQ|Buffer days|Unit price|Currency|Action", covHeads.join("|"));
   check("Note says how many Savera makes", (await page.locator("#covShare").textContent()).includes("Savera makes 60% = 36,000"));
   const levels = await page.locator("#coverageTable tbody tr").evaluateAll((trs) => trs.map((tr) => tr.dataset.treeDepth).join(""));
   check("Levels like the Product Master tree (T1 0, L1 1, T2 2, L2 2, T3 3)", levels === "01222323", levels);
@@ -154,12 +156,14 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await lineRow("FL001STEEL0.7").locator("[data-sb-toggle]").click();
   check("+ opens them again", (await visible()) === 8);
   await page.screenshot({ path: __dirname + "/supply_chain.png" });
-  // Edit T1 in its row
+  // Edit T1 in its row (its saved price mode, set elsewhere, is kept: not shown on this page)
+  const t1Id = (await api("GET", "/api/planning/supplier-parts?tier=T1")).items[0].id;
+  await api("PATCH", `/api/planning/supplier-parts/${t1Id}`, { price_mode: "fixed_monthly" });
   await page.click("[data-cov-edit-t1]");
   await setIn("lead_time_days", 16);
   await saveRow("T1 saved");
   await page.waitForFunction(() => document.querySelector("#coverageTable tr.cov-t1")?.cells[11].textContent === "16 days");
-  check("Edit T1 in the row: lead time 16 days", true);
+  check("Edit T1 in the row: lead time 16 days; price mode kept (fixed monthly)", (await api("GET", "/api/planning/supplier-parts?tier=T1")).items[0].price_mode === "fixed_monthly");
   // edit a quantity (Enter saves), Esc cancels, delete a line
   await lineRow("COAL-01").locator("[data-cov-edit-line]").click();
   await setIn("quantity", 0.5);
