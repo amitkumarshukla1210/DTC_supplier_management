@@ -882,6 +882,14 @@ def _sheet_date(value: Any) -> date | None:
     raise HTTPException(status_code=422, detail=f"{value} is not a date; use DD-MM-YYYY")
 
 
+def _is_month(value: Any) -> bool:
+    try:
+        _month(value)
+        return True
+    except HTTPException:
+        return False
+
+
 def _plan_blocks(raw: bytes) -> list[dict[str, Any]] | None:
     """Plan sheet as in the template: blocks of Model Code | Model Name | Release date | Plan revision | one
     column per month (01-01-2026 ...). A sheet may hold several blocks (one per revision). None: not this layout."""
@@ -899,7 +907,8 @@ def _plan_blocks(raw: bytes) -> list[dict[str, Any]] | None:
     current: dict[str, Any] | None = None
     for number, line in enumerate(lines, start=1):
         keys = [key(value) for value in line]
-        if "model_code" in keys and ("release_date" in keys or "plan_revision" in keys):
+        month_like = sum(1 for value in line if value is not None and str(value).strip() and _is_month(value))
+        if "model_code" in keys and (month_like or "release_date" in keys or "plan_revision" in keys):
             columns, months = {}, []
             for index, value in enumerate(line):
                 if keys[index] in ("model_code", "model_name", "release_date", "plan_revision"):
@@ -5152,17 +5161,19 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     async def upload_plan_excel(issue_month: str, request: Request, workspace: str = "trial", release_date: str = ""):
         raw = await request.body()
         blocks = _plan_blocks(raw)
-        if blocks is not None:  # the plan template: one revision per upload, picked by its release date
+        if blocks is not None:  # the plan template: one plan per upload, released on the date picked in the app (next revision)
             picked_date = _sheet_date(release_date) if release_date else None
-            if picked_date:
-                chosen = [block for block in blocks if block["released"] == picked_date]
-            else:
-                chosen = blocks if len(blocks) == 1 else []
             shown = lambda day: day.strftime("%d-%m-%Y") if day else "(blank)"
-            if not chosen:
-                listed = ", ".join(f"{shown(block['released'])} (Rev.{block['revision']:02d})" if block["revision"] is not None else shown(block["released"]) for block in blocks)
-                raise HTTPException(status_code=422, detail=(f"No plan in the file is released on {shown(picked_date)}. " if picked_date else "The file has more than one plan. ")
-                                    + f"Plans in the file: {listed}. Pick that release date and upload again.")
+            dated = [block for block in blocks if block["released"]]
+            if len(blocks) == 1:
+                chosen = blocks
+            elif picked_date and dated:  # an older sheet with several dated blocks: the one released on the picked date
+                chosen = [block for block in blocks if block["released"] == picked_date]
+                if not chosen:
+                    listed = ", ".join(shown(block["released"]) for block in blocks)
+                    raise HTTPException(status_code=422, detail=f"No plan in the file is released on {shown(picked_date)}. Plans in the file: {listed}.")
+            else:
+                raise HTTPException(status_code=422, detail=f"The file has {len(blocks)} plans; keep one plan (one heading row) per upload")
             if len(chosen) > 1:
                 raise HTTPException(status_code=422, detail=f"The file has {len(chosen)} plans released on {shown(picked_date)}; keep one")
             block = chosen[0]
@@ -5170,9 +5181,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     for row in block["rows"] for month, quantity in row["quantities"].items()]
             if not rows:
                 raise HTTPException(status_code=422, detail="The plan has no quantities")
-            released = block["released"] or picked_date
-            payload = PlanUpload(issue_month=block["months"][0][1], workspace=workspace, rows=rows, revision=block["revision"],
-                                 release_date=released.isoformat() if released else None)
+            released = picked_date or block["released"]
+            plan_month = _month_text(_month(released)) if released else _month_text(_month(issue_month))  # no date: the month in the address (older uploads)
+            payload = PlanUpload(issue_month=plan_month, workspace=workspace, rows=rows, release_date=released.isoformat() if released else None)
             return upload_plan(payload, request)
         rows = _read_xlsx(raw)
         payload = PlanUpload(issue_month=_month_text(_month(issue_month)), workspace=workspace, rows=_plan_rows_from_excel(rows))
@@ -5694,15 +5705,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="dtc-analysis-{start_month}-{end_month}.pdf"'})
 
     def plan_template_workbook(issue_month: str | None, release_date: str | None) -> StreamingResponse:
-        """Plan template as the user keeps it: logo and title, then Model Code | Model Name | Release date |
-        Plan revision | 20 months (DD-MM-YYYY), one row per model."""
-        first_month = _month(issue_month or _month_text(date.today()))
-        released = _sheet_date(release_date) if release_date else date.today()
+        """Plan template: logo and title, then Model Code | Model Name | 24 months (DD-MM-YYYY) from the month of the
+        plan date, one row per model. The plan date and revision are set by the app on upload."""
+        released = _sheet_date(release_date) if release_date else None
+        first_month = _month(released) if released else _month(issue_month or _month_text(date.today()))
         with open_db() as db:
-            models = db.scalars(select(ProductModel).order_by(ProductModel.code, ProductModel.name)).all()
-            taken = db.scalar(select(func.max(PlanningCycle.revision)).where(PlanningCycle.workspace == "trial", PlanningCycle.issue_month == _month_text(first_month)))
-            rows = [(model.code, model.name) for model in models]
-        next_revision = 0 if taken is None else taken + 1
+            rows = [(model.code, model.name) for model in db.scalars(select(ProductModel).order_by(ProductModel.code, ProductModel.name)).all()]
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Plan"
@@ -5718,32 +5726,27 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         sheet.row_dimensions[2].height = 22
         sheet["B1"] = "Design to Cost · Production plan"
         sheet["B1"].font = Font(bold=True, size=14, color="12263A")
-        sheet["B2"] = (f"Plan from {first_month.strftime('%d-%m-%Y')} for 20 months · dates DD-MM-YYYY. One block = one revision; a sheet may hold several "
-                       "blocks (Rev.00, Rev.01 ...), each with its Release date. On upload pick the release date of the block to load.")
+        sheet["B2"] = (f"Plan from {first_month.strftime('%d-%m-%Y')} for 24 months · dates DD-MM-YYYY. On upload pick the plan date in the app: "
+                       "each upload is saved as the next revision of that month (Rev.00, Rev.01 ...).")
         sheet["B2"].font = Font(italic=True, color="5B6B7B")
-        months = [_plus_months(first_month, offset) for offset in range(20)]
-        headers = ["Model Code", "Model Name", "Release date", "Plan revision"] + months
+        months = [_plus_months(first_month, offset) for offset in range(24)]
+        headers = ["Model Code", "Model Name"] + months
         for index, value in enumerate(headers, start=1):
             cell = sheet.cell(4, index, value)
             cell.fill, cell.font = dark, white
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            if index > 4:
+            if index > 2:
                 cell.number_format = "DD-MM-YYYY"
         for row_index, (code, name) in enumerate(rows or [("", "")], start=5):
             sheet.cell(row_index, 1, code)
             sheet.cell(row_index, 2, name)
-            released_cell = sheet.cell(row_index, 3, released)
-            released_cell.number_format = "DD-MM-YYYY"
-            sheet.cell(row_index, 4, f"Rev.{next_revision:02d}")
-            for column in range(5, 25):
+            for column in range(3, 27):
                 sheet.cell(row_index, column).number_format = "#,##0.###"
         sheet.column_dimensions["A"].width = 16
         sheet.column_dimensions["B"].width = 26
-        sheet.column_dimensions["C"].width = 14
-        sheet.column_dimensions["D"].width = 13
-        for column in range(5, 25):
+        for column in range(3, 27):
             sheet.column_dimensions[__import__("openpyxl").utils.get_column_letter(column)].width = 12
-        sheet.freeze_panes = "E5"
+        sheet.freeze_panes = "C5"
         output = io.BytesIO()
         workbook.save(output)
         output.seek(0)

@@ -461,58 +461,51 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(transfer.status_code, 201, transfer.text)
         self.assertEqual(self.client.get("/api/planning/transfers?workspace=trial").json()[0]["quantity"], 3)
 
-    def test_plan_sheet_with_revisions_picked_by_release_date(self):
-        # The user's sheet: three blocks Rev.00 / Rev.01 / Rev.02 (released 01-01, 15-01, 17-01-2026), one per revision
+    def test_plan_uploads_get_next_revision_on_the_picked_date(self):
+        # The user's way: in Nov-26 the 24-month plan is uploaded on 01-11, 10-11 and 15-11; each upload = next revision
         api = self.client
         product = api.post("/api/planning/products", json={"code": "RV-PRD", "name": "Fans"}).json()["id"]
-        product2 = api.post("/api/planning/products", json={"code": "RV-PRD2", "name": "Fans 2"}).json()["id"]
-        eva = api.post("/api/planning/models", json={"product_id": product, "code": "RV12000", "name": "Eva 8014"}).json()["id"]
-        serena = api.post("/api/planning/models", json={"product_id": product2, "code": "RV12001", "name": "Serena 8014"}).json()["id"]
-        months = [f"01-{m:02d}-2026" for m in range(1, 11)]
-
-        def block(released, revision, eva_qty, serena_qty):
-            return [[None], [None], ["Model Code", "Model Name", "Release date", "Plan revision"] + months,
-                    ["RV12000", "Eva 8014", released, revision] + eva_qty, ["RV12001", "Serena 8014", released, revision] + serena_qty]
-
-        workbook = Workbook()
-        sheet = workbook.active
-        rows = block("01-01-2026", "Rev.00", [20000, 15000, 20000, 16000, 20000, 40000, 15000, 20000, 20000, 35000], [20000] * 10) \
-            + block(date(2026, 1, 15), "Rev.01", [15000, 18000, 21600, 25920, 31104, 37325, 44790, 53748, 64498, 77398], [35000] * 10) \
-            + block("17-01-2026", "Rev.02", [17000] * 10, [30000] * 10) + [[None], ["Total", "", "", ""] + [47000] * 10]  # a total under the last block, after a blank row: not a model
-        for row in rows:
-            sheet.append(row)
-        content = io.BytesIO()
-        workbook.save(content)
+        api.post("/api/planning/models", json={"product_id": product, "code": "RV12000", "name": "Eva 8014"})
+        api.post("/api/planning/models", json={"product_id": product, "code": "RV12001", "name": "Serena 8014"})
         xlsx = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
-        upload = lambda released: api.post(f"/api/planning/plans/2026-01/upload?workspace=trial&release_date={released}", content=content.getvalue(), headers=xlsx)
-        # without a date the file is ambiguous; a date not in the file lists the dates there
-        none = api.post("/api/planning/plans/2026-01/upload?workspace=trial", content=content.getvalue(), headers=xlsx)
-        self.assertIn("Plans in the file: 01-01-2026 (Rev.00), 15-01-2026 (Rev.01), 17-01-2026 (Rev.02)", none.json()["detail"])
-        self.assertIn("No plan in the file is released on 16-01-2026", upload("2026-01-16").json()["detail"])
-        # one revision per upload, picked by its release date
-        first = upload("2026-01-15")
-        self.assertEqual(first.status_code, 201, first.text)
-        self.assertEqual((first.json()["revision"], first.json()["issue_month"], first.json()["release_date"], first.json()["rows"]), ("Rev.01", "2026-01", "2026-01-15", 20))
-        self.assertEqual(upload("2026-01-15").status_code, 409)  # Rev.01 already loaded
-        self.assertEqual(upload("2026-01-01").json()["revision"], "Rev.00")
-        self.assertEqual(upload("17-01-2026").json()["rows"], 20)  # the last block; its Total row is ignored
-        listed = {p["revision"]: p for p in api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-01"}).json()}
-        self.assertEqual((listed["Rev.00"]["release_date"], listed["Rev.01"]["release_date"]), ("2026-01-01", "2026-01-15"))
-        # quantities went to the right model
-        rows_view = api.get(f"/api/planning/plans/{first.json()['id']}/rows", params={"limit": 100}).json()["items"]
-        by_name = {item["model_name"]: item["quantities"] for item in rows_view}
-        self.assertEqual((by_name["Eva 8014"]["2026-03"], by_name["Eva 8014"]["2026-10"], by_name["Serena 8014"]["2026-03"]), (21600, 77398, 35000))
-        # a code given with another model's name (as FL12000 for both Eva and Serena) is reported, not guessed
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.append(["Model Code", "Model Name", "Release date", "Plan revision", "01-01-2026"])
-        sheet.append(["RV12000", "Eva 8014", "20-01-2026", "Rev.05", 10])
-        sheet.append(["RV12000", "Serena  8014", "20-01-2026", "Rev.05", 10])
-        content = io.BytesIO()
-        workbook.save(content)
-        wrong = api.post("/api/planning/plans/2026-01/upload?workspace=trial&release_date=20-01-2026", content=content.getvalue(), headers=xlsx)
-        self.assertIn("Row 3: RV12000 is Eva 8014 in Product Master, not Serena  8014", wrong.json()["detail"])
-        self.assertEqual(len(api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-01"}).json()), 3)  # nothing saved
+        # template: no Release date / Plan revision columns; 24 months from the plan date's month
+        template = load_workbook(io.BytesIO(api.get("/api/planning/templates/plan.xlsx", params={"release_date": "2027-02-10"}).content)).active
+        heads = [template.cell(4, c).value for c in range(1, 28)]
+        self.assertEqual(heads[:2], ["Model Code", "Model Name"])
+        self.assertEqual((heads[2].date(), heads[25].date(), heads[26]), (date(2027, 2, 1), date(2029, 1, 1), None))
+        self.assertEqual([(template.cell(r, 1).value, template.cell(r, 2).value) for r in (5, 6)], [("RV12000", "Eva 8014"), ("RV12001", "Serena 8014")])
+
+        def sheet_with(eva, serena, extra=()):
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Design to Cost · Production plan"])
+            sheet.append([])
+            sheet.append([])
+            sheet.append(["Model Code", "Model Name"] + [f"01-{(10 + m) % 12 + 1:02d}-{2026 + (10 + m) // 12}" for m in range(24)])
+            sheet.append(["RV12000", "Eva 8014"] + [eva] * 24)
+            sheet.append(["RV12001", "Serena 8014"] + [serena] * 24)
+            for row in extra:
+                sheet.append(row)
+            content = io.BytesIO()
+            workbook.save(content)
+            return content.getvalue()
+
+        upload = lambda day, body: api.post(f"/api/planning/plans/2026-11/upload?workspace=trial&release_date={day}", content=body, headers=xlsx)
+        results = [upload(day, sheet_with(qty, qty * 2, [[None], ["Total", ""] + [qty * 3] * 24])) for day, qty in (("2026-11-01", 100), ("10-11-2026", 200), ("2026-11-15", 300))]
+        self.assertEqual([(r.status_code, r.json()["revision"], r.json()["issue_month"], r.json()["release_date"], r.json()["rows"]) for r in results],
+                         [(201, "Rev.00", "2026-11", "2026-11-01", 48), (201, "Rev.01", "2026-11", "2026-11-10", 48), (201, "Rev.02", "2026-11", "2026-11-15", 48)])
+        listed = {p["revision"]: p["release_date"] for p in api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-11"}).json()}
+        self.assertEqual(listed, {"Rev.00": "2026-11-01", "Rev.01": "2026-11-10", "Rev.02": "2026-11-15"})
+        by_name = {item["model_name"]: item["quantities"] for item in api.get(f"/api/planning/plans/{results[1].json()['id']}/rows", params={"limit": 100}).json()["items"]}
+        self.assertEqual((by_name["Eva 8014"]["2026-11"], by_name["Eva 8014"]["2028-10"], by_name["Serena 8014"]["2027-05"]), (200, 200, 400))
+        # one plan per upload; a model name that does not match its code is reported (nothing saved)
+        two = sheet_with(1, 2, [[None], ["Model Code", "Model Name", "01-11-2026"], ["RV12000", "Eva 8014", 5]])
+        self.assertIn("keep one plan", upload("2026-11-20", two).json()["detail"])
+        wrong = sheet_with(1, 2, [["RV12000", "Serena  8014"] + [1] * 24])
+        self.assertIn("Row 7: RV12000 is Eva 8014 in Product Master, not Serena  8014", upload("2026-11-20", wrong).json()["detail"])
+        # a plan month before the plan date's month is outside the horizon
+        self.assertIn("24-month horizon", upload("2026-12-01", sheet_with(1, 2)).json()["detail"])
+        self.assertEqual(len(api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-11"}).json()), 3)
 
     def test_wide_month_plan_template_and_month_formats_upload(self):
         product = self.client.post("/api/planning/products", json={"code": "MONTH-PRD", "name": "Month product"})
@@ -524,14 +517,14 @@ class SupplierHubApiTests(unittest.TestCase):
         template = self.client.get("/api/planning/templates/plan.xlsx?issue_month=2026-04")
         self.assertEqual(template.status_code, 200, template.text)
         template_sheet = load_workbook(io.BytesIO(template.content), data_only=False).active
-        # the user's layout: logo + title, then Model Code | Model Name | Release date | Plan revision | 20 months (DD-MM-YYYY)
+        # logo + title, then Model Code | Model Name | 24 months (DD-MM-YYYY)
         self.assertEqual(template_sheet["B1"].value, "Design to Cost · Production plan")
         self.assertEqual(len(template_sheet._images), 1)  # the DC logo
-        self.assertEqual([template_sheet.cell(4, c).value for c in range(1, 5)], ["Model Code", "Model Name", "Release date", "Plan revision"])
-        self.assertEqual((template_sheet["E4"].value.date(), template_sheet["E4"].number_format), (date(2026, 4, 1), "DD-MM-YYYY"))
-        self.assertEqual(template_sheet["X4"].value.date(), date(2027, 11, 1))  # 20th month
-        self.assertIsNone(template_sheet["Y4"].value)
-        self.assertEqual((template_sheet["A5"].value, template_sheet["B5"].value, template_sheet["D5"].value, template_sheet["C5"].number_format), ("MONTH-12000", "Eva 8014", "Rev.00", "DD-MM-YYYY"))
+        self.assertEqual([template_sheet.cell(4, c).value for c in range(1, 3)], ["Model Code", "Model Name"])
+        self.assertEqual((template_sheet["C4"].value.date(), template_sheet["C4"].number_format), (date(2026, 4, 1), "DD-MM-YYYY"))
+        self.assertEqual(template_sheet["Z4"].value.date(), date(2028, 3, 1))  # 24th month
+        self.assertIsNone(template_sheet["AA4"].value)
+        self.assertEqual((template_sheet["A5"].value, template_sheet["B5"].value), ("MONTH-12000", "Eva 8014"))
 
         workbook = Workbook()
         sheet = workbook.active

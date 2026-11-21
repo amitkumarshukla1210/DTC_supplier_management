@@ -97,8 +97,8 @@ Tabs, in order: **Supplier register** (first), Supplier/material relationship, S
 
 ## Production plan (Plans & actuals)
 
-- **Plan template**: the DC logo and a title, then a block **Model Code | Model Name | Release date | Plan revision | 20 months** (dates **DD-MM-YYYY**, from the chosen start month), one row per model, with the chosen release date and the next revision (Rev.00, Rev.01 ...).
-- **One revision per upload**: pick the **Plan release date** and the file. A sheet may hold several blocks (Rev.00 released 01-01-2026, Rev.01 on 15-01-2026 ...): the block with the picked release date is loaded; another date lists the dates in the file. The block's first month is the plan start; its Plan revision is kept (a revision already loaded for that month is refused). A row whose name differs from the model code's name in Product Master is reported. A blank row ends a block (a Total row under it is ignored). Revision history shows the release date. Older sheets (one model per row, one month per column) still work.
+- **Plan template**: the DC logo and a title, then **Model Code | Model Name | 24 months** (dates **DD-MM-YYYY**, from the month of the chosen plan date), one row per model. No date or revision columns: the app sets them.
+- **Upload**: pick the **Plan date** from the calendar, then the file. Each upload is saved as the **next revision** of that month: e.g. in Nov-26, 01-11 → Rev.00, 10-11 → Rev.01, 15-11 → Rev.02. One plan per file; a blank row ends it (a Total row under it is ignored). A row whose name differs from the model code's name in Product Master is reported. Revision history shows the plan date and upload time as DD-MM-YYYY. Older sheets still work.
 
 ## Supplier register → relationship → coverage
 

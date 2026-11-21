@@ -374,14 +374,13 @@ async function renderPlans() {
   const ddmmyyyy = (iso) => (iso ? iso.split("-").reverse().join("-") : "");
   const today = new Date().toISOString().slice(0, 10);
   const planRows = state.plans.map((plan) => `<tr class="clickable-row" data-plan-id="${plan.id}" tabindex="0" title="Open ${esc(plan.revision)} to review or edit monthly quantities"><td>${monthLabel(plan.issue_month)}</td><td>${esc(plan.revision)}</td><td>${esc(ddmmyyyy(plan.release_date))}</td><td>${number(plan.row_count, 0)}</td><td>${(() => { const d = new Date(plan.created_at); const two = (n) => String(n).padStart(2, "0"); return `${two(d.getDate())}-${two(d.getMonth() + 1)}-${d.getFullYear()} ${two(d.getHours())}:${two(d.getMinutes())}`; })()}</td><td>${esc(plan.workspace)}</td></tr>`).join("");
-  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?issue_month=${month}&release_date=${today}">Plan template</a><a class="button" href="/api/planning/templates/actuals.xlsx">Actuals template</a>`)}
+  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?release_date=${today}">Plan template</a><a class="button" href="/api/planning/templates/actuals.xlsx">Actuals template</a>`)}
     <div class="planning-grid">
-      <section class="panel">${panelHeader("Upload plan revision", "Plan template: logo and header, then Model Code, Model Name, Release date, Plan revision and 20 months (DD-MM-YYYY), one row per model. One revision per upload: pick its release date; if the file holds several blocks (Rev.00, Rev.01 ...), the block with that release date is loaded, and its first month is the plan start. Older sheets (one model per row, one month per column, from the start month) are also accepted.")}
+      <section class="panel">${panelHeader("Upload plan revision", "Pick the plan date from the calendar, then the file. Each upload is saved as the next revision of that month (e.g. Nov-26: 01-11 Rev.00, 10-11 Rev.01, 15-11 Rev.02). Plan template: logo and header, then Model Code, Model Name and 24 months (DD-MM-YYYY) from the plan date's month, one row per model.")}
         <form id="planUploadForm" class="panel-body form-grid">
-          ${field("Plan start month", "issue_month", "month", { required: true, value: month })}
-          ${field("Plan release date", "release_date", "date", { required: true, value: today })}
+          ${field("Plan date", "release_date", "date", { required: true, value: today })}
           <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
-          <label class="field full"><span>Plan workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
+          <label class="field full"><span>24-month plan workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload as next revision</button>
         </form></section>
       <section class="panel">${panelHeader("Upload actual production & OEM stock", "Columns: model_code, actual_quantity, oem_stock. Actuals update that model and month; plans remain unchanged.")}
@@ -399,23 +398,21 @@ async function renderPlans() {
     <section id="planRevisionEditor" class="panel table-panel" hidden></section>
     <section class="panel table-panel">${panelHeader("Revision history", "Each issue month begins at Rev.00. Prior uploads are preserved for plan-versus-actual review.")}
       <div class="table-toolbar"><div class="toolbar-group" id="planFilters"></div><div class="toolbar-group">${tableExportLinks("plans", { workspace: state.workspace })}<button class="button button-small" data-action="clear-table-filters" data-table="planHistory">Clear all filters</button></div></div>
-      <div id="planHistory">${table(["Issue month", "Revision", "Release date", "Rows", "Revision date", "Workspace"], planRows, "No monthly plans uploaded yet.")}</div>
+      <div id="planHistory">${table(["Issue month", "Revision", "Plan date", "Rows", "Uploaded on", "Workspace"], planRows, "No monthly plans uploaded yet.")}</div>
     </section>`;
   $("#planUploadForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
-    const uploadMonth = data.get("issue_month");
+    const uploadMonth = String(data.get("release_date") || today).slice(0, 7);
     state.workspace = data.get("workspace");
     try {
       const result = await uploadExcel(`/api/planning/plans/${uploadMonth}/upload?workspace=${state.workspace}&release_date=${data.get("release_date") || ""}`, data.get("workbook"));
-      toast(`Plan saved as ${result.revision} for ${monthLabel(result.issue_month)}${result.release_date ? `, released ${ddmmyyyy(result.release_date)}` : ""}`);
+      toast(`Plan saved as ${result.revision} for ${monthLabel(result.issue_month)}${result.release_date ? `, plan date ${ddmmyyyy(result.release_date)}` : ""}`);
       await renderPlans();
     } catch (error) { toast(error.message, true); }
   });
-  const templateHref = () => { $("#planTemplateLink").href = `/api/planning/templates/plan.xlsx?issue_month=${encodeURIComponent($('#planUploadForm [name="issue_month"]').value)}&release_date=${encodeURIComponent($('#planUploadForm [name="release_date"]').value)}`; };
-  $('#planUploadForm [name="issue_month"]').addEventListener("change", templateHref);
-  $('#planUploadForm [name="release_date"]').addEventListener("change", templateHref);
+  $('#planUploadForm [name="release_date"]').addEventListener("change", (event) => { $("#planTemplateLink").href = `/api/planning/templates/plan.xlsx?release_date=${encodeURIComponent(event.target.value)}`; });
   $("#actualUploadForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -437,7 +434,7 @@ async function renderPlans() {
       setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
     } catch (error) { toast(error.message, true); }
   });
-  setupTableFilters("#planHistory", "#planFilters", null, [{ title: "Issue month", index: 0 }, { title: "Revision", index: 1 }, { title: "Release date", index: 2 }, { title: "Workspace", index: 5 }]);
+  setupTableFilters("#planHistory", "#planFilters", null, [{ title: "Issue month", index: 0 }, { title: "Revision", index: 1 }, { title: "Plan date", index: 2 }, { title: "Workspace", index: 5 }]);
   setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
 }
 
@@ -470,7 +467,7 @@ function renderPlanEditor() {
     return `<td><input class="form-control plan-quantity-input" type="number" min="0" max="1000000000" step="any" required aria-label="${esc(`${item.model_code}, ${monthLabel(month)} quantity`)}" data-plan-quantity data-model-code="${esc(item.model_code)}" data-month="${esc(month)}" value="${esc(value)}" /></td>`;
   }).join("")}</tr>`).join("");
   const canSave = editor.latest && editor.edits.size > 0;
-  root.innerHTML = `${panelHeader(`Edit ${editor.revision}`, `Issue month ${monthLabel(editor.issue_month)} · ${editor.workspace} workspace · original saved ${new Date(editor.created_at).toLocaleString()}. Saving creates a new revision and keeps this one unchanged.`)}
+  root.innerHTML = `${panelHeader(`Edit ${editor.revision}`, `Issue month ${monthLabel(editor.issue_month)} · ${editor.workspace} workspace · original saved ${(() => { const d = new Date(editor.created_at); const two = (n) => String(n).padStart(2, "0"); return `${two(d.getDate())}-${two(d.getMonth() + 1)}-${d.getFullYear()} ${two(d.getHours())}:${two(d.getMinutes())}`; })()}. Saving creates a new revision and keeps this one unchanged.`)}
     <div class="table-toolbar plan-editor-toolbar"><label class="search-field"><input class="form-control" id="planEditorSearch" type="search" placeholder="Search model code or name" value="${esc(editor.search)}" /></label><span>${editor.total_models.toLocaleString()} models · edit month quantities below</span><button class="button button-small" type="button" data-plan-editor-close>Close editor</button></div>
     ${editor.latest ? "" : '<p class="plan-editor-warning">A newer revision already exists. Open the latest revision to save further changes.</p>'}
     <form id="planEditorForm"><div class="table-wrap plan-editor-table"><table><thead><tr><th>Model code</th><th>Model name</th>${monthHeaders}</tr></thead><tbody>${modelRows || `<tr><td class="table-empty" colspan="${editor.months.length + 2}">No models found.</td></tr>`}</tbody></table></div>
