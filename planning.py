@@ -5388,6 +5388,84 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         "items": rows}
             return [row for row in rows if row["actual_quantity"] is not None]
 
+    def month_material_demand(db: Session, workspace: str, month: str) -> tuple[PlanningCycle | None, dict[int, float]]:
+        """Plan demand of every material in a month: the plan in force x each model's BOM (L1-L3, alternates' SOB)."""
+        cycle, planned = month_plan(db, workspace, month)
+        if not planned:
+            return cycle, {}
+        _, children = _item_map(db)
+        roots_by_model: dict[int, list[ModelBOM]] = {}
+        for root in db.scalars(select(ModelBOM).where(ModelBOM.model_id.in_(list(planned)))).all():
+            roots_by_model.setdefault(root.model_id, []).append(root)
+        root_history, component_history, _ = _line_alternate_history(db)
+        root_splits, component_splits = _splits_at(root_history, month), _splits_at(component_history, month)
+        demand: dict[int, float] = {}
+        for model_id, quantity in planned.items():
+            if not quantity:
+                continue
+            for material_id, per_model in _rollup_model_bom(roots_by_model.get(model_id, []), children, root_splits, component_splits).items():
+                demand[material_id] = demand.get(material_id, 0) + quantity * per_model
+        return cycle, demand
+
+    @app.get("/api/planning/supplier-overview/{supplier_id}")
+    def supplier_overview(supplier_id: int, request: Request, month: str = "", workspace: str = "trial"):
+        """One supplier at a glance (Supplier register click): the parts it supplies you with SOB, rate, FG stock and
+        requirement; each part's BOM with its sub-suppliers (SOB, rate, requirement, stock); the sub-supplier list."""
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        can_price = _check_price_access(request)
+        month = _month_text(_month(month)) if month else _month_text(date.today())
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id)
+            if not supplier:
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            cycle, demand = month_material_demand(db, workspace, month)
+            links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all()
+            items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_({link.material_id for link in links})))} if links else {}
+            stock = {row.supplier_part_id: row for row in db.scalars(select(SupplierStockSnapshot).where(
+                SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == month,
+                SupplierStockSnapshot.supplier_part_id.in_([link.id for link in links]))).all()} if links else {}
+            source_stock = {(row.product_material_id, row.material_code.casefold(), row.sub_supplier_id): row for row in db.scalars(select(SupplierSourceStock).where(
+                SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == month, SupplierSourceStock.t1_supplier_id == supplier_id)).all()}
+            parts, sub_rows = [], []
+            for link in sorted(links, key=lambda l: items[l.material_id].code.casefold()):
+                item = items[link.material_id]
+                held = stock.get(link.id)
+                part_need = demand.get(item.id, 0.0)
+                share = part_need * (link.sob_percent or 0) / 100  # this supplier's part of the requirement
+                part = {"link_id": link.id, "code": item.code, "name": item.name, "uom": item.uom, "sob_percent": link.sob_percent,
+                        "lead_time_days": link.lead_time_days, "price_status": _price_status(link, _month_text(date.today())),
+                        "stock": held.quantity if held else None, "available": held.available_quantity if held else None,
+                        "part_requirement": part_need, "supplier_requirement": share, "lines": []}
+                if can_price:
+                    part.update(unit_price=link.unit_price, currency=link.currency)
+                view = supplier_bom_view(db, supplier_id, item.id, can_price)
+                per_unit: dict[int, float] = {}
+                for line in view["lines"]:
+                    per_piece = line["quantity"] * (per_unit.get(line["parent_line_id"], 1.0) if line["parent_line_id"] else 1.0)
+                    per_unit[line["id"]] = per_piece
+                    component = line["component"]
+                    need = share * per_piece
+                    entry = {"id": line["id"], "depth": line["depth"], "parent_line_id": line["parent_line_id"], "code": component["code"], "name": component["name"],
+                             "origin": component["origin"], "uom": component["uom"], "bom_qty": line["quantity"], "per_part": per_piece, "requirement": need, "sources": []}
+                    for src in line["sources"]:
+                        kept = source_stock.get((item.id, component["code"].casefold(), src["sub_supplier_id"]))
+                        source = {"sub_supplier_id": src["sub_supplier_id"], "code": src["sub_supplier_code"], "name": src["sub_supplier"], "tier": f"T{line['depth'] + 1}",
+                                  "sob_percent": src["sob_percent"], "lead_time_days": src["lead_time_days"], "requirement": need * src["sob_percent"] / 100,
+                                  "stock": kept.quantity if kept else None, "available": kept.available_quantity if kept else None}
+                        if can_price:
+                            source.update(unit_price=src.get("unit_price"), currency=src["currency"])
+                        entry["sources"].append(source)
+                        sub_rows.append({**source, "part_code": item.code, "part_name": item.name, "material_code": component["code"], "material_name": component["name"], "uom": component["uom"]})
+                    part["lines"].append(entry)
+                parts.append(part)
+            sub_rows.sort(key=lambda row: (row["code"].casefold(), row["part_code"].casefold(), row["material_code"].casefold()))
+            return {"supplier": {"id": supplier.id, "code": supplier.code, "name": supplier.name, "category": supplier.category, "tiers": _tier_list(supplier.tiers)},
+                    "month": month, "workspace": workspace,
+                    "plan": {"revision": f"Rev.{cycle.revision:02d}", "issue_month": cycle.issue_month, "release_date": cycle.release_date} if cycle else None,
+                    "parts": parts, "sub_suppliers": sub_rows}
+
     @app.get("/api/planning/actuals/template.xlsx")
     def actual_template(request: Request, as_of: str = "", workspace: str = "trial"):
         """Actual production template like the plan template: logo and title, the month and as-on date, then the

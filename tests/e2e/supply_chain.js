@@ -37,9 +37,12 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.click('[data-page="suppliers"]');
   await page.waitForSelector("#supplierRegisterTable tbody tr");
   check("No separate coverage tab any more", (await page.locator('[data-supplier-tab="Supplier/material coverage"]').count()) === 0);
-  await page.locator('#supplierRegisterTable td[data-open-supplier-rel]', { hasText: "SUP-2013" }).click();
+  await page.locator('#supplierRegisterTable td[data-open-supplier-overview]', { hasText: "SUP-2013" }).click();
+  await page.waitForSelector("#ovParts table");
+  check("Clicking the code opens Savera's overview (no parts yet)", (await page.textContent("#ovTitle")) === "SUP-2013 Savera" && (await page.textContent("#ovParts")).includes("supplies no part yet"));
+  await page.click("#ovEditParts");
   await page.waitForSelector("#relListTable table");
-  check("Clicking the code opens Supplier/material relationship for Savera", (await page.locator(".panel-header, .panel").first().textContent()).includes("Supplier/material relationship · SUP-2013 Savera"));
+  check("Edit parts opens Supplier/material relationship for Savera", (await page.locator(".panel-header, .panel").first().textContent()).includes("Supplier/material relationship · SUP-2013 Savera"));
   const relHeads = await page.locator("#relListTable thead th summary").allTextContents();
   check("Columns: Supplier Code, Supplier Name, T1 Part Code, T1 Part Name, SOB, Lead time, MOQ, Buffer days, Unit price, Currency, Action", JSON.stringify(relHeads) === JSON.stringify(["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Lead time", "MOQ", "Buffer days", "Unit price", "Currency", "Action"]), JSON.stringify(relHeads));
   const row = page.locator("#relEntryTable tbody tr").first();
@@ -189,8 +192,19 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Uploading the template back: 1 part, 2 material lines, 3 supplier rows", (await toastText()).includes("1 part: 2 material lines, 3 supplier rows saved"), await toastText());
   const after = await read();
   check("Tree unchanged after the round trip", JSON.stringify(after) === JSON.stringify([["T1", "Savera", "60%", "1", "36,000 Nos"], ["L1 BOM", "FL001STEEL0.7 T2", "90%", "2", "72,000 kg"], ["T2", "JGI STEEL", "20%", "0.4", "14,400 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"], ["L2 BOM", "ORE-01 T3", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"]]), JSON.stringify(after));
-  // back via the breadcrumb, then all suppliers
-  await page.locator('#covCrumbs a[data-open-supplier-rel]').click();
+  // the breadcrumb's supplier opens its overview: parts (SOB, FG stock), BOM tree, sub-supplier list
+  await page.locator('#covCrumbs a[data-open-supplier-overview]').click();
+  await page.waitForSelector('#ovParts tbody tr:has-text("UF220BFB010")');
+  const ovPart = await page.locator('#ovParts tbody tr:has-text("UF220BFB010") td').allTextContents();
+  check("Overview 1: part, SOB 60%, rate, no plan -> requirement 0", ovPart[0] === "UF220BFB010" && ovPart[2] === "60%" && ovPart[3].includes("85") && ovPart[6] === "0" && ovPart[7] === "0", JSON.stringify(ovPart));
+  check("Overview plan note when no plan", (await page.textContent("#ovPlan")).includes("no plan uploaded"));
+  const ovTree = await page.locator("#ovTree tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[2].textContent, tr.cells[5].textContent, tr.cells[6].textContent]));
+  check("Overview 2-3: part BOM with sub-supplier SOB", JSON.stringify(ovTree) === JSON.stringify([["T1 part", "UF220BFB010", "Savera", "60%"], ["L1 BOM", "FL001STEEL0.7 T2", "", "90%"], ["T2 supplier", "↳ FL001STEEL0.7", "JGI STEEL", "20%"], ["T2 supplier", "↳ FL001STEEL0.7", "TATA Steel", "70%"], ["L2 BOM", "ORE-01 T3", "", "100%"], ["T3 supplier", "↳ ORE-01", "XYZ Mining", "100%"]]), JSON.stringify(ovTree));
+  await page.click("#ovCloseAll");
+  check("Overview tree closes", (await page.locator("#ovTree tbody tr:not([hidden])").count()) === 1);
+  const ovSubs = await page.locator("#ovSubs tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[0].textContent, tr.cells[2].textContent, tr.cells[3].textContent, tr.cells[4].textContent, tr.cells[6].textContent, tr.cells[7].textContent]));
+  check("Overview 4-6: sub-supplier list with part, material, SOB and rate", JSON.stringify(ovSubs) === JSON.stringify([["SUP-2004", "T2", "UF220BFB010", "FL001STEEL0.7", "20%", "₹70.00"], ["SUP-2014", "T2", "UF220BFB010", "FL001STEEL0.7", "70%", "₹70.00"], ["SUP-2030", "T3", "UF220BFB010", "ORE-01", "100%", "₹0.00"]]), JSON.stringify(ovSubs));
+  await page.click("#ovEditParts");
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);
   check("Relationship page: Download Excel / PDF of the list shown (Savera)", /^\/api\/planning\/supplier-relationships\.xlsx\?search=&supplier_id=\d+$/.test(await page.getAttribute("#relExcel", "href")) && (await page.request.get(BASE + await page.getAttribute("#relExcel", "href"))).status() === 200 && (await page.request.get(BASE + await page.getAttribute("#relPdf", "href"))).status() === 200, await page.getAttribute("#relExcel", "href"));

@@ -554,6 +554,63 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("Row 6: AC12001 is Serena 8014 in Product Master, not Eva 8014", api.post("/api/planning/actuals/2026-11/upload?as_of=2026-11-26", content=content.getvalue(), headers=xlsx).json()["detail"])
         self.assertIn("No actual production typed", api.post("/api/planning/actuals", json={"period": "2026-11", "rows": [{"model_code": "AC12000", "actual_quantity": ""}]}).json()["detail"])
 
+    def test_supplier_overview_parts_bom_sub_suppliers_rates_and_requirement(self):
+        # Savera makes Base Front Beam (60%) and Top Beam (100%). Plan Nov-26: Eva 60,000 (1 beam + 1 top beam each),
+        # Serena 10,000 (2 beams each). Beam: 2 kg steel (JGI 30% @74, TATA 70% @72), per kg steel 1.7 kg ore (XYZ 100%).
+        # Top beam: 1.5 kg steel (JGI 100% @76).
+        api = self.client
+        mat = lambda code, name, uom: api.post("/api/planning/materials", json={"code": code, "name": name, "uom": uom}).json()["id"]
+        beam, top = mat("OV-BEAM", "Base Front Beam", "Nos"), mat("OV-TOPB", "Top Beam", "Nos")
+        steel = api.post("/api/planning/tier-materials", json={"tier": "T2", "code": "OV-STEEL", "name": "STEEL0.7", "uom": "kg"}).json()["id"]
+        ore = api.post("/api/planning/tier-materials", json={"tier": "T3", "code": "OV-ORE", "name": "Iron ore", "uom": "kg"}).json()["id"]
+        product = api.post("/api/planning/products", json={"code": "OV-PRD", "name": "Fans"}).json()["id"]
+        eva = api.post("/api/planning/models", json={"product_id": product, "code": "OV12000", "name": "Eva 8014"}).json()["id"]
+        serena = api.post("/api/planning/models", json={"product_id": product, "code": "OV12001", "name": "Serena 8014"}).json()["id"]
+        for model, material, qty in ((eva, beam, 1), (eva, top, 1), (serena, beam, 2)):
+            self.assertEqual(api.post(f"/api/planning/model-bom/{model}", json={"material_id": material, "quantity": qty, "uom": "Nos"}).status_code, 201)
+        sup = lambda code, name: api.post("/api/suppliers", json={"code": code, "name": name, "category": "Sheet Metal", "country": "India"}).json()["id"]
+        savera, other, jgi, tata, xyz = sup("OV-1013", "OV Savera"), sup("OV-1007", "OV Supangita"), sup("OV-1004", "OV JGI"), sup("OV-1014", "OV TATA"), sup("OV-1030", "OV XYZ")
+        link = lambda who, material, sob, price: api.post("/api/planning/supplier-parts", json={"material_id": material, "supplier_id": who, "sob_percent": sob, "unit_price": price, "currency": "INR", "lead_time_days": 15}).json()["id"]
+        beam_link, top_link = link(savera, beam, 60, 85), link(savera, top, 100, 40)
+        link(other, beam, 40, 90)
+        src = lambda who, sob, price=0: {"sub_supplier_id": who, "sob_percent": sob, "unit_price": price, "currency": "INR"}
+        steel_line = api.post("/api/planning/supplier-coverage/lines", json={"link_id": beam_link, "tier_material_id": steel, "quantity": 2, "sources": [src(jgi, 30, 74), src(tata, 70, 72)]}).json()["id"]
+        api.post("/api/planning/supplier-coverage/lines", json={"link_id": beam_link, "parent_line_id": steel_line, "tier_material_id": ore, "quantity": 1.7, "sources": [src(xyz, 100, 9)]})
+        api.post("/api/planning/supplier-coverage/lines", json={"link_id": top_link, "tier_material_id": steel, "quantity": 1.5, "sources": [src(jgi, 100, 76)]})
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Model Code", "Model Name", "01-11-2026"])
+        sheet.append(["OV12000", "Eva 8014", 60000])
+        sheet.append(["OV12001", "Serena 8014", 10000])
+        content = io.BytesIO()
+        workbook.save(content)
+        api.post("/api/planning/plans/2026-11/upload?workspace=trial&release_date=2026-11-10", content=content.getvalue(), headers={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+        api.post("/api/planning/supplier-stock/2026-11?workspace=trial", json={"rows": [{"supplier_part_id": beam_link, "quantity": 9000, "available_quantity": 8000}]})
+        view = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()
+        self.assertEqual((view["supplier"]["code"], view["plan"]["revision"], view["plan"]["release_date"]), ("OV-1013", "Rev.00", "2026-11-10"))
+        # 1. parts: SOB, rate, FG stock, requirement (beam 60,000 x 1 + 10,000 x 2 = 80,000; Savera 60% = 48,000)
+        parts = {p["code"]: p for p in view["parts"]}
+        self.assertEqual([p["code"] for p in view["parts"]], ["OV-BEAM", "OV-TOPB"])
+        self.assertEqual((parts["OV-BEAM"]["sob_percent"], parts["OV-BEAM"]["unit_price"], parts["OV-BEAM"]["stock"], parts["OV-BEAM"]["available"], parts["OV-BEAM"]["part_requirement"], parts["OV-BEAM"]["supplier_requirement"]),
+                         (60, 85, 9000, 8000, 80000, 48000))
+        self.assertEqual((parts["OV-TOPB"]["part_requirement"], parts["OV-TOPB"]["supplier_requirement"], parts["OV-TOPB"]["stock"]), (60000, 60000, None))
+        # same as the Shortage & excess report's plan demand for Savera's beam (worked out there separately)
+        report = api.get("/api/planning/report", params={"start_month": "2026-11", "end_month": "2026-11"}).json()["items"]
+        self.assertEqual(next(r["plan_demand"] for r in report if r["material_code"] == "OV-BEAM" and r["supplier_code"] == "OV-1013"), 48000)
+        # 2-3. BOM with sub-supplier SOB and requirement: steel 48,000 x 2 = 96,000 kg (JGI 30% 28,800, TATA 70% 67,200); ore x 1.7
+        lines = parts["OV-BEAM"]["lines"]
+        self.assertEqual([(l["depth"], l["code"], l["bom_qty"], l["per_part"], l["requirement"]) for l in lines], [(1, "OV-STEEL", 2, 2, 96000), (2, "OV-ORE", 1.7, 3.4, 163200)])
+        self.assertEqual([(s["code"], s["tier"], s["sob_percent"], s["unit_price"], s["requirement"]) for s in lines[0]["sources"]], [("OV-1004", "T2", 30, 74, 28800), ("OV-1014", "T2", 70, 72, 67200)])
+        self.assertEqual((lines[1]["sources"][0]["code"], lines[1]["sources"][0]["tier"], lines[1]["sources"][0]["requirement"]), ("OV-1030", "T3", 163200))
+        # 4-6. sub-supplier list: who, for which part and material, SOB, rate, requirement (top beam steel 60,000 x 1.5 = 90,000 kg)
+        listed = [(r["code"], r["part_code"], r["material_code"], r["sob_percent"], r["unit_price"], r["requirement"]) for r in view["sub_suppliers"]]
+        self.assertEqual(listed, [("OV-1004", "OV-BEAM", "OV-STEEL", 30, 74, 28800), ("OV-1004", "OV-TOPB", "OV-STEEL", 100, 76, 90000),
+                                  ("OV-1014", "OV-BEAM", "OV-STEEL", 70, 72, 67200), ("OV-1030", "OV-BEAM", "OV-ORE", 100, 9, 163200)])
+        # no plan for the month: requirement 0; unknown supplier 404
+        later = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-10"}).json()
+        self.assertEqual((later["plan"], later["parts"][0]["part_requirement"], later["sub_suppliers"][0]["requirement"]), (None, 0, 0))
+        self.assertEqual(api.get("/api/planning/supplier-overview/999999").status_code, 404)
+
     def test_wide_month_plan_template_and_month_formats_upload(self):
         product = self.client.post("/api/planning/products", json={"code": "MONTH-PRD", "name": "Month product"})
         model = self.client.post("/api/planning/models", json={
