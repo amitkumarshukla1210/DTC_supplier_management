@@ -602,3 +602,4 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #ovTree tr[data-tree-depth="3"] > .tree-toggle-cell { padding-left: 56px; }
 #ovTree tr[data-tree-depth="4"] > .tree-toggle-cell { padding-left: 72px; }
 #ovTree tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
+.ov-input { width: 100px; display: inline-block; }

@@ -5461,10 +5461,84 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     part["lines"].append(entry)
                 parts.append(part)
             sub_rows.sort(key=lambda row: (row["code"].casefold(), row["part_code"].casefold(), row["material_code"].casefold()))
+            # one line per sub-supplier and material: requirement summed over the parts; SOB = its share of the
+            # material's total requirement (plain average when there is no requirement); rate weighted by requirement
+            material_total: dict[str, float] = {}
+            for row in sub_rows:
+                material_total[row["material_code"].casefold()] = material_total.get(row["material_code"].casefold(), 0) + row["requirement"]
+            blended: dict[tuple[int, str], dict] = {}
+            for row in sub_rows:
+                key = (row["sub_supplier_id"], row["material_code"].casefold())
+                line = blended.setdefault(key, {"sub_supplier_id": row["sub_supplier_id"], "code": row["code"], "name": row["name"], "tiers": [], "material_code": row["material_code"],
+                                                "material_name": row["material_name"], "uom": row["uom"], "requirement": 0.0, "stock": None, "parts": [], "_sob": [], "_rate": []})
+                if row["tier"] not in line["tiers"]:
+                    line["tiers"].append(row["tier"])
+                line["requirement"] += row["requirement"]
+                if row["stock"] is not None:
+                    line["stock"] = (line["stock"] or 0) + row["stock"]
+                line["parts"].append({"part_code": row["part_code"], "sob_percent": row["sob_percent"], "requirement": row["requirement"], "unit_price": row.get("unit_price")})
+                line["_sob"].append(row["sob_percent"])
+                if can_price:
+                    line["_rate"].append((row.get("unit_price") or 0, row["requirement"], row.get("currency")))
+            summary = []
+            for (sub_id, material_key), line in blended.items():
+                total = material_total.get(material_key, 0)
+                line["sob_percent"] = round(line["requirement"] * 100 / total, 4) if total else round(sum(line["_sob"]) / len(line["_sob"]), 4)
+                line["tier"] = ", ".join(line.pop("tiers"))
+                rates = line.pop("_rate")
+                line.pop("_sob")
+                if can_price and rates:
+                    weight = sum(need for _, need, _ in rates)
+                    line["unit_price"] = round(sum(price * need for price, need, _ in rates) / weight, 4) if weight else round(sum(price for price, _, _ in rates) / len(rates), 4)
+                    line["currency"] = rates[0][2] if len({currency for _, _, currency in rates}) == 1 else "mixed"
+                summary.append(line)
             return {"supplier": {"id": supplier.id, "code": supplier.code, "name": supplier.name, "category": supplier.category, "tiers": _tier_list(supplier.tiers)},
                     "month": month, "workspace": workspace,
                     "plan": {"revision": f"Rev.{cycle.revision:02d}", "issue_month": cycle.issue_month, "release_date": cycle.release_date} if cycle else None,
-                    "parts": parts, "sub_suppliers": sub_rows}
+                    "parts": parts, "sub_suppliers": sub_rows, "sub_supplier_summary": summary}
+
+    @app.post("/api/planning/supplier-overview/{supplier_id}/sub-supplier")
+    def edit_sub_supplier(supplier_id: int, payload: dict, request: Request):
+        """From the overview's sub-supplier list: set this sub-supplier's SOB and / or rate for one material in every
+        part of the supplier where it supplies that material. All parts or none (SOB per part at most 100%)."""
+        current_user(request)
+        _check_supply_role(request)
+        sub_id, code = payload.get("sub_supplier_id"), str(payload.get("material_code") or "").strip()
+        sob, price = payload.get("sob_percent"), payload.get("unit_price")
+        if sob is None and price is None:
+            raise HTTPException(status_code=422, detail="Give the SOB or the rate")
+        try:
+            sob = None if sob in (None, "") else float(sob)
+            price = None if price in (None, "") else float(price)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="SOB and rate must be numbers") from exc
+        if sob is not None and not 0 < sob <= 100:
+            raise HTTPException(status_code=422, detail="SOB must be more than 0 and at most 100")
+        if price is not None and (price < 0 or not math.isfinite(price)):
+            raise HTTPException(status_code=422, detail="Rate must be zero or more")
+        if price is not None and not _check_price_access(request):
+            raise HTTPException(status_code=403, detail="Price access is required to set a rate")
+        with open_db() as db:
+            rows = db.execute(select(SupplierBOMLineSource, SupplierBOMLine).join(SupplierBOMLine, SupplierBOMLine.id == SupplierBOMLineSource.line_id)
+                              .join(SupplierMaterial, SupplierMaterial.id == SupplierBOMLine.supplier_material_id)
+                              .where(SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLineSource.sub_supplier_id == sub_id,
+                                     func.lower(SupplierMaterial.code) == code.casefold())).all()
+            if not rows:
+                raise HTTPException(status_code=404, detail=f"That sub-supplier does not supply {code} in this supplier's BOMs")
+            month = _month_text(date.today())
+            for source, line in rows:
+                if sob is not None:
+                    others = db.scalar(select(func.coalesce(func.sum(SupplierBOMLineSource.sob_percent), 0)).where(
+                        SupplierBOMLineSource.line_id == line.id, SupplierBOMLineSource.id != source.id)) or 0
+                    if others + sob > 100.0001:
+                        part = db.get(Item, line.product_material_id)
+                        raise HTTPException(status_code=422, detail=f"{part.code if part else 'A part'}: the other suppliers of {code} have {others:g}%, so at most {100 - others:g}% is left; lower them first")
+                    source.sob_percent = sob
+                if price is not None and price != source.unit_price:
+                    source.unit_price = price
+                    source.price_updated_month = month
+            db.commit()
+            return {"parts": len(rows)}
 
     @app.get("/api/planning/actuals/template.xlsx")
     def actual_template(request: Request, as_of: str = "", workspace: str = "trial"):

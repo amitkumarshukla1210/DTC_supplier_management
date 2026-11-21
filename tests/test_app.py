@@ -606,6 +606,22 @@ class SupplierHubApiTests(unittest.TestCase):
         listed = [(r["code"], r["part_code"], r["material_code"], r["sob_percent"], r["unit_price"], r["requirement"]) for r in view["sub_suppliers"]]
         self.assertEqual(listed, [("OV-1004", "OV-BEAM", "OV-STEEL", 30, 74, 28800), ("OV-1004", "OV-TOPB", "OV-STEEL", 100, 76, 90000),
                                   ("OV-1014", "OV-BEAM", "OV-STEEL", 70, 72, 67200), ("OV-1030", "OV-BEAM", "OV-ORE", 100, 9, 163200)])
+        # one line per sub-supplier and material, blended over Savera's parts: steel total 28,800 + 90,000 + 67,200 = 186,000 kg;
+        # JGI 118,800 kg -> 63.871%, rate (74 x 28,800 + 76 x 90,000) / 118,800 = 75.5152; TATA 67,200 -> 36.129% @72; XYZ ore 100% @9
+        blend = [(r["code"], r["material_code"], round(r["sob_percent"], 3), round(r["unit_price"], 4), r["requirement"], r["tier"]) for r in view["sub_supplier_summary"]]
+        self.assertEqual(blend, [("OV-1004", "OV-STEEL", 63.871, 75.5152, 118800, "T2"), ("OV-1014", "OV-STEEL", 36.129, 72, 67200, "T2"), ("OV-1030", "OV-ORE", 100, 9, 163200, "T3")])
+        # edit from that line: TATA steel SOB 50 (beam only); JGI 60 would make the beam 110% -> refused, nothing changed
+        edit = lambda body: api.post(f"/api/planning/supplier-overview/{savera}/sub-supplier", json={"material_code": "ov-steel", **body})
+        self.assertEqual(edit({"sub_supplier_id": tata, "sob_percent": 50}).json(), {"parts": 1})
+        refused = edit({"sub_supplier_id": jgi, "sob_percent": 60})
+        self.assertEqual(refused.status_code, 422)
+        self.assertIn("OV-BEAM: the other suppliers of ov-steel have 50%, so at most 50% is left", refused.json()["detail"])
+        self.assertEqual(edit({"sub_supplier_id": jgi, "unit_price": 80}).json(), {"parts": 2})  # the rate goes to both parts
+        after = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()
+        detail = {(r["code"], r["part_code"]): (r["sob_percent"], r["unit_price"]) for r in after["sub_suppliers"]}
+        self.assertEqual((detail[("OV-1004", "OV-BEAM")], detail[("OV-1004", "OV-TOPB")], detail[("OV-1014", "OV-BEAM")]), ((30, 80), (100, 80), (50, 72)))
+        self.assertEqual(edit({"sub_supplier_id": xyz}).status_code, 422)  # nothing to change
+        self.assertEqual(api.post(f"/api/planning/supplier-overview/{savera}/sub-supplier", json={"sub_supplier_id": xyz, "material_code": "OV-STEEL", "sob_percent": 10}).status_code, 404)
         # no plan for the month: requirement 0; unknown supplier 404
         later = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-10"}).json()
         self.assertEqual((later["plan"], later["parts"][0]["part_requirement"], later["sub_suppliers"][0]["requirement"]), (None, 0, 0))
