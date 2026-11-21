@@ -625,6 +625,16 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual((detail[("OV-1004", "OV-BEAM")], detail[("OV-1004", "OV-TOPB")], detail[("OV-1014", "OV-BEAM")]), ((30, 80), (100, 80), (50, 72)))
         self.assertEqual(edit({"sub_supplier_id": xyz}).status_code, 422)  # nothing to change
         self.assertEqual(api.post(f"/api/planning/supplier-overview/{savera}/sub-supplier", json={"sub_supplier_id": xyz, "material_code": "OV-STEEL", "sob_percent": 10}).status_code, 404)
+        # stock typed on the overview: T2 (JGI under the beam's steel) and FG stock of the beam
+        saved = api.post("/api/planning/supplier-source-stock/2026-11?workspace=trial", json={"rows": [{"t1_supplier_code": "OV-1013", "part_code": "OV-BEAM", "material_code": "OV-STEEL", "supplier_code": "OV-1004", "quantity": 5000}]})
+        self.assertEqual((saved.status_code, saved.json()["rows"]), (201, 1), saved.text)
+        self.assertEqual(api.post("/api/planning/supplier-stock/2026-11?workspace=trial", json={"rows": [{"supplier_part_id": beam_link, "quantity": 7500}]}).status_code, 201)
+        stocked = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()
+        beam_view = next(p for p in stocked["parts"] if p["code"] == "OV-BEAM")
+        jgi_beam = next(src for src in beam_view["lines"][0]["sources"] if src["code"] == "OV-1004")
+        self.assertEqual((beam_view["stock"], jgi_beam["stock"], jgi_beam["available"]), (7500, 5000, 5000))
+        self.assertIn("Row 1: OV TATA is not a supplier of OV-ORE", api.post("/api/planning/supplier-source-stock/2026-11", json={"rows": [{"t1_supplier_code": "OV-1013", "part_code": "OV-BEAM", "material_code": "OV-ORE", "supplier_code": "OV-1014", "quantity": 1}]}).json()["detail"])
+        self.assertIn("stock must be a number", api.post("/api/planning/supplier-source-stock/2026-11", json={"rows": [{"t1_supplier_code": "OV-1013", "quantity": "x"}]}).json()["detail"])
         # no plan for the month: requirement 0; unknown supplier 404
         later = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-10"}).json()
         self.assertEqual((later["plan"], later["parts"][0]["part_requirement"], later["sub_suppliers"][0]["requirement"]), (None, 0, 0))

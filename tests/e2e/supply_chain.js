@@ -213,6 +213,23 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.waitForFunction(() => [...document.querySelectorAll("#ovTree tr.st-source")].some((tr) => tr.textContent.includes("TATA Steel") && tr.cells[6].textContent === "80%"), null, { timeout: 5000 }).catch(() => {});
   const tataTree = await page.locator('#ovTree tr.st-source:has-text("TATA Steel")').locator("td").allTextContents();
   check("Edit TATA steel SOB to 80% from the list: the BOM tree follows", tataTree[6] === "80%", JSON.stringify(tataTree));
+  // stock typed in the boxes: FG stock of the beam (parts table) and TATA's stock in the BOM tree; Enter saves
+  const fgBox = page.locator("#ovParts input.ov-stock").first();
+  await fgBox.fill("9000");
+  await clearToast();
+  await fgBox.press("Enter");
+  await waitToast("Stock 9,000 saved");
+  await page.waitForFunction(() => document.querySelector("#ovTree tr.st-part input.ov-stock")?.value === "9000");
+  check("FG stock typed in the parts table is saved (also shown in the tree)", (await page.locator("#ovParts input.ov-stock").first().inputValue()) === "9000");
+  const tataBox = page.locator('#ovTree input.ov-stock[data-stock-supplier="SUP-2014"]');
+  await tataBox.fill("3000");
+  await clearToast();
+  await tataBox.press("Enter");
+  await waitToast("Stock 3,000 saved");
+  await page.waitForFunction(() => [...document.querySelectorAll("#ovSubs tbody tr")].some((tr) => tr.cells[0].textContent === "SUP-2014" && tr.cells[8].textContent === "3,000"));
+  check("T2 stock typed in the tree is saved; the sub-supplier list shows it", (await page.locator('#ovTree input.ov-stock[data-stock-supplier="SUP-2014"]').inputValue()) === "3000");
+  const stockList = (await api("GET", `/api/planning/supplier-stock/${new Date().toISOString().slice(0, 7)}?workspace=trial`)).items.map((r) => [r.supplier_code, r.material_code, r.quantity]);
+  check("Both are in the month's stock list (Upload supplier stock)", JSON.stringify(stockList.filter((r) => r[1] === "UF220BFB010" || r[0] === "SUP-2014")) === JSON.stringify([["SUP-2013", "UF220BFB010", 9000], ["SUP-2014", "FL001STEEL0.7", 3000]]), JSON.stringify(stockList));
   await page.click("#ovEditParts");
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);

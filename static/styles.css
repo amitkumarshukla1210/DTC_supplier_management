@@ -612,3 +612,4 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #supplierRegisterTable .sup-in { width: 130px; min-width: 0; padding: 6px 8px; }
 #supplierRegisterTable tr.sup-editing > td { background: #fff7e0; }
 #supplierRegisterTable .sup-tier { display: inline-flex; gap: 3px; align-items: center; margin-right: 6px; white-space: nowrap; }
+.ov-stock { width: 110px; }

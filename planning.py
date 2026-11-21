@@ -5858,6 +5858,30 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             saved += 1
         return saved
 
+    @app.post("/api/planning/supplier-source-stock/{report_month}", status_code=201)
+    def save_source_stock_rows(report_month: str, payload: dict, request: Request, workspace: str = "trial"):
+        """Stock at a T2 / T3 supplier typed on the supplier overview: rows of t1_supplier_code, part_code,
+        material_code, supplier_code, quantity (available = quantity unless given). All rows or none."""
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        month = _month_text(_month(report_month))
+        rows = []
+        for number, row in enumerate(payload.get("rows") or [], start=1):
+            try:
+                quantity = float(row.get("quantity"))
+                available = None if row.get("available_quantity") in (None, "") else float(row["available_quantity"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"Row {number}: stock must be a number") from exc
+            rows.append({"t1_supplier_code": str(row.get("t1_supplier_code") or ""), "part_code": str(row.get("part_code") or ""), "material_code": str(row.get("material_code") or ""),
+                         "supplier_code": str(row.get("supplier_code") or ""), "quantity": quantity, "available_quantity": available, "arrival_month": "", "_excel_row": number})
+        if not rows:
+            raise HTTPException(status_code=422, detail="Add at least one row")
+        with open_db() as db:
+            saved = save_source_stock(db, workspace, month, rows)
+            db.commit()
+        return {"report_month": month, "rows": saved}
+
     @app.post("/api/planning/supplier-stock/{report_month}/upload", status_code=201)
     async def upload_supplier_stock_excel(report_month: str, request: Request, workspace: str = "trial"):
         current_user(request)
