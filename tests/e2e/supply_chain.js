@@ -140,9 +140,9 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // worked out by hand: 60,000 x 60% = 36,000 beams; x 2 kg = 72,000 kg steel; JGI 30% = 21,600, TATA 70% = 50,400;
   // ore 72,000 x 1.7 = 122,400 kg (3.4 kg per beam); coal 72,000 x 0.6 = 43,200 kg (1.2 kg per beam)
   const expected = [["T1", "Savera", "60%", "1", "36,000 Nos"],
-    ["L1 BOM", "FL001STEEL0.7 T2", "100%", "2", "72,000 kg"], ["T2", "JGI STEEL", "30%", "0.6", "21,600 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"],
-    ["L2 BOM", "ORE-01 T3", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"],
-    ["L2 BOM", "COAL-01 T3", "100%", "1.2", "43,200 kg"], ["T3", "ABC Coal", "100%", "1.2", "43,200 kg"]];
+    ["L1 BOM", "FL001STEEL0.7", "100%", "2", "72,000 kg"], ["T2", "JGI STEEL", "30%", "0.6", "21,600 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"],
+    ["L2 BOM", "ORE-01", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"],
+    ["L2 BOM", "COAL-01", "100%", "1.2", "43,200 kg"], ["T3", "ABC Coal", "100%", "1.2", "43,200 kg"]];
   check("Tree and requirement: T1 36,000; steel 72,000 kg (JGI 21,600 / TATA 50,400); ore 122,400 kg; coal 43,200 kg", JSON.stringify(rows) === JSON.stringify(expected), JSON.stringify(rows));
   check("Note says how many Savera makes", (await page.locator("#covShare").textContent()).includes("Savera makes 60% = 36,000"));
   const levels = await page.locator("#coverageTable tbody tr").evaluateAll((trs) => trs.map((tr) => tr.dataset.treeDepth).join(""));
@@ -191,7 +191,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await waitToast("saved");
   check("Uploading the template back: 1 part, 2 material lines, 3 supplier rows", (await toastText()).includes("1 part: 2 material lines, 3 supplier rows saved"), await toastText());
   const after = await read();
-  check("Tree unchanged after the round trip", JSON.stringify(after) === JSON.stringify([["T1", "Savera", "60%", "1", "36,000 Nos"], ["L1 BOM", "FL001STEEL0.7 T2", "90%", "2", "72,000 kg"], ["T2", "JGI STEEL", "20%", "0.4", "14,400 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"], ["L2 BOM", "ORE-01 T3", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"]]), JSON.stringify(after));
+  check("Tree unchanged after the round trip", JSON.stringify(after) === JSON.stringify([["T1", "Savera", "60%", "1", "36,000 Nos"], ["L1 BOM", "FL001STEEL0.7", "90%", "2", "72,000 kg"], ["T2", "JGI STEEL", "20%", "0.4", "14,400 kg"], ["T2", "TATA Steel", "70%", "1.4", "50,400 kg"], ["L2 BOM", "ORE-01", "100%", "3.4", "122,400 kg"], ["T3", "XYZ Mining", "100%", "3.4", "122,400 kg"]]), JSON.stringify(after));
   // the breadcrumb's supplier opens its overview: parts (SOB, FG stock), BOM tree, sub-supplier list
   await page.locator('#covCrumbs a[data-open-supplier-overview]').click();
   await page.waitForSelector('#ovParts tbody tr:has-text("UF220BFB010")');
@@ -199,7 +199,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Overview 1: part, SOB 60%, rate, no plan -> requirement 0", ovPart[0] === "UF220BFB010" && ovPart[2] === "60%" && ovPart[3].includes("85") && ovPart[5] === "0" && ovPart[6] === "0", JSON.stringify(ovPart));
   check("Overview plan note when no plan", (await page.textContent("#ovPlan")).includes("no plan uploaded"));
   const ovTree = await page.locator("#ovTree tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[2].textContent, tr.cells[5].textContent, tr.cells[6].textContent]));
-  check("Overview 2-3: part BOM with sub-supplier SOB", JSON.stringify(ovTree) === JSON.stringify([["T1 part", "UF220BFB010", "Savera", "60%"], ["L1 BOM", "FL001STEEL0.7 T2", "", "90%"], ["T2 supplier", "↳ FL001STEEL0.7", "JGI STEEL", "20%"], ["T2 supplier", "↳ FL001STEEL0.7", "TATA Steel", "70%"], ["L2 BOM", "ORE-01 T3", "", "100%"], ["T3 supplier", "↳ ORE-01", "XYZ Mining", "100%"]]), JSON.stringify(ovTree));
+  check("Overview 2-3: part BOM with sub-supplier SOB", JSON.stringify(ovTree) === JSON.stringify([["T1 part", "UF220BFB010", "Savera", "60%"], ["L1 BOM", "FL001STEEL0.7", "", "90%"], ["T2 supplier", "↳ FL001STEEL0.7", "JGI STEEL", "20%"], ["T2 supplier", "↳ FL001STEEL0.7", "TATA Steel", "70%"], ["L2 BOM", "ORE-01", "", "100%"], ["T3 supplier", "↳ ORE-01", "XYZ Mining", "100%"]]), JSON.stringify(ovTree));
+  check("No T2 / T3 tag under material codes (overview and coverage trees)", (await page.locator("#ovTree td small").count()) === 0);
   await page.click("#ovCloseAll");
   check("Overview tree closes", (await page.locator("#ovTree tbody tr:not([hidden])").count()) === 1);
   const ovHeads = await page.locator("#ovSubs thead th summary").allTextContents();
