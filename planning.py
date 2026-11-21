@@ -4697,7 +4697,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         return own
 
     @app.get("/api/planning/coverage-workbook/template.xlsx")
-    def coverage_template(request: Request, supplier_id: int):
+    def coverage_template(request: Request, supplier_id: int, link_id: int | None = None):
         """Supplier-wise coverage workbook: each T1 part the supplier supplies, its BOM lines (L1-L3, quantity per
         unit of the line above) and the suppliers of each line (T2-T4) - filled with what is saved now."""
         current_user(request)
@@ -4709,6 +4709,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 raise HTTPException(status_code=404, detail="Supplier not found")
             links = db.scalars(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.tier == TOP_TIER,
                                                           SupplierPart.material_id.is_not(None))).all()
+            if link_id:  # one part only (e.g. to copy its BOM to another part: change the T1 Part Code and upload)
+                links = [link for link in links if link.id == link_id]
+                if not links:
+                    raise HTTPException(status_code=404, detail="Part not found for this supplier")
             workbook = Workbook()
             sheet = workbook.active
             sheet.title = "Coverage"
@@ -4879,6 +4883,87 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 save(lines, None)
             db.commit()
             return counts
+
+    @app.get("/api/planning/bom-copy-sources")
+    def bom_copy_sources(request: Request):
+        """Parts (T1 relationships) that have a BOM, to copy from: every supplier's."""
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            counts = {(supplier_id, product_id): lines for supplier_id, product_id, lines in db.execute(
+                select(SupplierBOMLine.supplier_id, SupplierBOMLine.product_material_id, func.count(SupplierBOMLine.id))
+                .group_by(SupplierBOMLine.supplier_id, SupplierBOMLine.product_material_id)).all()}
+            out = []
+            for link in db.scalars(select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all():
+                lines = counts.get((link.supplier_id, link.material_id))
+                if lines:
+                    item, who = db.get(Item, link.material_id), db.get(Supplier, link.supplier_id)
+                    out.append({"link_id": link.id, "part_code": item.code, "part_name": item.name, "supplier_code": who.code, "supplier_name": who.name, "lines": lines})
+            return {"items": sorted(out, key=lambda row: (row["part_code"].casefold(), row["supplier_name"].casefold()))}
+
+    @app.post("/api/planning/supplier-coverage/{link_id}/copy-from", status_code=201)
+    def copy_bom_from(link_id: int, payload: dict, request: Request):
+        """Copy another part's BOM (L1-L3 lines with quantity, and the sub-suppliers of each line with SOB and terms)
+        into this part, to edit it after. The part's own BOM is replaced only with replace = true."""
+        current_user(request)
+        _check_supply_role(request)
+        with open_db() as db:
+            target = coverage_link(db, link_id)
+            source = coverage_link(db, int(payload.get("source_link_id") or 0))
+            if source.id == target.id:
+                raise HTTPException(status_code=422, detail="Pick another part to copy from")
+            source_lines = db.scalars(select(SupplierBOMLine).where(SupplierBOMLine.supplier_id == source.supplier_id,
+                                                                   SupplierBOMLine.product_material_id == source.material_id)).all()
+            if not source_lines:
+                raise HTTPException(status_code=422, detail="That part has no BOM to copy")
+            existing = db.scalars(select(SupplierBOMLine.id).where(SupplierBOMLine.supplier_id == target.supplier_id,
+                                                                  SupplierBOMLine.product_material_id == target.material_id)).all()
+            if existing and not payload.get("replace"):
+                raise HTTPException(status_code=409, detail="This part already has a BOM; copying replaces it")
+            if existing:
+                db.execute(delete(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id.in_(existing)))
+                db.execute(sa_update(SupplierBOMLine).where(SupplierBOMLine.id.in_(existing)).values(parent_line_id=None))
+                db.execute(delete(SupplierBOMLine).where(SupplierBOMLine.id.in_(existing)))
+            same_supplier = source.supplier_id == target.supplier_id
+
+            def target_material(own_id: int) -> int:
+                """The target supplier's material master entry for a source entry (the same code)."""
+                own = db.get(SupplierMaterial, own_id)
+                if same_supplier:
+                    return own.id
+                if own.item_id or own.tier_material_id:
+                    return own_material_for(db, target.supplier_id, own.item_id, own.tier_material_id).id
+                found = db.scalar(select(SupplierMaterial).where(SupplierMaterial.supplier_id == target.supplier_id, func.lower(SupplierMaterial.code) == own.code.lower()))
+                if not found:
+                    found = SupplierMaterial(supplier_id=target.supplier_id, code=own.code, name=own.name, uom=own.uom, unit_price=own.unit_price, currency=own.currency)
+                    db.add(found)
+                    db.flush()
+                return found.id
+
+            depth = {}
+            by_id = {line.id: line for line in source_lines}
+            def level(line):
+                if line.id not in depth:
+                    depth[line.id] = 1 if not line.parent_line_id or line.parent_line_id not in by_id else level(by_id[line.parent_line_id]) + 1
+                return depth[line.id]
+            new_id: dict[int, int] = {}
+            copied_sources = 0
+            for line in sorted(source_lines, key=lambda l: (level(l), l.id)):  # parents first
+                if not line.supplier_material_id:
+                    continue
+                fresh = SupplierBOMLine(supplier_id=target.supplier_id, product_material_id=target.material_id, parent_line_id=new_id.get(line.parent_line_id),
+                                        supplier_material_id=target_material(line.supplier_material_id), quantity=line.quantity, unit_price=line.unit_price, currency=line.currency)
+                db.add(fresh)
+                db.flush()
+                new_id[line.id] = fresh.id
+                for src in db.scalars(select(SupplierBOMLineSource).where(SupplierBOMLineSource.line_id == line.id)).all():
+                    db.add(SupplierBOMLineSource(line_id=fresh.id, sub_supplier_id=src.sub_supplier_id, unit_price=src.unit_price, currency=src.currency, sob_percent=src.sob_percent,
+                                                 lead_time_days=src.lead_time_days, moq=src.moq, buffer_days=src.buffer_days, price_mode=src.price_mode,
+                                                 price_interval_months=src.price_interval_months, price_updated_month=src.price_updated_month,
+                                                 item_id=src.item_id if same_supplier else None, supplier_material_id=src.supplier_material_id if same_supplier else None))
+                    copied_sources += 1
+            db.commit()
+            return {"lines": len(new_id), "sources": copied_sources}
 
     def coverage_link(db: Session, link_id: int) -> SupplierPart:
         link = db.get(SupplierPart, link_id)

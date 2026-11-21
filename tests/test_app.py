@@ -2536,6 +2536,31 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(len(by_code["CV-STEEL0.7"]["sources"]), 2)
         # steel is priced at what JGI / TATA charge (30% x 74 + 70% x 72 = 72.6), not from ore + coal
         self.assertAlmostEqual(by_code["CV-STEEL0.7"]["unit_price"], 72.6)
+        # copy this BOM (steel 2 kg with JGI / TATA, its L2 ore with XYZ, paint) to another part of Savera, then edit there
+        beam2 = api.post("/api/planning/materials", json={"code": "CV-BEAM2", "name": "Beam 2", "uom": "Nos"}).json()["id"]
+        link2 = api.post("/api/planning/supplier-parts", json={"material_id": beam2, "supplier_id": savera, "sob_percent": 100, "currency": "INR"}).json()["id"]
+        sources_list = api.get("/api/planning/bom-copy-sources").json()["items"]
+        self.assertEqual([(row["part_code"], row["supplier_name"], row["lines"]) for row in sources_list if row["part_code"].startswith("CV-")], [("CV-BEAM", "CV Savera", 4)])
+        copied = api.post(f"/api/planning/supplier-coverage/{link2}/copy-from", json={"source_link_id": link})
+        self.assertEqual((copied.status_code, copied.json()), (201, {"lines": 4, "sources": 3}), copied.text)
+        got = {(l["depth"], l["component"]["code"]): (l["quantity"], sorted((s["sub_supplier"], s["sob_percent"]) for s in l["sources"])) for l in api.get(f"/api/planning/supplier-coverage/{link2}").json()["lines"]}
+        self.assertEqual(got[(1, "CV-STEEL0.7")], (2, [("CV JGI Steel", 30), ("CV TATA Steel", 70)]))
+        self.assertEqual((got[(2, "CV-ORE")], got[(1, "CV-PAINT")]), ((1.7, [("CV XYZ Mining", 100)]), (0.1, [])))
+        self.assertEqual(api.post(f"/api/planning/supplier-coverage/{link2}/copy-from", json={"source_link_id": link}).status_code, 409)  # has a BOM now
+        self.assertEqual(api.post(f"/api/planning/supplier-coverage/{link2}/copy-from", json={"source_link_id": link, "replace": True}).json()["lines"], 4)
+        self.assertEqual(len(api.get(f"/api/planning/supplier-coverage/{link2}").json()["lines"]), 4)  # replaced, not doubled
+        self.assertEqual(api.post(f"/api/planning/supplier-coverage/{link}/copy-from", json={"source_link_id": link}).status_code, 422)
+        # the source part is unchanged
+        self.assertEqual(len(api.get(f"/api/planning/supplier-coverage/{link}").json()["lines"]), 4)
+        # copy to another supplier's part: its material master gets the codes
+        other = sup("CV Other Fabricator")
+        link3 = api.post("/api/planning/supplier-parts", json={"material_id": beam2, "supplier_id": other, "sob_percent": 0, "currency": "INR"}).json()["id"]
+        self.assertEqual(api.post(f"/api/planning/supplier-coverage/{link3}/copy-from", json={"source_link_id": link}).json()["lines"], 4)
+        codes = sorted(m["code"] for m in api.get("/api/planning/supplier-materials", params={"supplier_id": other}).json()["items"])
+        self.assertEqual(codes, ["CV-COAL", "CV-ORE", "CV-PAINT", "CV-STEEL0.7"])
+        # one part's BOM in Excel (to copy it there): only that part's rows
+        one = load_workbook(io.BytesIO(api.get("/api/planning/coverage-workbook/template.xlsx", params={"supplier_id": savera, "link_id": link}).content)).active
+        self.assertEqual({row[0].value for row in one.iter_rows(min_row=4)}, {"CV-BEAM"})
 
     def test_supply_chain_rows_from_users_sheet(self):
         # The user's sheet: Supangita 40% / Savera 60% supply Base Front Beam; each buys steel

@@ -2256,9 +2256,9 @@ async function renderSupplierControl() {
   const tabs = `<div class="tab-strip">${SUPPLIER_TABS.map((name) => `<button class="tab-button ${tab === name ? "active" : ""}" data-supplier-tab="${esc(name)}">${esc(name)}</button>`).join("")}</div>`;
   let body = "";
   if (tab === "Supplier/material relationship" && state.coverageLinkId) {
-    body = `<nav class="crumbs" id="covCrumbs"></nav><section class="panel table-panel">${panelHeader("Supplier/material coverage", "The part as this supplier makes it: its BOM (L1 materials, their L2 BOM and L3 BOM, each with quantity per unit of the line above) and the suppliers of every material with SOB (T2 for L1, T3 for L2, T4 for L3). A part may have only the T1 supplier, or go down to L3: add what you know. Type the requirement of the part to see the quantity of every material and supplier: e.g. 60,000 beams × Savera 60% × 2 kg steel = 72,000 kg; JGI 30% = 21,600 kg, TATA 70% = 50,400 kg; × 1.7 kg ore per kg steel = 122,400 kg ore. + / − opens and closes a level. Excel: Download template gives every part of this supplier with its BOM and suppliers (Level L1/L2/L3 = material with BOM qty; T2/T3/T4 = supplier of the line above, with SOB and terms); edit it and Upload coverage. Uploading replaces the BOM of each part in the file.")}
+    body = `<nav class="crumbs" id="covCrumbs"></nav><section class="panel table-panel">${panelHeader("Supplier/material coverage", "The part as this supplier makes it: its BOM (L1 materials, their L2 BOM and L3 BOM, each with quantity per unit of the line above) and the suppliers of every material with SOB (T2 for L1, T3 for L2, T4 for L3). A part may have only the T1 supplier, or go down to L3: add what you know. Type the requirement of the part to see the quantity of every material and supplier: e.g. 60,000 beams × Savera 60% × 2 kg steel = 72,000 kg; JGI 30% = 21,600 kg, TATA 70% = 50,400 kg; × 1.7 kg ore per kg steel = 122,400 kg ore. + / − opens and closes a level. Copy BOM from: take another part's BOM (this supplier's or another's) and edit it. Download this part's BOM: change its T1 Part Code in Excel to copy it to another part and Upload coverage. Excel: Download template gives every part of this supplier with its BOM and suppliers (Level L1/L2/L3 = material with BOM qty; T2/T3/T4 = supplier of the line above, with SOB and terms); edit it and Upload coverage. Uploading replaces the BOM of each part in the file.")}
       <form id="coverageUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier-wise coverage workbook (all parts of this supplier)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload coverage</button><a class="button" id="coverageTemplate" href="#">Download template</a></form>
-      <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Requirement of the part (all suppliers)</span><input class="form-control" type="number" min="0" step="any" id="covRequirement" placeholder="e.g. 60000" /></label><span class="subtle" id="covShare"></span></div><span class="toolbar-add"><button type="button" class="button button-small button-primary" data-cov-add-line="">+ L1 material</button></span></div>
+      <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Requirement of the part (all suppliers)</span><input class="form-control" type="number" min="0" step="any" id="covRequirement" placeholder="e.g. 60000" /></label><span class="subtle" id="covShare"></span></div><span class="toolbar-add"><label class="cov-copy"><span class="subtle">Copy BOM from</span><select class="form-control" id="covCopySource"><option value="">Loading…</option></select></label><button type="button" class="button button-small" id="covCopy">Copy</button><a class="button button-small" id="covPartExcel" href="#">Download this part's BOM</a><button type="button" class="button button-small button-primary" data-cov-add-line="">+ L1 material</button></span></div>
       <div id="coverageTable" class="coverage-tree"><div class="tree-loading">Loading…</div></div>
     </section>`;
   } else if (tab === "Supplier/material relationship") {
@@ -2352,6 +2352,26 @@ async function renderSupplierControl() {
     catch (error) { state.coverageLinkId = null; toast(error.message, true); return renderSupplierControl(); }
     const { t1 } = state.coverage;
     $("#coverageTemplate").href = `/api/planning/coverage-workbook/template.xlsx?supplier_id=${t1.supplier_id}`;
+    $("#covPartExcel").href = `/api/planning/coverage-workbook/template.xlsx?supplier_id=${t1.supplier_id}&link_id=${t1.id}`;
+    // copy another part's BOM here (then edit it): parts with a BOM, this supplier's first
+    try {
+      const sources = (await api("/api/planning/bom-copy-sources")).items.filter((row) => row.link_id !== t1.id)
+        .sort((a, b) => Number(b.supplier_code === t1.supplier_code) - Number(a.supplier_code === t1.supplier_code));
+      $("#covCopySource").innerHTML = sources.length ? `<option value="">Choose a part with a BOM</option>${sources.map((row) => `<option value="${row.link_id}">${esc(row.part_code)} ${esc(row.part_name)} · ${esc(row.supplier_name)} (${row.lines} line${row.lines === 1 ? "" : "s"})</option>`).join("")}` : '<option value="">No other part has a BOM yet</option>';
+    } catch (error) { toast(error.message, true); }
+    $("#covCopy").addEventListener("click", async () => {
+      const sourceId = Number($("#covCopySource").value);
+      if (!sourceId) return toast("Choose the part to copy the BOM from.", true);
+      const label = $("#covCopySource").selectedOptions[0].textContent;
+      const replace = state.coverage.lines.length > 0;
+      if (replace && !window.confirm(`${t1.material_code} already has a BOM. Replace it with the BOM of ${label}?`)) return;
+      try {
+        const result = await api(`/api/planning/supplier-coverage/${t1.id}/copy-from`, { method: "POST", body: JSON.stringify({ source_link_id: sourceId, replace }) });
+        state.covEdit = null;
+        await loadCoverage();
+        toast(`Copied ${result.lines} material line${result.lines === 1 ? "" : "s"} and ${result.sources} sub-supplier row${result.sources === 1 ? "" : "s"} from ${label.split(" · ")[0]}: edit them in the rows`);
+      } catch (error) { toast(error.message, true); }
+    });
     $("#coverageUploadForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.currentTarget;

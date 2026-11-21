@@ -253,6 +253,29 @@ wb.save(sys.argv[1])`, partsFile]);
   await waitToast("1 row saved");
   await page.waitForFunction(() => document.querySelector("#ovParts input.ov-stock")?.value === "9500");
   check("Parts template uploaded: FG stock 9,500", true);
+  // a second part (Top Beam) takes the Base Front Beam's BOM: Copy BOM from on its coverage page, then edit
+  const topId = (await api("POST", "/api/planning/materials", { code: "UF220TB020", name: "Top Beam", uom: "Nos" })).id;
+  await api("POST", "/api/planning/supplier-parts", { material_id: topId, supplier_id: (await api("GET", "/api/suppliers")).find((w) => w.code === "SUP-2013").id, sob_percent: 100, currency: "INR" });
+  await page.dispatchEvent("#ovMonth", "change");
+  await page.waitForSelector('#ovParts tbody tr:has-text("UF220TB020")');
+  await page.locator('#ovParts tbody tr:has-text("UF220TB020") [data-open-coverage]').click();
+  await page.waitForFunction(() => document.querySelector("#covCopySource option[value]:not([value=''])"));
+  check("Copy BOM from lists the part with a BOM", (await page.locator("#covCopySource option").allTextContents()).some((t) => t.startsWith("UF220BFB010 Base Front Beam · Savera (")));
+  check("Download this part's BOM is for this part only", /link_id=\d+$/.test(await page.getAttribute("#covPartExcel", "href")));
+  await page.selectOption("#covCopySource", { label: (await page.locator("#covCopySource option").allTextContents()).find((t) => t.startsWith("UF220BFB010")) });
+  await clearToast();
+  await page.click("#covCopy");
+  await waitToast("Copied 2 material lines and 3 sub-supplier rows from UF220BFB010");
+  const copiedRows = await page.locator("#coverageTable tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[3].textContent || tr.cells[4].textContent, tr.cells[6].textContent]));
+  check("Top Beam now has the copied BOM (steel with JGI / TATA, ore with XYZ), ready to edit", JSON.stringify(copiedRows.slice(1)) === JSON.stringify([["L1 BOM", "FL001STEEL0.7", "100%"], ["T2", "JGI STEEL", "20%"], ["T2", "TATA Steel", "80%"], ["L2 BOM", "ORE-01", "100%"], ["T3", "XYZ Mining", "100%"]]), JSON.stringify(copiedRows));
+  await clearToast();
+  await page.click("#covCopy");  // again: asks to replace (accepted), not doubled
+  await waitToast("Copied 2 material lines");
+  check("Copying again replaces (not doubled)", (await page.locator("#coverageTable tbody tr").count()) === 6);
+  await page.click("[data-cov-delete-t1]");  // remove the Top Beam again (the checks below use Savera with one part)
+  await page.waitForSelector("#ovParts table");
+  await page.waitForFunction(() => !document.querySelector("#ovParts")?.textContent.includes("UF220TB020"));
+  await page.waitForSelector("#ovParts table");
   await page.click("#ovEditParts");
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);
