@@ -58,22 +58,39 @@ const MY_LIST = ["Raw material", "Finished assembly", "Electrical components", "
   // suppliers: add and edit use the same dropdown
   await page.click('[data-page="suppliers"]');
   await page.waitForSelector("#supplierRegisterTable tbody tr");
+  const supRow = () => page.locator("#supplierRegisterTable tr.sup-editing");
   await page.click('[data-action="new-supplier"]');
-  await page.waitForSelector("#modalForm #categorySelect");
-  check("Add supplier: category dropdown from the list", (await page.locator("#modalForm #categorySelect option").allTextContents()).includes("Wire Harness"));
-  await page.fill('#modalForm [name="name"]', "CAT Harness Works");
-  await page.selectOption("#modalForm #categorySelect", "Wire Harness");
-  await page.fill('#modalForm [name="country"]', "India");
-  await page.click("#modalForm .modal-footer button");
+  await supRow().waitFor();
+  check("Add supplier: category dropdown from the list", (await supRow().locator('[data-s="category"] option').allTextContents()).includes("Wire Harness"));
+  await supRow().locator('[data-s="name"]').fill("CAT Harness Works");
+  await supRow().locator('[data-s="category"]').selectOption("Wire Harness");
+  await supRow().locator('[data-s="country"]').fill("India");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("CAT Harness Works"));
   check("Supplier added with category Wire Harness", (await page.locator('#supplierRegisterTable tbody tr:has-text("CAT Harness Works")').textContent()).includes("Wire Harness"));
-  await page.locator('#supplierRegisterTable tbody tr:has-text("Koyo") [data-edit-supplier]').click();
-  await page.waitForSelector("#supplierEditForm #categorySelect");
-  check("Edit supplier: current category selected", (await page.inputValue("#supplierEditForm #categorySelect")) === "Electrical components");
-  await page.selectOption("#supplierEditForm #categorySelect", "Electronic Child Part");
-  await page.click("#supplierEditForm button");
+  await page.locator('#supplierRegisterTable tbody tr:has-text("Koyo") [data-sup-edit]').click();
+  await supRow().waitFor();
+  check("Edit supplier: current category selected", (await supRow().locator('[data-s="category"]').inputValue()) === "Electrical components");
+  await supRow().locator('[data-s="category"]').selectOption("Electronic Child Part");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector('#supplierRegisterTable').textContent.includes("Electronic Child Part"));
   check("Supplier category changed from the dropdown", true);
+  // + Add new category inside the row
+  await page.click('[data-action="new-supplier"]');
+  await supRow().waitFor();
+  await supRow().locator('[data-s="name"]').fill("CAT Gasket House");
+  await supRow().locator('[data-s="category"]').selectOption("__new__");
+  check("+ Add new category shows a box in the row", await supRow().locator('[data-s="category_new"]').isVisible());
+  await supRow().locator('[data-s="category_new"]').fill("Gaskets");
+  await supRow().locator('[data-s="status"]').selectOption("On hold");
+  await supRow().locator('[data-s="country"]').fill("India");
+  await supRow().locator("[data-sup-save]").click();
+  await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("CAT Gasket House"));
+  check("New category saved with the supplier and added to the list", (await page.locator('#supplierRegisterTable tbody tr:has-text("CAT Gasket House")').textContent()).includes("Gaskets") && (await page.locator('#supplierRegisterTable tbody tr:has-text("CAT Gasket House")').textContent()).includes("On hold") && (await page.request.get("http://127.0.0.1:8765/api/planning/material-categories").then((r) => r.json())).items.includes("Gaskets"));
+  // Esc cancels
+  await page.locator('#supplierRegisterTable tbody tr:has-text("CAT Gasket House") [data-sup-edit]').click();
+  await supRow().locator('[data-s="name"]').press("Escape");
+  check("Esc cancels the row edit", (await supRow().count()) === 0);
 
   // rename (records follow) and delete (refused while used)
   await page.click('[data-page="master"]');

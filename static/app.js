@@ -1837,6 +1837,59 @@ function supplierTierField(selected) {
   return `<fieldset class="field full tier-ticks"><legend>Supplier tier (one or more)</legend>${SUPPLIER_TIER_TABS.map(([tier]) => `<label class="check-option"><input type="checkbox" name="tiers" value="${tier}" ${selected.includes(tier) ? "checked" : ""} /> ${tier}${tier === "T1" ? " (supplies you)" : tier === "T2" ? " (supplies a T1 supplier)" : " (supplies a T2 supplier)"}</label>`).join("")}</fieldset>`;
 }
 
+// Supplier register edited in the rows: Edit / Add supplier turn a row into boxes (Save / Cancel), no window
+function supplierRegisterRow(supplier) {
+  return `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td class="cell-link" data-open-supplier-overview="${supplier.id}" title="Open the supplier overview">${esc(supplier.code)}</td><td class="cell-link" data-open-supplier-overview="${supplier.id}" title="Open the supplier overview">${esc(supplier.name)}</td><td>${esc((supplier.tiers || ["T1"]).join(", "))}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-sup-edit="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`;
+}
+function supplierEditRow(supplier) {
+  const isNew = !supplier;
+  supplier = supplier || { code: "", name: "", tiers: ["T1"], category: "", country: "", contact_name: "", email: "", phone: "", status: "Approved" };
+  const box = (name, value, attrs = "") => `<input class="form-control sup-in" data-s="${name}" value="${esc(value || "")}" ${attrs} />`;
+  const categories = [...state.materialCategories];
+  const known = categories.some((name) => name.toLowerCase() === String(supplier.category).toLowerCase());
+  const category = `<select class="form-control sup-in" data-s="category">${!supplier.category ? '<option value="">Select</option>' : ""}${supplier.category && !known ? `<option value="" selected>${esc(supplier.category)} (choose one)</option>` : ""}${categories.map((name) => `<option value="${esc(name)}" ${name.toLowerCase() === String(supplier.category).toLowerCase() ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__new__">+ Add new category</option></select><input class="form-control sup-in" data-s="category_new" placeholder="New category" hidden />`;
+  const tiers = SUPPLIER_TIER_TABS.map(([tier]) => `<label class="sup-tier"><input type="checkbox" data-s-tier="${tier}" ${(supplier.tiers || ["T1"]).includes(tier) ? "checked" : ""} /> ${tier}</label>`).join("");
+  const status = `<select class="form-control sup-in" data-s="status">${["Approved", "Pending review", "On hold"].map((item) => `<option ${item === supplier.status ? "selected" : ""}>${item}</option>`).join("")}</select>`;
+  return `<tr class="sup-editing${isNew ? " sup-new" : ""}" data-sup-id="${isNew ? "" : supplier.id}"><td>${box("code", supplier.code, `placeholder="${isNew ? "Blank = next SUP- code" : ""}" maxlength="24"`)}</td><td>${box("name", supplier.name, 'placeholder="Supplier name"')}</td><td class="sup-tiers">${tiers}</td><td>${category}</td><td>${box("country", supplier.country, 'placeholder="Country"')}</td><td>${box("contact_name", supplier.contact_name)}</td><td>${box("email", supplier.email, 'type="email"')}</td><td>${box("phone", supplier.phone)}</td><td>${status}</td><td><button class="text-button" data-sup-save>Save</button><button class="text-button" data-sup-cancel>Cancel</button></td></tr>`;
+}
+function renderSupplierRegisterTable() {
+  const target = $("#supplierRegisterTable");
+  if (!target) return;
+  const edit = state.supEdit;
+  const rows = (edit === "new" ? supplierEditRow(null) : "") + state.suppliers.map((supplier) => (edit === supplier.id ? supplierEditRow(supplier) : supplierRegisterRow(supplier))).join("");
+  target.innerHTML = table(["Code", "Supplier", "Tiers", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], rows, "No suppliers yet.");
+  setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Tiers", index: 2 }, { title: "Category", index: 3 }, { title: "Approval", index: 8 }]);
+  target.querySelector(".sup-editing .sup-in")?.focus();
+}
+async function saveSupplierRow() {
+  const tr = $("#supplierRegisterTable tr.sup-editing");
+  if (!tr) return;
+  const value = (name) => (tr.querySelector(`[data-s="${name}"]`)?.value || "").trim();
+  const tiers = [...tr.querySelectorAll("[data-s-tier]:checked")].map((box) => box.dataset.sTier);
+  let category = value("category") === "__new__" ? value("category_new") : value("category");
+  const known = state.materialCategories.find((name) => name.toLowerCase() === category.toLowerCase());
+  if (known) category = known;
+  if (value("name").length < 2) return toast("Type the supplier name.", true);
+  if (!tiers.length) return toast("Tick at least one tier: T1, T2 or T3.", true);
+  if (category.length < 2) return toast("Choose the category (or + Add new category).", true);
+  if (value("country").length < 2) return toast("Type the country.", true);
+  const body = { name: value("name"), tiers, category, country: value("country"), contact_name: value("contact_name"), email: value("email"), phone: value("phone") };
+  const id = tr.dataset.supId;
+  try {
+    if (id) {
+      await api(`/api/suppliers/${id}`, { method: "PATCH", body: JSON.stringify({ ...body, code: value("code") || undefined, status: value("status") }) });
+    } else {
+      const made = await api("/api/suppliers", { method: "POST", body: JSON.stringify({ ...body, code: value("code") }) });
+      if (value("status") && value("status") !== made.status) await api(`/api/suppliers/${made.id}`, { method: "PATCH", body: JSON.stringify({ status: value("status") }) });
+    }
+    state.supEdit = null;
+    await reloadCategories();
+    state.suppliers = await api("/api/suppliers");
+    renderSupplierRegisterTable();
+    toast(id ? "Supplier saved" : "Supplier added");
+  } catch (error) { toast(error.message, true); }
+}
+
 function openSupplierEdit(supplier) {
   if (!supplier) return;
   $("#modalTitle").textContent = `Edit ${supplier.code} · ${supplier.name}`;
@@ -2245,7 +2298,7 @@ async function renderSupplierControl() {
   } else if (tab === "Supplier register") {
     // one list for T1, T2 and T3 suppliers; the Tiers column (and its filter) says which
     const tierCounts = SUPPLIER_TIER_TABS.map(([tier]) => `${tier} ${state.suppliers.filter((supplier) => (supplier.tiers || ["T1"]).includes(tier)).length}`).join(" · ");
-    const supplierRows = state.suppliers.map((supplier) => `<tr data-search="${esc(`${supplier.code} ${supplier.name} ${supplier.category}`.toLowerCase())}"><td class="cell-link" data-open-supplier-overview="${supplier.id}" title="Open the supplier overview">${esc(supplier.code)}</td><td class="cell-link" data-open-supplier-overview="${supplier.id}" title="Open the supplier overview">${esc(supplier.name)}</td><td>${esc((supplier.tiers || ["T1"]).join(", "))}</td><td>${esc(supplier.category)}</td><td>${esc(supplier.country || "")}</td><td>${esc(supplier.contact_name || "")}</td><td>${esc(supplier.email || "")}</td><td>${esc(supplier.phone || "")}</td><td>${esc(supplier.status)}</td><td>${supplier.status === "Pending review" ? `<button class="text-button" data-approve-supplier="${supplier.id}">Approve</button>` : ""}<button class="text-button" data-edit-supplier="${supplier.id}">Edit</button><button class="text-button button-danger" data-delete-supplier="${supplier.id}">Delete</button></td></tr>`).join("");
+    const supplierRows = "";  // rows: renderSupplierRegisterTable()
     body = `<section class="panel table-panel">${panelHeader(`Supplier Master (${tierCounts})`, `Click a supplier's Code or name to open its overview: parts with SOB, rate, FG stock and requirement; each part's BOM; sub-suppliers with SOB, rate and requirement. T1 = supplies you; T2 = supplies a T1 supplier; T3 = supplies a T2 supplier. One supplier can be in more than one (e.g. TATA Steel: T1 for you, T2 for Supangita); a relationship saved at a tier adds that tier to the supplier; filter the Tiers column to see one tier. Add one supplier with Add supplier, or many with an Excel upload (your own headings are fine; suppliers are T1 unless the sheet has a Supplier tier column). Needed: Supplier name. Optional: Supplier code (blank = next free SUP- code), Supplier tier, Category, Country, Contact person, Email, Phone, Approval. A row whose code (or, without a code, name) is already here updates that supplier; the whole file is rejected if any row is wrong.`)}
       <form id="supplierUploadForm" class="panel-body inline-upload"><label class="field"><span>Supplier list workbook</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label><button class="button button-primary" type="submit">Upload suppliers</button><a class="button" href="/api/planning/templates/suppliers.xlsx">Download template</a></form>
       <div class="table-toolbar"><span class="toolbar-add"><button class="button button-small button-primary" data-action="new-supplier">Add supplier</button></span><label class="search-field"><input class="form-control" id="supplierSearch" type="search" placeholder="Search supplier" /></label><div id="supplierFilters"></div>${tableExportLinks("suppliers")}<button class="button button-small" data-action="clear-table-filters">Clear all filters</button></div><div id="supplierRegisterTable">${table(["Code", "Supplier", "Tiers", "Category", "Country", "Contact", "Email", "Phone", "Approval", "Action"], supplierRows, "No suppliers yet.")}</div></section>`;
@@ -2454,7 +2507,8 @@ async function renderSupplierControl() {
         renderSupplierControl();
       } catch (error) { toast(error.message, true); }
     });
-    setupTableFilters("#supplierRegisterTable", "#supplierFilters", $("#supplierSearch"), [{ title: "Tiers", index: 2 }, { title: "Category", index: 3 }, { title: "Approval", index: 8 }]);
+    state.supEdit = null;
+    renderSupplierRegisterTable();
     $("#supplierSearch").addEventListener("input", applyTableSearch);
   }
   if (tab === "Supplier-to-supplier material transfer") {
@@ -3428,7 +3482,11 @@ document.addEventListener("click", async (event) => {
     if (!state.selectedBomParent) return toast("Select one parent part first.", true);
     return openModal("component", { parent_item_id: Number(state.selectedBomParent) });
   }
-  if (event.target.closest('[data-action="new-supplier"]')) return openModal("supplier");
+  if (event.target.closest('[data-action="new-supplier"]')) { state.supEdit = "new"; return renderSupplierRegisterTable(); }
+  const supEdit = event.target.closest("[data-sup-edit]");
+  if (supEdit) { state.supEdit = Number(supEdit.dataset.supEdit); return renderSupplierRegisterTable(); }
+  if (event.target.closest("[data-sup-save]")) return saveSupplierRow();
+  if (event.target.closest("[data-sup-cancel]")) { state.supEdit = null; return renderSupplierRegisterTable(); }
   if (event.target.closest('[data-action="reset-trial"]')) {
     if (!window.confirm("Delete all trial plans, actuals, stock snapshots, POs and transfers? Production data and master data will be preserved.")) return;
     try {
@@ -3570,7 +3628,15 @@ const DROPDOWN_SELECTOR = "details.multi-filter[open], details.model-picker[open
 document.addEventListener("click", (event) => {
   document.querySelectorAll(DROPDOWN_SELECTOR).forEach((dropdown) => { if (!dropdown.contains(event.target)) dropdown.open = false; });
 }, true);
+document.addEventListener("change", (event) => {
+  const choice = event.target.closest('#supplierRegisterTable [data-s="category"]');
+  if (choice) { const fresh = choice.parentElement.querySelector('[data-s="category_new"]'); fresh.hidden = choice.value !== "__new__"; if (!fresh.hidden) fresh.focus(); }
+});
 document.addEventListener("keydown", (event) => {
+  if (event.target.closest?.("#supplierRegisterTable .sup-editing")) {
+    if (event.key === "Enter") { event.preventDefault(); saveSupplierRow(); return; }
+    if (event.key === "Escape") { state.supEdit = null; renderSupplierRegisterTable(); return; }
+  }
   if (event.target.closest?.("#coverageTable .cov-editing")) {
     if (event.key === "Enter") { event.preventDefault(); saveCoverageEdit(); return; }
     if (event.key === "Escape") { state.covEdit = null; renderCoverageTable(); return; }

@@ -45,23 +45,25 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
 
   // Register: Edit and Delete
   const spareRow = page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier")');
-  await spareRow.locator("[data-edit-supplier]").click();
-  await page.fill('#supplierEditForm [name="name"]', "ST Spare Supplier Two");
-  await page.selectOption('#supplierEditForm [name="status"]', "On hold");
-  await page.click("#supplierEditForm button");
+  const supRow = () => page.locator("#supplierRegisterTable tr.sup-editing");
+  await spareRow.locator("[data-sup-edit]").click();
+  check("Edit turns the supplier row into boxes (no window)", (await supRow().count()) === 1 && await page.locator("#modalLayer").isHidden());
+  await supRow().locator('[data-s="name"]').fill("ST Spare Supplier Two");
+  await supRow().locator('[data-s="status"]').selectOption("On hold");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Spare Supplier Two"));
   check("Edit a supplier (name, approval)", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two")').textContent()).includes("On hold"));
   // one Supplier Master page for T1, T2 and T3; a T2 supplier is ticked in Add supplier
   check("One supplier page: no T1 / T2 / T3 tabs; heading counts the tiers", (await page.locator("[data-supplier-tier-tab]").count()) === 0 && /Supplier Master \(T1 \d+ · T2 \d+ · T3 \d+\)/.test(await page.locator("#pageContent").textContent()));
   await page.click('[data-action="new-supplier"]');
-  await page.waitForSelector('#modalForm [name="tiers"]');
-  check("Add supplier ticks T1 by default", JSON.stringify(await page.locator('#modalForm [name="tiers"]:checked').evaluateAll((boxes) => boxes.map((b) => b.value))) === JSON.stringify(["T1"]));
-  await page.uncheck('#modalForm [name="tiers"][value="T1"]');
-  await page.check('#modalForm [name="tiers"][value="T2"]');
-  await page.fill('#modalForm [name="name"]', "ST Samicon");
-  await page.selectOption("#modalForm #categorySelect", "Electronic Child Part");
-  await page.fill('#modalForm [name="country"]', "India");
-  await page.click("#modalForm .modal-footer button");
+  await supRow().waitFor();
+  check("Add supplier: an empty row at the top of the table, T1 ticked", (await page.locator("#supplierRegisterTable tbody tr").first().getAttribute("class")).includes("sup-new") && JSON.stringify(await supRow().locator("[data-s-tier]:checked").evaluateAll((boxes) => boxes.map((b) => b.dataset.sTier))) === JSON.stringify(["T1"]) && await page.locator("#modalLayer").isHidden());
+  await supRow().locator('[data-s-tier="T1"]').uncheck();
+  await supRow().locator('[data-s-tier="T2"]').check();
+  await supRow().locator('[data-s="name"]').fill("ST Samicon");
+  await supRow().locator('[data-s="category"]').selectOption("Electronic Child Part");
+  await supRow().locator('[data-s="country"]').fill("India");
+  await supRow().locator('[data-s="country"]').press("Enter");
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ST Samicon"));
   check("T2 supplier listed in the same list with its tier", (await page.locator('#supplierRegisterTable tbody tr:has-text("ST Samicon") td').nth(2).textContent()) === "T2");
   const tierFilter = page.locator("#supplierRegisterTable thead th").nth(2);
@@ -71,14 +73,14 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Tiers filter shows T2 suppliers only", (await page.locator("#supplierRegisterTable tbody tr:visible").count()) === 1);
   await page.click('[data-action="clear-table-filters"]');
   // change the supplier code; a used code is refused
-  await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-edit-supplier]').click();
-  await page.fill('#supplierEditForm [name="code"]', "SUP-1001");
+  await page.locator('#supplierRegisterTable tbody tr:has-text("ST Spare Supplier Two") [data-sup-edit]').click();
+  await supRow().locator('[data-s="code"]').fill("SUP-1001");
   await clearToast();
-  await page.click("#supplierEditForm button");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("already used"));
   check("A supplier code already used is refused", (await toastText()).includes("Apex Precision Works"), await toastText());
-  await page.fill('#supplierEditForm [name="code"]', "SPARE-01");
-  await page.click("#supplierEditForm button");
+  await supRow().locator('[data-s="code"]').fill("SPARE-01");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("SPARE-01"));
   check("Change a supplier code", true);
   // bulk upload of suppliers + template

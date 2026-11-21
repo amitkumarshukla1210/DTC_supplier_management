@@ -61,15 +61,16 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("Sort supplier A → Z", JSON.stringify(names) === JSON.stringify([...names].sort((a, b) => a.localeCompare(b))), JSON.stringify(names));
 
   // Add supplier window: supplier code; no category pre-selected
+  const supRow = () => page.locator("#supplierRegisterTable tr.sup-editing");
   await page.click('[data-action="new-supplier"]');
-  await page.waitForSelector('#modalForm [name="code"]');
-  check("Add supplier asks for the supplier code", await page.locator('#modalForm [name="code"]').isVisible());
-  check("Category starts at 'Select category'", (await page.locator("#modalForm #categorySelect option:checked").textContent()) === "Select category");
-  await page.fill('#modalForm [name="code"]', "ZZ-01");
-  await page.fill('#modalForm [name="name"]', "Zeta Castings");
-  await page.selectOption("#modalForm #categorySelect", "Casting");
-  await page.fill('#modalForm [name="country"]', "India");
-  await page.click("#modalForm .modal-footer button");
+  await supRow().waitFor();
+  check("Add supplier asks for the supplier code (in the new row)", await supRow().locator('[data-s="code"]').isVisible());
+  check("Category starts at 'Select'", (await supRow().locator('[data-s="category"] option:checked').textContent()) === "Select");
+  await supRow().locator('[data-s="code"]').fill("ZZ-01");
+  await supRow().locator('[data-s="name"]').fill("Zeta Castings");
+  await supRow().locator('[data-s="category"]').selectOption("Casting");
+  await supRow().locator('[data-s="country"]').fill("India");
+  await supRow().locator("[data-sup-save]").click();
   await page.waitForFunction(() => document.querySelector("#supplierRegisterTable")?.textContent.includes("ZZ-01"));
   check("Supplier added with your own code", (await page.locator('#supplierRegisterTable tbody tr:has-text("Zeta Castings") td').first().textContent()) === "ZZ-01");
 
