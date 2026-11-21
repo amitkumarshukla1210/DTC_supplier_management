@@ -507,6 +507,53 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertIn("24-month horizon", upload("2026-12-01", sheet_with(1, 2)).json()["detail"])
         self.assertEqual(len(api.get("/api/planning/plans", params={"workspace": "trial", "issue_month": "2026-11"}).json()), 3)
 
+    def test_actual_production_till_date_with_plan_template_and_upload(self):
+        api = self.client
+        xlsx = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        product = api.post("/api/planning/products", json={"code": "AC-PRD", "name": "Fans"}).json()["id"]
+        for code, name in (("AC12000", "Eva 8014"), ("AC12001", "Serena 8014"), ("AC12002", "Old model")):
+            api.post("/api/planning/models", json={"product_id": product, "code": code, "name": name})
+        # Nov-26 plan, two revisions: the latest (Rev.01, 10-11) is the plan in force; AC12002 not planned
+        for day, eva, serena in (("2026-11-01", 20000, 15000), ("2026-11-10", 18000, 16000)):
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Model Code", "Model Name", "01-11-2026", "01-12-2026"])
+            sheet.append(["AC12000", "Eva 8014", eva, 1])
+            sheet.append(["AC12001", "Serena 8014", serena, 1])
+            content = io.BytesIO()
+            workbook.save(content)
+            self.assertEqual(api.post(f"/api/planning/plans/2026-11/upload?workspace=trial&release_date={day}", content=content.getvalue(), headers=xlsx).status_code, 201)
+        template_buffer = io.BytesIO(api.get("/api/planning/actuals/template.xlsx", params={"as_of": "2026-11-15"}).content)  # kept open: the logo image reads from it on save
+        template = load_workbook(template_buffer).active
+        self.assertEqual((template["B1"].value, len(template._images)), ("Design to Cost · Actual production", 1))
+        self.assertIn("Month: Nov-2026 · as on 15-11-2026 · plan Rev.01 of 10-11-2026", template["B2"].value)
+        self.assertEqual([template.cell(4, c).value for c in range(1, 6)], ["Model Code", "Model Name", "Plan qty (Rev.01)", "Actual production (till date)", "OEM stock"])
+        self.assertEqual([[template.cell(r, c).value for c in range(1, 6)] for r in (5, 6, 7)], [["AC12000", "Eva 8014", 18000, None, None], ["AC12001", "Serena 8014", 16000, None, None], [None] * 5])
+        # 15-11: the total produced from 01-11 till 15-11 (Serena left blank: skipped)
+        template.cell(5, 4).value, template.cell(5, 5).value = 9000, 1200
+        template._images = []  # openpyxl cannot re-save an image read from memory (Excel keeps it)
+        content = io.BytesIO()
+        template.parent.save(content)
+        first = api.post("/api/planning/actuals/2026-11/upload?workspace=trial&as_of=2026-11-15", content=content.getvalue(), headers=xlsx)
+        self.assertEqual((first.status_code, first.json()["rows"], first.json()["as_of"]), (201, 1, "2026-11-15"), first.text)
+        view = api.get("/api/planning/actuals", params={"period": "2026-11", "with_plan": "true"}).json()
+        self.assertEqual(view["plan"]["revision"], "Rev.01")
+        got = [(r["model_code"], r["plan_quantity"], r["actual_quantity"], r["oem_stock"], r["balance"], r["achieved_percent"], r["as_of"]) for r in view["items"]]
+        self.assertEqual(got, [("AC12000", 18000, 9000, 1200, 9000, 50.0, "2026-11-15"), ("AC12001", 16000, None, None, 16000, 0.0, None)])
+        # 25-11: the new total replaces it (typed in the table: JSON rows)
+        again = api.post("/api/planning/actuals", json={"period": "2026-11", "workspace": "trial", "as_of": "25-11-2026", "rows": [{"model_code": "AC12000", "actual_quantity": 16000, "oem_stock": 800}, {"model_code": "AC12001", "actual_quantity": 12000, "oem_stock": 0}]})
+        self.assertEqual(again.status_code, 201, again.text)
+        rows = {r["model_code"]: r for r in api.get("/api/planning/actuals", params={"period": "2026-11", "with_plan": "true"}).json()["items"]}
+        self.assertEqual((rows["AC12000"]["actual_quantity"], rows["AC12000"]["achieved_percent"], rows["AC12000"]["as_of"], rows["AC12001"]["balance"]), (16000, 88.9, "2026-11-25", 4000))
+        self.assertEqual(len(api.get("/api/planning/actuals", params={"period": "2026-11"}).json()), 2)  # plain list: models with an actual
+        # errors: a date outside the month, a name that is not the code's, nothing typed
+        self.assertIn("is not in 2026-11", api.post("/api/planning/actuals", json={"period": "2026-11", "as_of": "2026-12-01", "rows": [{"model_code": "AC12000", "actual_quantity": 1}]}).json()["detail"])
+        template.cell(6, 2).value, template.cell(6, 4).value = "Eva 8014", 5
+        content = io.BytesIO()
+        template.parent.save(content)
+        self.assertIn("Row 6: AC12001 is Serena 8014 in Product Master, not Eva 8014", api.post("/api/planning/actuals/2026-11/upload?as_of=2026-11-26", content=content.getvalue(), headers=xlsx).json()["detail"])
+        self.assertIn("No actual production typed", api.post("/api/planning/actuals", json={"period": "2026-11", "rows": [{"model_code": "AC12000", "actual_quantity": ""}]}).json()["detail"])
+
     def test_wide_month_plan_template_and_month_formats_upload(self):
         product = self.client.post("/api/planning/products", json={"code": "MONTH-PRD", "name": "Month product"})
         model = self.client.post("/api/planning/models", json={

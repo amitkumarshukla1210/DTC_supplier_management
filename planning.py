@@ -240,8 +240,9 @@ class ActualProduction(Base):
     workspace: Mapped[str] = mapped_column(String(16), index=True)
     period: Mapped[str] = mapped_column(String(7), index=True)
     model_id: Mapped[int] = mapped_column(ForeignKey("product_models.id"), index=True)
-    actual_quantity: Mapped[float] = mapped_column(Float, default=0)
+    actual_quantity: Mapped[float] = mapped_column(Float, default=0)  # total produced in the month till the as-on date
     oem_stock: Mapped[float] = mapped_column(Float, default=0)
+    as_of: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD of the latest entry
     updated_by: Mapped[int] = mapped_column(ForeignKey("app_users.id"))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -658,6 +659,7 @@ class PlanRevisionUpdate(BaseModel):
 class ActualUpload(BaseModel):
     period: str
     workspace: str = "trial"
+    as_of: str | None = None  # YYYY-MM-DD: actual = total produced in the month till this date
     rows: list[dict[str, Any]] = Field(min_length=1, max_length=250_000)
 
 
@@ -1716,6 +1718,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                    ("price_updated_month", f"VARCHAR(7) NOT NULL DEFAULT '{_month_text(date.today())}'")):
             if column not in present:
                 db.execute(sa_text(f"ALTER TABLE supplier_bom_line_sources ADD COLUMN {column} {definition}"))
+        if "as_of" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("actual_production")}:
+            db.execute(sa_text("ALTER TABLE actual_production ADD COLUMN as_of VARCHAR(10)"))
         if "release_date" not in {column["name"] for column in sa_inspect(db.get_bind()).get_columns("planning_cycles")}:
             db.execute(sa_text("ALTER TABLE planning_cycles ADD COLUMN release_date VARCHAR(10)"))
         # bom_line_alternates gained from_month (SOB history); earlier SOB applies from the start
@@ -5306,49 +5310,143 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
     def upload_actuals(payload: ActualUpload, request: Request):
         user = current_user(request)
         _validate_workspace(payload.workspace)
-        _month(payload.period)
+        payload.period = _month_text(_month(payload.period))
+        as_of = _sheet_date(payload.as_of) if payload.as_of else None
+        if as_of and _month_text(_month(as_of)) != payload.period:
+            raise HTTPException(status_code=422, detail=f"The as-on date {as_of.strftime('%d-%m-%Y')} is not in {payload.period}")
         with open_db() as db:
             models_by_code = {m.code: m for m in db.scalars(select(ProductModel)).all()}
             saved = 0
             for row in payload.rows:
+                where = f"Row {row['_excel_row']}: " if row.get("_excel_row") else ""
                 code = str(row.get("model_code", "")).strip()
+                if not code:
+                    continue
                 model = models_by_code.get(code)  # actuals: one model per code
                 if not model:
-                    raise HTTPException(status_code=422, detail=f"Unknown model code: {code}")
-                quantity = float(row.get("actual_quantity", row.get("quantity", 0)))
-                oem_stock = float(row.get("oem_stock", 0))
+                    raise HTTPException(status_code=422, detail=f"{where}Unknown model code: {code}")
+                name = str(row.get("model_name") or "").strip()
+                if name and " ".join(model.name.split()).casefold() != " ".join(name.split()).casefold():
+                    raise HTTPException(status_code=422, detail=f"{where}{code} is {model.name} in Product Master, not {name}; check the Model Code")
+                raw_quantity = row.get("actual_quantity", row.get("quantity"))
+                if raw_quantity is None or str(raw_quantity).strip() == "":
+                    continue  # nothing typed for this model
+                try:
+                    quantity = float(raw_quantity)
+                    oem_stock = float(row.get("oem_stock") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=f"{where}actual production and OEM stock must be numbers") from exc
                 if min(quantity, oem_stock) < 0:
-                    raise HTTPException(status_code=422, detail="Actual production and OEM stock cannot be negative")
+                    raise HTTPException(status_code=422, detail=f"{where}Actual production and OEM stock cannot be negative")
                 existing = db.scalar(select(ActualProduction).where(ActualProduction.workspace == payload.workspace, ActualProduction.period == payload.period, ActualProduction.model_id == model.id))
-                if existing:
+                if existing:  # the total till the new date replaces the earlier total
                     existing.actual_quantity = quantity
                     existing.oem_stock = oem_stock
                     existing.updated_by = user["id"]
+                    existing.as_of = as_of.isoformat() if as_of else existing.as_of
                 else:
-                    db.add(ActualProduction(workspace=payload.workspace, period=payload.period, model_id=model.id, actual_quantity=quantity, oem_stock=oem_stock, updated_by=user["id"]))
+                    db.add(ActualProduction(workspace=payload.workspace, period=payload.period, model_id=model.id, actual_quantity=quantity, oem_stock=oem_stock,
+                                            as_of=as_of.isoformat() if as_of else None, updated_by=user["id"]))
                 saved += 1
+            if not saved:
+                raise HTTPException(status_code=422, detail="No actual production typed")
             db.commit()
-            return {"workspace": payload.workspace, "period": payload.period, "rows": saved}
+            return {"workspace": payload.workspace, "period": payload.period, "rows": saved, "as_of": as_of.isoformat() if as_of else None}
+
+    def month_plan(db: Session, workspace: str, period: str) -> tuple[PlanningCycle | None, dict[int, float]]:
+        """The plan in force for a production month: the latest revision of the latest plan issued up to that month."""
+        cycle = db.scalar(select(PlanningCycle).where(PlanningCycle.workspace == workspace, PlanningCycle.issue_month <= period)
+                          .order_by(PlanningCycle.issue_month.desc(), PlanningCycle.revision.desc()).limit(1))
+        if not cycle:
+            return None, {}
+        return cycle, {line.model_id: line.quantity for line in db.scalars(select(PlanLine).where(PlanLine.cycle_id == cycle.id, PlanLine.target_month == period)).all()}
+
+    def actual_rows(db: Session, workspace: str, period: str) -> tuple[PlanningCycle | None, list[dict]]:
+        """Every model planned for the month or with an actual: plan, actual till date, balance, % achieved."""
+        cycle, planned = month_plan(db, workspace, period)
+        actuals = {row.model_id: row for row in db.scalars(select(ActualProduction).where(ActualProduction.workspace == workspace, ActualProduction.period == period)).all()}
+        models = {m.id: m for m in db.scalars(select(ProductModel)).all()}
+        ids = [model_id for model_id in models if planned.get(model_id) or model_id in actuals]
+        rows = []
+        for model_id in sorted(ids, key=lambda i: (models[i].code.casefold(), models[i].name.casefold())):
+            plan, actual = planned.get(model_id, 0.0), actuals.get(model_id)
+            done = actual.actual_quantity if actual else None
+            rows.append({"model_code": models[model_id].code, "model_name": models[model_id].name, "plan_quantity": plan,
+                         "actual_quantity": done, "oem_stock": actual.oem_stock if actual else None, "as_of": actual.as_of if actual else None,
+                         "balance": plan - (done or 0), "achieved_percent": round((done or 0) * 100 / plan, 1) if plan else None})
+        return cycle, rows
 
     @app.get("/api/planning/actuals")
-    def list_actuals(request: Request, period: str, workspace: str = "trial"):
+    def list_actuals(request: Request, period: str, workspace: str = "trial", with_plan: bool = False):
         current_user(request)
         _validate_workspace(workspace)
-        _month(period)
+        period = _month_text(_month(period))
         with open_db() as db:
-            models_by_id = {m.id: m for m in db.scalars(select(ProductModel)).all()}
-            return [
-                {"model_code": models_by_id[row.model_id].code if row.model_id in models_by_id else "", "model_name": models_by_id[row.model_id].name if row.model_id in models_by_id else "", "actual_quantity": row.actual_quantity, "oem_stock": row.oem_stock}
-                for row in db.scalars(select(ActualProduction).where(ActualProduction.workspace == workspace, ActualProduction.period == period).order_by(ActualProduction.model_id)).all()
-            ]
+            cycle, rows = actual_rows(db, workspace, period)
+            if with_plan:
+                return {"period": period, "plan": {"revision": f"Rev.{cycle.revision:02d}", "issue_month": cycle.issue_month, "release_date": cycle.release_date} if cycle else None,
+                        "items": rows}
+            return [row for row in rows if row["actual_quantity"] is not None]
+
+    @app.get("/api/planning/actuals/template.xlsx")
+    def actual_template(request: Request, as_of: str = "", workspace: str = "trial"):
+        """Actual production template like the plan template: logo and title, the month and as-on date, then the
+        models of the month's plan with Plan qty, Actual production (total till date) and OEM stock."""
+        current_user(request)
+        _validate_workspace(workspace)
+        day = _sheet_date(as_of) if as_of else date.today()
+        period = _month_text(_month(day))
+        with open_db() as db:
+            cycle, rows = actual_rows(db, workspace, period)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Actual production"
+        try:  # the app logo (needs Pillow; the template works without it)
+            from openpyxl.drawing.image import Image as SheetImage
+            logo = SheetImage(str(Path(__file__).resolve().parent / "static" / "logo.png"))
+            logo.width = logo.height = 48
+            sheet.add_image(logo, "A1")
+        except Exception:
+            pass
+        sheet.row_dimensions[1].height = 22
+        sheet.row_dimensions[2].height = 22
+        sheet["B1"] = "Design to Cost · Actual production"
+        sheet["B1"].font = Font(bold=True, size=14, color="12263A")
+        if cycle:
+            plan_date = date.fromisoformat(cycle.release_date).strftime("%d-%m-%Y") if cycle.release_date else ""
+            plan_text = f"plan Rev.{cycle.revision:02d}" + (f" of {plan_date}" if plan_date else "")
+        else:
+            plan_text = "no plan uploaded for this month"
+        sheet["B2"] = f"Month: {_month(day).strftime('%b-%Y')} · as on {day.strftime('%d-%m-%Y')} · {plan_text}. Type the total produced in the month till the as-on date; a blank row is skipped."
+        sheet["B2"].font = Font(italic=True, color="5B6B7B")
+        headers = ["Model Code", "Model Name", f"Plan qty ({f'Rev.{cycle.revision:02d}' if cycle else 'no plan'})", "Actual production (till date)", "OEM stock"]
+        for index, value in enumerate(headers, start=1):
+            cell = sheet.cell(4, index, value)
+            cell.fill, cell.font = PatternFill("solid", fgColor="12263A"), Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for row_index, row in enumerate(rows, start=5):
+            sheet.cell(row_index, 1, row["model_code"])
+            sheet.cell(row_index, 2, row["model_name"])
+            sheet.cell(row_index, 3, row["plan_quantity"])
+            sheet.cell(row_index, 4, row["actual_quantity"])
+            sheet.cell(row_index, 5, row["oem_stock"])
+            for column in (3, 4, 5):
+                sheet.cell(row_index, column).number_format = "#,##0.###"
+        for column, width in zip("ABCDE", (16, 26, 16, 22, 14)):
+            sheet.column_dimensions[column].width = width
+        sheet.freeze_panes = "C5"
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f'attachment; filename="actual-production-{day.strftime("%d-%m-%Y")}.xlsx"'})
 
     @app.post("/api/planning/actuals/{period}/upload", status_code=201)
-    async def upload_actuals_excel(period: str, request: Request, workspace: str = "trial"):
-        rows = _read_xlsx(await request.body())
-        _required_columns(rows, {"model_code"})
-        if "actual_quantity" not in rows[0] and "quantity" not in rows[0]:
-            raise HTTPException(status_code=422, detail="Excel sheet needs an actual_quantity column")
-        return upload_actuals(ActualUpload(period=period, workspace=workspace, rows=rows), request)
+    async def upload_actuals_excel(period: str, request: Request, workspace: str = "trial", as_of: str = ""):
+        aliases = {"model_code": "model_code", "model_name": "model_name", "actual_production_(till_date)": "actual_quantity", "actual_production": "actual_quantity",
+                   "actual_quantity": "actual_quantity", "actual": "actual_quantity", "quantity": "actual_quantity", "oem_stock": "oem_stock"}
+        rows = _read_supplier_part_sheet(await request.body(), aliases, {"model_code", "actual_quantity"})
+        return upload_actuals(ActualUpload(period=period, workspace=workspace, rows=rows, as_of=as_of or None), request)
 
     @app.post("/api/planning/own-stock", status_code=201)
     def upload_own_stock(payload: StockUpload, request: Request):

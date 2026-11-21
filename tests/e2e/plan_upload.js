@@ -69,6 +69,46 @@ wb.save(sys.argv[2])`, templateFile, out, String(qty)]);
   const history = await page.locator("#planHistory tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[1].textContent, tr.cells[2].textContent, tr.cells[3].textContent]));
   check("Revision history: plan dates DD-MM-YYYY, 48 rows each", JSON.stringify(history) === JSON.stringify([["Rev.02", "15-11-2026", "48"], ["Rev.01", "10-11-2026", "48"], ["Rev.00", "01-11-2026", "48"]]), JSON.stringify(history));
   check("Uploaded on is DD-MM-YYYY too", /^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$/.test(await page.locator("#planHistory tbody tr").first().locator("td").nth(4).textContent()));
+  // actual production till date: plan of the month (latest revision Rev.02: Eva 300, Serena 600) beside the actual
+  await page.fill('#actualHistoryForm [name="history_as_of"]', "2026-11-15");
+  await page.click('#actualHistoryForm button[type="submit"]');
+  await page.waitForFunction(() => document.querySelector("#actualPlanNote")?.textContent.includes("Rev.02"));
+  const actualHeads = await page.locator("#actualHistoryTable thead th summary").allTextContents();
+  check("Actual table: plan (latest revision), actual till date, OEM stock, balance, % achieved, as on", JSON.stringify(actualHeads) === JSON.stringify(["Model code", "Model name", "Plan qty (Rev.02)", "Actual (till date)", "OEM stock", "Balance", "% achieved", "As on"]), JSON.stringify(actualHeads));
+  check("Plan note: Nov 2026 · plan Rev.02 of 15-11-2026", (await page.textContent("#actualPlanNote")).includes("plan Rev.02 of 15-11-2026"));
+  const evaRow = page.locator('#actualHistoryTable tr[data-actual-model="PL12000"]');
+  await evaRow.locator('[data-f="actual_quantity"]').fill("150");
+  await evaRow.locator('[data-f="oem_stock"]').fill("20");
+  await page.evaluate(() => { document.querySelector("#toast").textContent = ""; });
+  await page.click("#actualSaveAll");
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("actual till 15-11-2026"));
+  await page.waitForFunction(() => document.querySelector('#actualHistoryTable tr[data-actual-model="PL12000"]')?.cells[7].textContent === "15-11-2026");
+  const eva = await evaRow.locator("td").allTextContents();
+  check("Typed in the table: Eva plan 300, actual 150 -> balance 150, 50%, as on 15-11-2026", eva[2] === "300" && eva[5] === "150" && eva[6] === "50%" && eva[7] === "15-11-2026", JSON.stringify(eva));
+  // Actual template for 25-11-2026: models of the month's plan; Serena typed in Excel, uploaded on 25-11
+  await page.fill('#actualUploadForm [name="as_of"]', "2026-11-25");
+  await page.dispatchEvent('#actualUploadForm [name="as_of"]', "change");
+  const actualHref = await page.getAttribute("#actualTemplateLink", "href");
+  check("Actual template follows the as-on date", actualHref === "/api/planning/actuals/template.xlsx?as_of=2026-11-25", actualHref);
+  const actualFile = path.join(os.tmpdir(), `actual-${Date.now()}.xlsx`);
+  fs.writeFileSync(actualFile, await (await page.request.get(BASE + actualHref)).body());
+  const actualFilled = spawnSync(python, ["-c", `import sys, openpyxl
+wb = openpyxl.load_workbook(sys.argv[1]); ws = wb.active
+print("TOP", ws["B1"].value, "|", ws["B2"].value, "|", len(ws._images))
+print("HEAD", [ws.cell(4, c).value for c in range(1, 6)])
+print("ROWS", [[ws.cell(r, c).value for c in range(1, 6)] for r in (5, 6)])
+ws.cell(6, 4).value, ws.cell(6, 5).value = 400, 50
+wb.save(sys.argv[1])`, actualFile]);
+  const out = String(actualFilled.stdout) + String(actualFilled.stderr);
+  check("Template: logo, 'Design to Cost · Actual production', month and as-on date", out.includes("TOP Design to Cost · Actual production | Month: Nov-2026 · as on 25-11-2026 · plan Rev.02 of 15-11-2026.") && out.includes("| 1\n"), out);
+  check("Template rows: the plan's models with Plan qty and the actual so far", out.includes("HEAD ['Model Code', 'Model Name', 'Plan qty (Rev.02)', 'Actual production (till date)', 'OEM stock']") && out.includes("ROWS [['PL12000', 'Eva 8014', 300, 150, 20], ['PL12001', 'Serena 8014', 600, None, None]]"), out);
+  await page.setInputFiles('#actualUploadForm input[type="file"]', actualFile);
+  await page.evaluate(() => { document.querySelector("#toast").textContent = ""; });
+  await page.click('#actualUploadForm button[type="submit"]');
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("actual till 25-11-2026"));
+  await page.waitForFunction(() => document.querySelector('#actualHistoryTable tr[data-actual-model="PL12001"]')?.cells[7].textContent === "25-11-2026");
+  const serena = await page.locator('#actualHistoryTable tr[data-actual-model="PL12001"] td').allTextContents();
+  check("Uploaded: Serena plan 600, actual 400 -> balance 200, 66.7%, as on 25-11-2026", serena[5] === "200" && serena[6] === "66.7%" && (await page.locator('#actualHistoryTable tr[data-actual-model="PL12001"] [data-f="actual_quantity"]').inputValue()) === "400", JSON.stringify(serena));
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
   const failed = results.filter((x) => !x.ok).length;

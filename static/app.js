@@ -370,11 +370,11 @@ async function renderPlans() {
   state.planEditor = null;
   const month = monthNow();
   state.plans = await api(`/api/planning/plans?workspace=${state.workspace}`);
-  const actuals = await api(`/api/planning/actuals?period=${month}&workspace=${state.workspace}`);
+
   const ddmmyyyy = (iso) => (iso ? iso.split("-").reverse().join("-") : "");
   const today = new Date().toISOString().slice(0, 10);
   const planRows = state.plans.map((plan) => `<tr class="clickable-row" data-plan-id="${plan.id}" tabindex="0" title="Open ${esc(plan.revision)} to review or edit monthly quantities"><td>${monthLabel(plan.issue_month)}</td><td>${esc(plan.revision)}</td><td>${esc(ddmmyyyy(plan.release_date))}</td><td>${number(plan.row_count, 0)}</td><td>${(() => { const d = new Date(plan.created_at); const two = (n) => String(n).padStart(2, "0"); return `${two(d.getDate())}-${two(d.getMonth() + 1)}-${d.getFullYear()} ${two(d.getHours())}:${two(d.getMinutes())}`; })()}</td><td>${esc(plan.workspace)}</td></tr>`).join("");
-  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?release_date=${today}">Plan template</a><a class="button" href="/api/planning/templates/actuals.xlsx">Actuals template</a>`)}
+  content.innerHTML = `${heading("Monthly plans & actuals", "Import a monthly 24-month plan snapshot. Revisions are immutable; missing model/month rows are treated as zero demand.", `<a class="button" id="planTemplateLink" href="/api/planning/templates/plan.xlsx?release_date=${today}">Plan template</a><a class="button" id="actualTemplateLink" href="/api/planning/actuals/template.xlsx?as_of=${new Date().toISOString().slice(0, 10)}">Actual template</a>`)}
     <div class="planning-grid">
       <section class="panel">${panelHeader("Upload plan revision", "Pick the plan date from the calendar, then the file. Each upload is saved as the next revision of that month (e.g. Nov-26: 01-11 Rev.00, 10-11 Rev.01, 15-11 Rev.02). Plan template: logo and header, then Model Code, Model Name and 24 months (DD-MM-YYYY) from the plan date's month, one row per model.")}
         <form id="planUploadForm" class="panel-body form-grid">
@@ -383,17 +383,17 @@ async function renderPlans() {
           <label class="field full"><span>24-month plan workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload as next revision</button>
         </form></section>
-      <section class="panel">${panelHeader("Upload actual production & OEM stock", "Columns: model_code, actual_quantity, oem_stock. Actuals update that model and month; plans remain unchanged.")}
+      <section class="panel">${panelHeader("Upload actual production & OEM stock", "Pick the as-on date, then the file. Actual = total produced in the month till that date (e.g. on 15-11: 01-11 to 15-11); a later date replaces it. Actual template: logo and header, the month and the models of the month's plan (latest revision) with Plan qty, Actual production (till date) and OEM stock. Or type it in the table below.")}
         <form id="actualUploadForm" class="panel-body form-grid">
-          ${field("Production month", "period", "month", { required: true, value: month })}
+          ${field("As on date", "as_of", "date", { required: true, value: new Date().toISOString().slice(0, 10) })}
           <label class="field"><span>Workspace</span>${workspaceSelect()}</label>
           <label class="field full"><span>Actual production workbook (.xlsx)</span><input class="form-control" type="file" name="workbook" accept=".xlsx" required /></label>
           <button class="button button-primary" type="submit">Upload actuals</button>
         </form></section>
     </div>
-    <section class="panel table-panel">${panelHeader("Actual production & OEM stock history", "Actual production and OEM stock are retained by model and month; re-uploading a month updates that month's values.")}
-        <form id="actualHistoryForm" class="table-toolbar"><div class="toolbar-group">${field("Production month", "history_period", "month", { value: month })}</div><button class="button button-small" type="submit">View month</button><span id="actualHistoryExports">${tableExportLinks("actuals", { period: month, workspace: state.workspace })}</span><div class="toolbar-group" id="actualFilters"></div><button class="button button-small" type="button" data-action="clear-table-filters">Clear all filters</button></form>
-        <div id="actualHistoryTable">${table(["Model code", "Model name", "Actual production", "OEM stock"], actuals.map((row) => `<tr><td>${esc(row.model_code)}</td><td>${esc(row.model_name)}</td><td>${number(row.actual_quantity)}</td><td>${number(row.oem_stock)}</td></tr>`).join(""), `No actual production data for ${monthLabel(month)}.`)}</div>
+    <section class="panel table-panel">${panelHeader("Actual production till date", "The month's plan (latest revision) and the actual produced till the as-on date. Type Actual (till date) and OEM stock in the table and Save all, or upload the Actual template above. Balance = plan − actual.")}
+        <form id="actualHistoryForm" class="table-toolbar"><div class="toolbar-group">${field("As on date", "history_as_of", "date", { value: new Date().toISOString().slice(0, 10) })}</div><button class="button button-small" type="submit">View month</button><span id="actualPlanNote" class="subtle"></span><span id="actualHistoryExports">${tableExportLinks("actuals", { period: month, workspace: state.workspace })}</span><div class="toolbar-group" id="actualFilters"></div><button class="button button-small" type="button" data-action="clear-table-filters">Clear all filters</button><span class="toolbar-add"><button class="button button-small button-primary" type="button" id="actualSaveAll">Save all</button></span></form>
+        <div id="actualHistoryTable"><div class="tree-loading">Loading…</div></div>
     </section>
     <section id="planRevisionEditor" class="panel table-panel" hidden></section>
     <section class="panel table-panel">${panelHeader("Revision history", "Each issue month begins at Rev.00. Prior uploads are preserved for plan-versus-actual review.")}
@@ -413,29 +413,50 @@ async function renderPlans() {
     } catch (error) { toast(error.message, true); }
   });
   $('#planUploadForm [name="release_date"]').addEventListener("change", (event) => { $("#planTemplateLink").href = `/api/planning/templates/plan.xlsx?release_date=${encodeURIComponent(event.target.value)}`; });
-  $("#actualUploadForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const period = data.get("period");
-    state.workspace = data.get("workspace");
+  // actual production: total in the month till the as-on date, with the month's plan beside it
+  const ddmm = (iso) => (iso ? iso.split("-").reverse().join("-") : "");
+  const loadActuals = async () => {
+    const asOf = $('#actualHistoryForm [name="history_as_of"]').value || today;
+    const period = asOf.slice(0, 7);
     try {
-      const result = await uploadExcel(`/api/planning/actuals/${period}/upload?workspace=${state.workspace}`, data.get("workbook"));
-      toast(`${result.rows} actual production row(s) saved for ${period}`);
-      await renderPlans();
-    } catch (error) { toast(error.message, true); }
-  });
-  $("#actualHistoryForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const period = new FormData(event.currentTarget).get("history_period");
-    try {
-      const rows = await api(`/api/planning/actuals?period=${period}&workspace=${state.workspace}`);
-      $("#actualHistoryTable").innerHTML = table(["Model code", "Model name", "Actual production", "OEM stock"], rows.map((row) => `<tr><td>${esc(row.model_code)}</td><td>${esc(row.model_name)}</td><td>${number(row.actual_quantity)}</td><td>${number(row.oem_stock)}</td></tr>`).join(""), `No actual production data for ${monthLabel(period)}.`);
+      const result = await api(`/api/planning/actuals?${new URLSearchParams({ period, workspace: state.workspace, with_plan: "true" })}`);
+      $("#actualPlanNote").textContent = result.plan ? `${monthLabel(period)} · plan ${result.plan.revision}${result.plan.release_date ? ` of ${ddmm(result.plan.release_date)}` : ""}` : `${monthLabel(period)} · no plan uploaded`;
+      const rows = result.items.map((row) => `<tr data-actual-model="${esc(row.model_code)}"><td>${esc(row.model_code)}</td><td>${esc(row.model_name)}</td><td>${number(row.plan_quantity)}</td><td><input class="form-control actual-input" type="number" min="0" step="any" data-f="actual_quantity" value="${row.actual_quantity ?? ""}" placeholder="0" /></td><td><input class="form-control actual-input" type="number" min="0" step="any" data-f="oem_stock" value="${row.oem_stock ?? ""}" placeholder="0" /></td><td>${number(row.balance)}</td><td>${row.achieved_percent === null ? "—" : `${number(row.achieved_percent, 1)}%`}</td><td>${esc(ddmm(row.as_of))}</td></tr>`).join("");
+      $("#actualHistoryTable").innerHTML = table(["Model code", "Model name", `Plan qty${result.plan ? ` (${result.plan.revision})` : ""}`, "Actual (till date)", "OEM stock", "Balance", "% achieved", "As on"], rows, `No plan or actual production for ${monthLabel(period)}.`);
       $("#actualHistoryExports").innerHTML = tableExportLinks("actuals", { period, workspace: state.workspace });
       setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
     } catch (error) { toast(error.message, true); }
+  };
+  $("#actualHistoryForm").addEventListener("submit", (event) => { event.preventDefault(); loadActuals(); });
+  $("#actualSaveAll").addEventListener("click", async () => {
+    const asOf = $('#actualHistoryForm [name="history_as_of"]').value || today;
+    const rows = [...document.querySelectorAll("#actualHistoryTable tr[data-actual-model]")].map((tr) => ({
+      model_code: tr.dataset.actualModel, actual_quantity: tr.querySelector('[data-f="actual_quantity"]').value, oem_stock: tr.querySelector('[data-f="oem_stock"]').value || 0,
+    })).filter((row) => row.actual_quantity !== "");
+    if (!rows.length) return toast("Type the actual production (till date) of at least one model.", true);
+    try {
+      const result = await api("/api/planning/actuals", { method: "POST", body: JSON.stringify({ period: asOf.slice(0, 7), workspace: state.workspace, as_of: asOf, rows }) });
+      toast(`${result.rows} model${result.rows === 1 ? "" : "s"} saved, actual till ${ddmm(asOf)}`);
+      loadActuals();
+    } catch (error) { toast(error.message, true); }
   });
+  $('#actualUploadForm [name="as_of"]').addEventListener("change", (event) => { $("#actualTemplateLink").href = `/api/planning/actuals/template.xlsx?as_of=${encodeURIComponent(event.target.value)}`; });
+  $("#actualUploadForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const asOf = String(data.get("as_of") || today);
+    state.workspace = data.get("workspace");
+    try {
+      const result = await uploadExcel(`/api/planning/actuals/${asOf.slice(0, 7)}/upload?workspace=${state.workspace}&as_of=${asOf}`, data.get("workbook"));
+      toast(`${result.rows} model${result.rows === 1 ? "" : "s"} saved, actual till ${ddmm(asOf)}`);
+      $('#actualHistoryForm [name="history_as_of"]').value = asOf;
+      event.target.reset();
+      $('#actualUploadForm [name="as_of"]').value = asOf;
+      loadActuals();
+    } catch (error) { toast(error.message, true); }
+  });
+  loadActuals();
   setupTableFilters("#planHistory", "#planFilters", null, [{ title: "Issue month", index: 0 }, { title: "Revision", index: 1 }, { title: "Plan date", index: 2 }, { title: "Workspace", index: 5 }]);
-  setupTableFilters("#actualHistoryTable", "#actualFilters", null, [{ title: "Model", index: 0 }]);
 }
 
 async function openPlanEditor(cycleId) {

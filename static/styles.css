@@ -590,3 +590,4 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #supplyTreeTable tr[data-tree-depth="5"] > .tree-toggle-cell { padding-left: 88px; }
 #supplyTreeTable tr[data-tree-depth]:not([data-tree-depth="0"]) > td:first-child { box-shadow: inset 3px 0 0 #8cc4df; }
 .entry-table tr.balance-row > td { background: #fff7e0; }
+.actual-input { width: 130px; }

@@ -100,6 +100,8 @@ Tabs, in order: **Supplier register** (first), Supplier/material relationship, S
 - **Plan template**: the DC logo and a title, then **Model Code | Model Name | 24 months** (dates **DD-MM-YYYY**, from the month of the chosen plan date), one row per model. No date or revision columns: the app sets them.
 - **Upload**: pick the **Plan date** from the calendar, then the file. Each upload is saved as the **next revision** of that month: e.g. in Nov-26, 01-11 → Rev.00, 10-11 → Rev.01, 15-11 → Rev.02. One plan per file; a blank row ends it (a Total row under it is ignored). A row whose name differs from the model code's name in Product Master is reported. Revision history shows the plan date and upload time as DD-MM-YYYY. Older sheets still work.
 
+- **Actual production till date**: actual = total produced in the month till the **as-on date** (e.g. on 15-11: 01-11 to 15-11); a later date replaces it. The table shows every model of the month's plan (latest revision) with Plan qty, **Actual (till date)** and **OEM stock** (type and **Save all**), Balance, % achieved and the as-on date. **Actual template**: logo and title, the month, as-on date and plan revision, then the plan's models with Plan qty, Actual production (till date) and OEM stock; upload it with the as-on date (blank rows are skipped). The plain sheet (model_code, actual_quantity, oem_stock) still works.
+
 ## Supplier register → relationship → coverage
 
 - **Supplier register**: one list for T1, T2 and T3 suppliers (the heading counts each tier; filter the **Tiers** column for one tier). Click a supplier's **Code** or **name** to open its **Supplier/material relationship**.
