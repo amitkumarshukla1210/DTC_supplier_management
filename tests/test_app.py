@@ -594,25 +594,27 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual((parts["OV-BEAM"]["sob_percent"], parts["OV-BEAM"]["unit_price"], parts["OV-BEAM"]["stock"], parts["OV-BEAM"]["available"], parts["OV-BEAM"]["part_requirement"], parts["OV-BEAM"]["supplier_requirement"]),
                          (60, 85, 9000, 8000, 80000, 48000))
         self.assertEqual((parts["OV-TOPB"]["part_requirement"], parts["OV-TOPB"]["supplier_requirement"], parts["OV-TOPB"]["stock"]), (60000, 60000, None))
+        # net requirement after the FG stock: beam 48,000 - 9,000 = 39,000 still to make; top beam 60,000
+        self.assertEqual((parts["OV-BEAM"]["net_requirement"], parts["OV-TOPB"]["net_requirement"]), (39000, 60000))
         # the coverage page starts from the part's requirement in the month's plan (all suppliers: 80,000 beams)
         coverage_plan = api.get(f"/api/planning/supplier-coverage/{beam_link}", params={"month": "2026-11"}).json()["plan"]
         self.assertEqual((coverage_plan["revision"], coverage_plan["month"], coverage_plan["part_requirement"]), ("Rev.00", "2026-11", 80000))
         # same as the Shortage & excess report's plan demand for Savera's beam (worked out there separately)
         report = api.get("/api/planning/report", params={"start_month": "2026-11", "end_month": "2026-11"}).json()["items"]
         self.assertEqual(next(r["plan_demand"] for r in report if r["material_code"] == "OV-BEAM" and r["supplier_code"] == "OV-1013"), 48000)
-        # 2-3. BOM with sub-supplier SOB and requirement: steel 48,000 x 2 = 96,000 kg (JGI 30% 28,800, TATA 70% 67,200); ore x 1.7
+        # 2-3. BOM from the net requirement: steel 39,000 x 2 = 78,000 kg (JGI 30% 23,400, TATA 70% 54,600); ore x 1.7 = 132,600
         lines = parts["OV-BEAM"]["lines"]
-        self.assertEqual([(l["depth"], l["code"], l["bom_qty"], l["per_part"], l["requirement"]) for l in lines], [(1, "OV-STEEL", 2, 2, 96000), (2, "OV-ORE", 1.7, 3.4, 163200)])
-        self.assertEqual([(s["code"], s["tier"], s["sob_percent"], s["unit_price"], s["requirement"]) for s in lines[0]["sources"]], [("OV-1004", "T2", 30, 74, 28800), ("OV-1014", "T2", 70, 72, 67200)])
-        self.assertEqual((lines[1]["sources"][0]["code"], lines[1]["sources"][0]["tier"], lines[1]["sources"][0]["requirement"]), ("OV-1030", "T3", 163200))
+        self.assertEqual([(l["depth"], l["code"], l["bom_qty"], l["per_part"], l["requirement"]) for l in lines], [(1, "OV-STEEL", 2, 2, 78000), (2, "OV-ORE", 1.7, 3.4, 132600)])
+        self.assertEqual([(s["code"], s["tier"], s["sob_percent"], s["unit_price"], s["requirement"]) for s in lines[0]["sources"]], [("OV-1004", "T2", 30, 74, 23400), ("OV-1014", "T2", 70, 72, 54600)])
+        self.assertEqual((lines[1]["sources"][0]["code"], lines[1]["sources"][0]["tier"], lines[1]["sources"][0]["requirement"]), ("OV-1030", "T3", 132600))
         # 4-6. sub-supplier list: who, for which part and material, SOB, rate, requirement (top beam steel 60,000 x 1.5 = 90,000 kg)
         listed = [(r["code"], r["part_code"], r["material_code"], r["sob_percent"], r["unit_price"], r["requirement"]) for r in view["sub_suppliers"]]
-        self.assertEqual(listed, [("OV-1004", "OV-BEAM", "OV-STEEL", 30, 74, 28800), ("OV-1004", "OV-TOPB", "OV-STEEL", 100, 76, 90000),
-                                  ("OV-1014", "OV-BEAM", "OV-STEEL", 70, 72, 67200), ("OV-1030", "OV-BEAM", "OV-ORE", 100, 9, 163200)])
-        # one line per sub-supplier and material, blended over Savera's parts: steel total 28,800 + 90,000 + 67,200 = 186,000 kg;
-        # JGI 118,800 kg -> 63.871%, rate (74 x 28,800 + 76 x 90,000) / 118,800 = 75.5152; TATA 67,200 -> 36.129% @72; XYZ ore 100% @9
-        blend = [(r["code"], r["material_code"], round(r["sob_percent"], 3), round(r["unit_price"], 4), r["requirement"], r["tier"]) for r in view["sub_supplier_summary"]]
-        self.assertEqual(blend, [("OV-1004", "OV-STEEL", 63.871, 75.5152, 118800, "T2"), ("OV-1014", "OV-STEEL", 36.129, 72, 67200, "T2"), ("OV-1030", "OV-ORE", 100, 9, 163200, "T3")])
+        self.assertEqual(listed, [("OV-1004", "OV-BEAM", "OV-STEEL", 30, 74, 23400), ("OV-1004", "OV-TOPB", "OV-STEEL", 100, 76, 90000),
+                                  ("OV-1014", "OV-BEAM", "OV-STEEL", 70, 72, 54600), ("OV-1030", "OV-BEAM", "OV-ORE", 100, 9, 132600)])
+        # one line per sub-supplier and material, blended over Savera's parts: steel total 23,400 + 90,000 + 54,600 = 168,000 kg;
+        # JGI 113,400 kg -> 67.5%, rate (74 x 23,400 + 76 x 90,000) / 113,400 = 75.5873; TATA 54,600 -> 32.5% @72; XYZ ore 100% @9
+        blend = [(r["code"], r["material_code"], round(r["sob_percent"], 3), round(r["unit_price"], 4), r["requirement"], r["tier"], r["net_requirement"]) for r in view["sub_supplier_summary"]]
+        self.assertEqual(blend, [("OV-1004", "OV-STEEL", 67.5, 75.5873, 113400, "T2", 113400), ("OV-1014", "OV-STEEL", 32.5, 72, 54600, "T2", 54600), ("OV-1030", "OV-ORE", 100, 9, 132600, "T3", 132600)])
         # edit from that line: TATA steel SOB 50 (beam only); JGI 60 would make the beam 110% -> refused, nothing changed
         edit = lambda body: api.post(f"/api/planning/supplier-overview/{savera}/sub-supplier", json={"material_code": "ov-steel", **body})
         self.assertEqual(edit({"sub_supplier_id": tata, "sob_percent": 50}).json(), {"parts": 1})
@@ -635,6 +637,14 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual((beam_view["stock"], jgi_beam["stock"], jgi_beam["available"]), (7500, 5000, 5000))
         self.assertIn("Row 1: OV TATA is not a supplier of OV-ORE", api.post("/api/planning/supplier-source-stock/2026-11", json={"rows": [{"t1_supplier_code": "OV-1013", "part_code": "OV-BEAM", "material_code": "OV-ORE", "supplier_code": "OV-1014", "quantity": 1}]}).json()["detail"])
         self.assertIn("stock must be a number", api.post("/api/planning/supplier-source-stock/2026-11", json={"rows": [{"t1_supplier_code": "OV-1013", "quantity": "x"}]}).json()["detail"])
+        # stock typed on the blended line (JGI steel 2,000): one number for the material; the beam's 5,000 entry is replaced
+        # beam net 48,000 - 7,500 = 40,500 -> JGI 30% x 2 kg = 24,300 + top beam 90,000 = 114,300; net 114,300 - 2,000 = 112,300
+        api.post("/api/planning/supplier-source-stock/2026-11?workspace=trial", json={"rows": [{"t1_supplier_code": "OV-1013", "part_code": "OV-TOPB", "material_code": "OV-STEEL", "supplier_code": "OV-1004", "quantity": 1000}]})
+        self.assertEqual(next(r for r in api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()["sub_supplier_summary"] if r["code"] == "OV-1004")["stock"], 6000)  # 5,000 beam + 1,000 top beam
+        self.assertEqual(edit({"sub_supplier_id": jgi, "stock": 2000, "month": "2026-11"}).status_code, 200)
+        jgi_line = next(r for r in api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()["sub_supplier_summary"] if r["code"] == "OV-1004")
+        self.assertEqual((jgi_line["requirement"], jgi_line["stock"], jgi_line["net_requirement"]), (114300, 2000, 112300))
+        self.assertEqual(edit({"sub_supplier_id": jgi, "stock": -1, "month": "2026-11"}).status_code, 422)
         # no plan for the month: requirement 0; unknown supplier 404
         later = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-10"}).json()
         self.assertEqual((later["plan"], later["parts"][0]["part_requirement"], later["sub_suppliers"][0]["requirement"]), (None, 0, 0))

@@ -5441,6 +5441,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         "lead_time_days": link.lead_time_days, "price_status": _price_status(link, _month_text(date.today())),
                         "stock": held.quantity if held else None, "available": held.available_quantity if held else None,
                         "part_requirement": part_need, "supplier_requirement": share, "lines": []}
+                net = max(0.0, share - (held.quantity if held else 0.0))  # what is left to make after the FG stock
+                part["net_requirement"] = net
                 if can_price:
                     part.update(unit_price=link.unit_price, currency=link.currency)
                 view = supplier_bom_view(db, supplier_id, item.id, can_price)
@@ -5449,7 +5451,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     per_piece = line["quantity"] * (per_unit.get(line["parent_line_id"], 1.0) if line["parent_line_id"] else 1.0)
                     per_unit[line["id"]] = per_piece
                     component = line["component"]
-                    need = share * per_piece
+                    need = net * per_piece  # the BOM is needed for what is still to be made
                     entry = {"id": line["id"], "depth": line["depth"], "parent_line_id": line["parent_line_id"], "code": component["code"], "name": component["name"],
                              "origin": component["origin"], "uom": component["uom"], "bom_qty": line["quantity"], "per_part": per_piece, "requirement": need, "sources": []}
                     for src in line["sources"]:
@@ -5494,6 +5496,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                     weight = sum(need for _, need, _ in rates)
                     line["unit_price"] = round(sum(price * need for price, need, _ in rates) / weight, 4) if weight else round(sum(price for price, _, _ in rates) / len(rates), 4)
                     line["currency"] = rates[0][2] if len({currency for _, _, currency in rates}) == 1 else "mixed"
+                line["net_requirement"] = max(0.0, line["requirement"] - (line["stock"] or 0.0))
                 summary.append(line)
             return {"supplier": {"id": supplier.id, "code": supplier.code, "name": supplier.name, "category": supplier.category, "tiers": _tier_list(supplier.tiers)},
                     "month": month, "workspace": workspace,
@@ -5508,8 +5511,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         _check_supply_role(request)
         sub_id, code = payload.get("sub_supplier_id"), str(payload.get("material_code") or "").strip()
         sob, price = payload.get("sob_percent"), payload.get("unit_price")
-        if sob is None and price is None:
-            raise HTTPException(status_code=422, detail="Give the SOB or the rate")
+        stock = payload.get("stock")
+        if sob is None and price is None and stock in (None, ""):
+            raise HTTPException(status_code=422, detail="Give the SOB, the rate or the stock")
         try:
             sob = None if sob in (None, "") else float(sob)
             price = None if price in (None, "") else float(price)
@@ -5517,6 +5521,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             raise HTTPException(status_code=422, detail="SOB and rate must be numbers") from exc
         if sob is not None and not 0 < sob <= 100:
             raise HTTPException(status_code=422, detail="SOB must be more than 0 and at most 100")
+        try:
+            stock = None if stock in (None, "") else float(stock)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Stock must be a number") from exc
+        if stock is not None and (stock < 0 or not math.isfinite(stock)):
+            raise HTTPException(status_code=422, detail="Stock must be zero or more")
+        workspace = str(payload.get("workspace") or "trial")
+        _validate_workspace(workspace)
+        stock_month = _month_text(_month(payload.get("month") or _month_text(date.today())))
         if price is not None and (price < 0 or not math.isfinite(price)):
             raise HTTPException(status_code=422, detail="Rate must be zero or more")
         if price is not None and not _check_price_access(request):
@@ -5540,6 +5553,19 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 if price is not None and price != source.unit_price:
                     source.unit_price = price
                     source.price_updated_month = month
+            if stock is not None:
+                # one stock per sub-supplier and material for this supplier: kept on the first part (by code) that uses
+                # it; other parts' entries of the month are cleared so the total is what was typed
+                products = sorted({line.product_material_id for _, line in rows}, key=lambda pid: (db.get(Item, pid).code.casefold() if db.get(Item, pid) else ""))
+                same = (SupplierSourceStock.workspace == workspace, SupplierSourceStock.report_month == stock_month, SupplierSourceStock.t1_supplier_id == supplier_id,
+                        SupplierSourceStock.sub_supplier_id == sub_id, func.lower(SupplierSourceStock.material_code) == code.casefold())
+                db.execute(delete(SupplierSourceStock).where(*same, SupplierSourceStock.product_material_id != products[0]))
+                held = db.scalar(select(SupplierSourceStock).where(*same, SupplierSourceStock.product_material_id == products[0]))
+                if not held:
+                    held = SupplierSourceStock(workspace=workspace, report_month=stock_month, t1_supplier_id=supplier_id, product_material_id=products[0],
+                                               material_code=code, sub_supplier_id=sub_id)
+                    db.add(held)
+                held.quantity = held.available_quantity = stock
             db.commit()
             return {"parts": len(rows)}
 

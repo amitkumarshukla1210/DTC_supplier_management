@@ -1449,15 +1449,15 @@ async function loadSupplierOverview() {
   const qty = (value) => (value === null || value === undefined ? "" : number(value));
   const rate = (item) => (priced && item.unit_price !== undefined ? money(item.unit_price, item.currency) : "Restricted");
   const stockBox = (attrs, value) => `<input class="form-control ov-stock" type="number" min="0" step="any" ${attrs} value="${value ?? ""}" placeholder="0" title="Type the stock and press Enter" />`;
-  const partRows = data.parts.map((part) => `<tr><td>${esc(part.code)}</td><td>${esc(part.name)}</td><td>${number(part.sob_percent, 1)}%</td><td>${rate(part)}</td><td>${stockBox(`data-stock-link="${part.link_id}"`, part.stock)}</td><td>${number(part.supplier_requirement)}</td><td>${esc(part.uom || "")}</td><td>${number(part.lead_time_days, 0)} days</td><td><button class="text-button" data-open-coverage="${part.link_id}">BOM & sub-suppliers</button></td></tr>`).join("");
-  $("#ovParts").innerHTML = table(["Part code", "Part name", "SOB", "Unit price", "FG stock", `${data.supplier.name}'s requirement (SOB)`, "Unit", "Lead time", "Action"], partRows, `${data.supplier.name} supplies no part yet: Edit parts.`);
+  const partRows = data.parts.map((part) => `<tr><td>${esc(part.code)}</td><td>${esc(part.name)}</td><td>${number(part.sob_percent, 1)}%</td><td>${rate(part)}</td><td>${number(part.supplier_requirement)}</td><td>${stockBox(`data-stock-link="${part.link_id}"`, part.stock)}</td><td><strong>${number(part.net_requirement)}</strong></td><td>${esc(part.uom || "")}</td><td>${number(part.lead_time_days, 0)} days</td><td><button class="text-button" data-open-coverage="${part.link_id}">BOM & sub-suppliers</button></td></tr>`).join("");
+  $("#ovParts").innerHTML = table(["Part code", "Part name", "SOB", "Unit price", `${data.supplier.name}'s requirement (SOB)`, "FG stock", "Net requirement", "Unit", "Lead time", "Action"], partRows, `${data.supplier.name} supplies no part yet: Edit parts.`);
   // one line per sub-supplier and material, blended over the parts; SOB and rate can be changed here
   const subRows = data.sub_supplier_summary.map((row) => {
     const detail = row.parts.map((part) => `${part.part_code}: ${number(part.sob_percent, 1)}%, ${number(part.requirement)} ${row.uom || ""}`).join("\n");
     const rateCell = priced && row.unit_price !== undefined ? `<input class="form-control ov-input" type="number" min="0" step="0.0001" data-ov-f="unit_price" value="${row.unit_price}" />${row.currency && row.currency !== "mixed" ? ` <small class="subtle">${esc(row.currency)}</small>` : ""}` : "Restricted";
-    return `<tr data-ov-sub="${row.sub_supplier_id}" data-ov-material="${esc(row.material_code)}" title="${esc(detail)}"><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.tier)}</td><td>${esc(row.material_code)}</td><td>${esc(row.material_name)}</td><td><input class="form-control ov-input" type="number" min="0.01" max="100" step="0.01" data-ov-f="sob_percent" value="${Number(row.sob_percent.toFixed(2))}" />%</td><td>${rateCell}</td><td>${number(row.requirement)}</td><td>${qty(row.stock)}</td><td>${esc(row.uom || "")}</td><td><button type="button" class="text-button" data-ov-save>Save</button></td></tr>`;
+    return `<tr data-ov-sub="${row.sub_supplier_id}" data-ov-material="${esc(row.material_code)}" title="${esc(detail)}"><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.tier)}</td><td>${esc(row.material_code)}</td><td>${esc(row.material_name)}</td><td><input class="form-control ov-input" type="number" min="0.01" max="100" step="0.01" data-ov-f="sob_percent" value="${Number(row.sob_percent.toFixed(2))}" />%</td><td>${rateCell}</td><td>${number(row.requirement)}</td><td><input class="form-control ov-stock" type="number" min="0" step="any" data-stock-blend value="${row.stock ?? ""}" placeholder="0" title="Type the stock and press Enter" /></td><td><strong>${number(row.net_requirement)}</strong></td><td>${esc(row.uom || "")}</td><td><button type="button" class="text-button" data-ov-save>Save</button></td></tr>`;
   }).join("");
-  $("#ovSubs").innerHTML = table(["Sub-supplier code", "Sub-supplier name", "Tier", "Material code", "Material name", "Blended SOB", "Rate", "Blended requirement", "Stock", "Unit", "Action"], subRows, "No sub-suppliers yet: add them in each part's BOM & sub-suppliers.");
+  $("#ovSubs").innerHTML = table(["Sub-supplier code", "Sub-supplier name", "Tier", "Material code", "Material name", "Blended SOB", "Rate", "Blended requirement", "Stock", "Net requirement", "Unit", "Action"], subRows, "No sub-suppliers yet: add them in each part's BOM & sub-suppliers.");
   $("#ovSubs").querySelectorAll("[data-ov-save]").forEach((button) => button.addEventListener("click", async () => {
     const tr = button.closest("tr");
     const row = data.sub_supplier_summary.find((item) => String(item.sub_supplier_id) === tr.dataset.ovSub && item.material_code === tr.dataset.ovMaterial);
@@ -1483,22 +1483,21 @@ function renderOverviewTree(open = true) {
   if (!data || !target) return;
   const priced = canSeePrices();
   const rate = (item) => (priced && item.unit_price !== undefined ? money(item.unit_price, item.currency) : "Restricted");
-  const stockBox = (attrs, value) => `<input class="form-control ov-stock" type="number" min="0" step="any" ${attrs} value="${value ?? ""}" placeholder="0" title="Type the stock and press Enter" />`;
   const toggle = (has) => (has ? `<button type="button" class="tree-toggle" data-sb-toggle aria-expanded="${open}">${open ? "−" : "+"}</button>` : "");
   const html = [];
   data.parts.forEach((part) => {
-    html.push(`<tr class="tree-has-children st-part" data-tree-depth="0"><td class="tree-toggle-cell">${toggle(part.lines.length)}</td><td>T1 part</td><td>${esc(part.code)}</td><td>${esc(part.name)}</td><td>${esc(data.supplier.code)}</td><td>${esc(data.supplier.name)}</td><td>${number(part.sob_percent, 1)}%</td><td></td><td>1</td><td>${esc(part.uom || "")}</td><td>${number(part.supplier_requirement)}</td><td>${rate(part)}</td><td>${stockBox(`data-stock-link="${part.link_id}"`, part.stock)}</td></tr>`);
+    html.push(`<tr class="tree-has-children st-part" data-tree-depth="0"><td class="tree-toggle-cell">${toggle(part.lines.length)}</td><td>T1 part</td><td>${esc(part.code)}</td><td>${esc(part.name)}</td><td>${esc(data.supplier.code)}</td><td>${esc(data.supplier.name)}</td><td>${number(part.sob_percent, 1)}%</td><td></td><td>1</td><td>${esc(part.uom || "")}</td><td>${number(part.net_requirement)}</td><td>${rate(part)}</td></tr>`);
     part.lines.forEach((line, index) => {
       const hidden = open ? "" : "hidden";
       const next = part.lines[index + 1];
       const hasKids = line.sources.length || (next && next.depth > line.depth);
-      html.push(`<tr class="st-line" data-tree-depth="${line.depth}" ${hidden}><td class="tree-toggle-cell">${toggle(hasKids)}</td><td>L${line.depth} BOM</td><td>${esc(line.code)}</td><td>${esc(line.name)}</td><td></td><td></td><td>${line.sources.length ? `${number(line.sources.reduce((sum, src) => sum + Number(src.sob_percent || 0), 0), 1)}%` : "No supplier"}</td><td>${number(line.bom_qty, 4)}</td><td>${number(line.per_part, 4)}</td><td>${esc(line.uom || "")}</td><td>${number(line.requirement)}</td><td></td><td></td></tr>`);
+      html.push(`<tr class="st-line" data-tree-depth="${line.depth}" ${hidden}><td class="tree-toggle-cell">${toggle(hasKids)}</td><td>L${line.depth} BOM</td><td>${esc(line.code)}</td><td>${esc(line.name)}</td><td></td><td></td><td>${line.sources.length ? `${number(line.sources.reduce((sum, src) => sum + Number(src.sob_percent || 0), 0), 1)}%` : "No supplier"}</td><td>${number(line.bom_qty, 4)}</td><td>${number(line.per_part, 4)}</td><td>${esc(line.uom || "")}</td><td>${number(line.requirement)}</td><td></td></tr>`);
       line.sources.forEach((src) => {
-        html.push(`<tr class="tree-alternate st-source" data-tree-depth="${line.depth + 1}" ${hidden}><td class="tree-toggle-cell"></td><td>${esc(src.tier)} supplier</td><td>↳ ${esc(line.code)}</td><td>${esc(line.name)}</td><td>${esc(src.code)}</td><td>${esc(src.name)}</td><td>${number(src.sob_percent, 1)}%</td><td></td><td>${number(line.per_part * src.sob_percent / 100, 4)}</td><td>${esc(line.uom || "")}</td><td>${number(src.requirement)}</td><td>${rate(src)}</td><td>${stockBox(`data-stock-part="${esc(part.code)}" data-stock-material="${esc(line.code)}" data-stock-supplier="${esc(src.code)}"`, src.stock)}</td></tr>`);
+        html.push(`<tr class="tree-alternate st-source" data-tree-depth="${line.depth + 1}" ${hidden}><td class="tree-toggle-cell"></td><td>${esc(src.tier)} supplier</td><td>↳ ${esc(line.code)}</td><td>${esc(line.name)}</td><td>${esc(src.code)}</td><td>${esc(src.name)}</td><td>${number(src.sob_percent, 1)}%</td><td></td><td>${number(line.per_part * src.sob_percent / 100, 4)}</td><td>${esc(line.uom || "")}</td><td>${number(src.requirement)}</td><td>${rate(src)}</td></tr>`);
       });
     });
   });
-  target.innerHTML = table(["", "Level", "Part / material code", "Part / material name", "Supplier code", "Supplier name", "SOB", "BOM qty", "Qty per part", "Unit", "Requirement", "Rate", "Stock"], html.join(""), "No parts yet.");
+  target.innerHTML = table(["", "Level", "Part / material code", "Part / material name", "Supplier code", "Supplier name", "SOB", "BOM qty", "Qty per part", "Unit", "Requirement (net)", "Rate"], html.join(""), "No parts yet.");
 }
 
 function coverageLine(id) { return state.coverage.lines.find((line) => String(line.id) === String(id)); }
@@ -2290,10 +2289,10 @@ async function renderSupplierControl() {
         <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Month</span><input class="form-control" type="month" id="ovMonth" value="${state.overviewMonth || monthNow()}" /></label><span class="subtle" id="ovPlan"></span></div><span class="toolbar-add"><button type="button" class="button button-small" id="ovEditParts">Edit parts</button></span></div>
         <h3 class="subtable-heading">1. Parts supplied: SOB, rate, FG stock and requirement</h3>
         <div id="ovParts"><div class="tree-loading">Loading…</div></div>
-        <h3 class="subtable-heading">2–3. Part BOM and sub-supplier SOB, rate and requirement</h3>
+        <h3 class="subtable-heading">2–3. Part BOM and sub-supplier SOB, rate and requirement (from the net requirement)</h3>
         <div class="table-toolbar"><span class="toolbar-add"><button type="button" class="button button-small" id="ovOpenAll">Open all</button><button type="button" class="button button-small" id="ovCloseAll">Close all</button></span></div>
         <div id="ovTree"></div>
-        <h3 class="subtable-heading">4–6. Sub-supplier list: one line per sub-supplier and material (blended over the parts); change SOB or rate and Save</h3>
+        <h3 class="subtable-heading">4–6. Sub-supplier list: one line per sub-supplier and material (blended over the parts); change SOB or rate and Save; type the stock and press Enter</h3>
         <div id="ovSubs"></div>
       </section>`;
   } else if (tab === "Supplier register") {
@@ -3640,6 +3639,9 @@ document.addEventListener("change", async (event) => {
   try {
     if (box.dataset.stockLink) {
       await api(`/api/planning/supplier-stock/${month}?workspace=${state.workspace || "trial"}`, { method: "POST", body: JSON.stringify({ rows: [{ supplier_part_id: Number(box.dataset.stockLink), quantity }] }) });
+    } else if (box.hasAttribute("data-stock-blend")) {
+      const tr = box.closest("tr");
+      await api(`/api/planning/supplier-overview/${supplier.id}/sub-supplier`, { method: "POST", body: JSON.stringify({ sub_supplier_id: Number(tr.dataset.ovSub), material_code: tr.dataset.ovMaterial, stock: quantity, month, workspace: state.workspace || "trial" }) });
     } else {
       await api(`/api/planning/supplier-source-stock/${month}?workspace=${state.workspace || "trial"}`, { method: "POST", body: JSON.stringify({ rows: [{ t1_supplier_code: supplier.code, part_code: box.dataset.stockPart, material_code: box.dataset.stockMaterial, supplier_code: box.dataset.stockSupplier, quantity }] }) });
     }
