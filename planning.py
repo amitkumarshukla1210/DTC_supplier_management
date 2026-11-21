@@ -5509,6 +5509,12 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         part of the supplier where it supplies that material. All parts or none (SOB per part at most 100%)."""
         current_user(request)
         _check_supply_role(request)
+        with open_db() as db:
+            parts = apply_sub_supplier_edit(db, supplier_id, payload, request)
+            db.commit()
+            return {"parts": parts}
+
+    def apply_sub_supplier_edit(db: Session, supplier_id: int, payload: dict, request: Request) -> int:
         sub_id, code = payload.get("sub_supplier_id"), str(payload.get("material_code") or "").strip()
         sob, price = payload.get("sob_percent"), payload.get("unit_price")
         stock = payload.get("stock")
@@ -5534,7 +5540,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             raise HTTPException(status_code=422, detail="Rate must be zero or more")
         if price is not None and not _check_price_access(request):
             raise HTTPException(status_code=403, detail="Price access is required to set a rate")
-        with open_db() as db:
+        if True:
             rows = db.execute(select(SupplierBOMLineSource, SupplierBOMLine).join(SupplierBOMLine, SupplierBOMLine.id == SupplierBOMLineSource.line_id)
                               .join(SupplierMaterial, SupplierMaterial.id == SupplierBOMLine.supplier_material_id)
                               .where(SupplierBOMLine.supplier_id == supplier_id, SupplierBOMLineSource.sub_supplier_id == sub_id,
@@ -5566,8 +5572,165 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                                material_code=code, sub_supplier_id=sub_id)
                     db.add(held)
                 held.quantity = held.available_quantity = stock
+            db.flush()
+            return len(rows)
+
+    PARTS_SHEET_COLUMNS = ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Unit price", "Currency", "Lead time", "MOQ", "Buffer days", "FG stock"]
+    RM_SHEET_COLUMNS = ["Sub-supplier Code", "Sub-supplier Name", "Tier", "Material code", "Material name", "Blended SOB", "Rate", "Currency", "Stock"]
+
+    @app.get("/api/planning/supplier-overview/{supplier_id}/template/{section}.xlsx")
+    def overview_template(supplier_id: int, section: str, request: Request, month: str = "", workspace: str = "trial"):
+        """Templates of the overview's three sections, filled with what is saved: parts (Material Master and FG stock),
+        bom (the supplier-wise BOM and sub-supplier workbook) and rm (RM Master: blended SOB, rate and stock)."""
+        if section == "bom":
+            return coverage_template(request, supplier_id)
+        if section not in {"parts", "rm"}:
+            raise HTTPException(status_code=404, detail="Template not found")
+        view = supplier_overview(supplier_id, request, month, workspace)
+        can_price = _check_price_access(request)
+        who = view["supplier"]
+        workbook = Workbook()
+        sheet = workbook.active
+        if section == "parts":
+            sheet.title = "Parts"
+            styled_sheet(sheet, f"{who['name']} · Parts supplied & Material Master · {view['month']}",
+                         f"One row per part. Change SOB, rate, lead time, MOQ, buffer or FG stock (stock of {view['month']}) and upload. A new part code becomes a new relationship. Blank cells keep what is saved.",
+                         PARTS_SHEET_COLUMNS)
+            with open_db() as db:
+                for part in view["parts"]:
+                    link = db.get(SupplierPart, part["link_id"])
+                    sheet.append([who["code"], who["name"], part["code"], part["name"], link.sob_percent, link.unit_price if can_price else None, link.currency,
+                                  link.lead_time_days, link.moq, link.buffer_days, part["stock"]])
+        else:
+            sheet.title = "RM Master"
+            styled_sheet(sheet, f"{who['name']} · RM Master · {view['month']}",
+                         f"One row per sub-supplier and material. Only changed values are applied: Blended SOB and Rate go to every part where it supplies that material; Stock is its stock of {view['month']}.",
+                         RM_SHEET_COLUMNS)
+            for line in view["sub_supplier_summary"]:
+                sheet.append([line["code"], line["name"], line["tier"], line["material_code"], line["material_name"], round(line["sob_percent"], 2),
+                              round(line["unit_price"], 4) if can_price and line.get("unit_price") is not None else None, line.get("currency") if can_price else None, line["stock"]])
+        return xlsx_response(workbook, f"{who['code']}-{section}-{view['month']}.xlsx")
+
+    @app.post("/api/planning/supplier-overview/{supplier_id}/upload/{section}", status_code=201)
+    async def overview_upload(supplier_id: int, section: str, request: Request, month: str = "", workspace: str = "trial"):
+        """Upload a section's template back: all rows or none."""
+        if section == "bom":
+            return await upload_coverage(request, supplier_id)
+        if section not in {"parts", "rm"}:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        stock_month = _month_text(_month(month)) if month else _month_text(date.today())
+        raw = await request.body()
+        can_price = _check_price_access(request)
+
+        def number(row: dict, key: str, label: str):
+            value = row.get(key)
+            if value is None or str(value).strip() == "":
+                return None
+            try:
+                result = float(str(value).strip().rstrip("%"))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"Row {row['_excel_row']}: {label} must be a number") from exc
+            if result < 0 or not math.isfinite(result):
+                raise HTTPException(status_code=422, detail=f"Row {row['_excel_row']}: {label} must be zero or more")
+            return result
+
+        with open_db() as db:
+            supplier = db.get(Supplier, supplier_id)
+            if not supplier:
+                raise HTTPException(status_code=404, detail="Supplier not found")
+            if section == "parts":
+                aliases = {"supplier_code": "supplier_code", "t1_part_code": "part_code", "part_code": "part_code", "material_code": "part_code", "sob": "sob", "sob_%": "sob",
+                           "unit_price": "unit_price", "price": "unit_price", "rate": "unit_price", "currency": "currency", "lead_time": "lead_time", "lead_time_days": "lead_time",
+                           "moq": "moq", "buffer_days": "buffer_days", "buffer": "buffer_days", "fg_stock": "fg_stock", "stock": "fg_stock"}
+                rows = _read_supplier_part_sheet(raw, aliases, {"part_code"})
+                items = {item.code.casefold(): item for item in db.scalars(select(Item)).all()}
+                saved = 0
+                for row in rows:
+                    where = f"Row {row['_excel_row']}: "
+                    if str(row.get("supplier_code") or "").strip() and str(row["supplier_code"]).strip().casefold() != supplier.code.casefold():
+                        raise HTTPException(status_code=422, detail=f"{where}supplier code {row['supplier_code']} is not {supplier.code}; this sheet is for {supplier.name}")
+                    code = str(row.get("part_code") or "").strip()
+                    if not code:
+                        continue
+                    item = items.get(code.casefold())
+                    if not item:
+                        raise HTTPException(status_code=422, detail=f"{where}{code} is not in the T1 Material Master")
+                    reason = not_purchased_reason(db, item.id)
+                    if reason:
+                        raise HTTPException(status_code=422, detail=f"{where}{item.code} {reason}, so it cannot have a supplier")
+                    link = db.scalar(select(SupplierPart).where(SupplierPart.supplier_id == supplier_id, SupplierPart.material_id == item.id, SupplierPart.tier == TOP_TIER))
+                    values = {"sob_percent": number(row, "sob", "SOB"), "unit_price": number(row, "unit_price", "Unit price"), "lead_time_days": number(row, "lead_time", "Lead time"),
+                              "moq": number(row, "moq", "MOQ"), "buffer_days": number(row, "buffer_days", "Buffer days")}
+                    currency = str(row.get("currency") or "").strip().upper()
+                    if currency and not re.fullmatch(r"[A-Z]{3}", currency):
+                        raise HTTPException(status_code=422, detail=f"{where}Currency must be a 3-letter code such as INR")
+                    if values["unit_price"] is not None and not can_price:
+                        raise HTTPException(status_code=403, detail="Price access is required to upload prices")
+                    if values["sob_percent"] is not None and values["sob_percent"] > 100:
+                        raise HTTPException(status_code=422, detail=f"{where}SOB cannot exceed 100")
+                    given = {key: (int(value) if key in ("lead_time_days", "buffer_days") else value) for key, value in values.items() if value is not None}
+                    if currency:
+                        given["currency"] = currency
+                    try:
+                        if link:
+                            current = {key: getattr(link, key) for key in ("material_id", "tier_material_id", "supplier_id", "tier", "parent_supplier_id", "parent_link_id", "sob_percent",
+                                                                             "lead_time_days", "moq", "buffer_days", "unit_price", "currency", "price_mode", "price_interval_months")}
+                            checked = check_supplier_part(db, {**current, **given}, request, exclude_id=link.id)
+                            price_changed = checked["unit_price"] != link.unit_price
+                            for key, value in checked.items():
+                                setattr(link, key, value)
+                            if price_changed:
+                                link.price_updated_month = _month_text(date.today())
+                        else:
+                            fresh = SupplierPartInput(material_id=item.id, supplier_id=supplier_id, **{key: value for key, value in given.items()}).model_dump()
+                            link = SupplierPart(**check_supplier_part(db, fresh, request))
+                            db.add(link)
+                            db.flush()
+                            tiers_from_links(db, link)
+                        stock = number(row, "fg_stock", "FG stock")
+                        if stock is not None:
+                            save_stock(db, workspace, stock_month, link, stock, None, None)
+                    except HTTPException as exc:
+                        raise HTTPException(status_code=exc.status_code, detail=f"{where}{exc.detail}") from exc
+                    db.flush()
+                    saved += 1
+                db.commit()
+                return {"rows": saved, "month": stock_month}
+            # RM Master: only changed values are applied
+            aliases = {"sub-supplier_code": "code", "sub_supplier_code": "code", "supplier_code": "code", "material_code": "material_code", "blended_sob": "sob", "sob": "sob",
+                       "rate": "rate", "unit_price": "rate", "stock": "stock"}
+            rows = _read_supplier_part_sheet(raw, aliases, {"code", "material_code"})
+            view = supplier_overview(supplier_id, request, stock_month, workspace)
+            current = {(line["code"].casefold(), line["material_code"].casefold()): line for line in view["sub_supplier_summary"]}
+            changed = 0
+            for row in rows:
+                where = f"Row {row['_excel_row']}: "
+                code, material = str(row.get("code") or "").strip(), str(row.get("material_code") or "").strip()
+                if not code and not material:
+                    continue
+                line = current.get((code.casefold(), material.casefold()))
+                if not line:
+                    raise HTTPException(status_code=422, detail=f"{where}{code} does not supply {material} in {supplier.name}'s BOMs; add it in Parts BOM & Sub Supplier Master first")
+                payload = {"sub_supplier_id": line["sub_supplier_id"], "material_code": line["material_code"], "month": stock_month, "workspace": workspace}
+                sob, rate, stock = number(row, "sob", "Blended SOB"), number(row, "rate", "Rate"), number(row, "stock", "Stock")
+                if sob is not None and abs(sob - line["sob_percent"]) > 0.005:
+                    payload["sob_percent"] = sob
+                if rate is not None and line.get("unit_price") is not None and abs(rate - line["unit_price"]) > 0.00005:
+                    payload["unit_price"] = rate
+                if stock is not None and abs(stock - (line["stock"] or 0)) > 1e-9 or (stock is not None and line["stock"] is None):
+                    payload["stock"] = stock
+                if len(payload) == 4:
+                    continue  # nothing changed on this row
+                try:
+                    apply_sub_supplier_edit(db, supplier_id, payload, request)
+                except HTTPException as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=f"{where}{exc.detail}") from exc
+                changed += 1
             db.commit()
-            return {"parts": len(rows)}
+            return {"rows": changed, "month": stock_month}
 
     @app.get("/api/planning/actuals/template.xlsx")
     def actual_template(request: Request, as_of: str = "", workspace: str = "trial"):

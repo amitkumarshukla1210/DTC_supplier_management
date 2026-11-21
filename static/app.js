@@ -1451,6 +1451,7 @@ async function loadSupplierOverview() {
   $("#ovHead1").textContent = `1. ${who} · Parts supplied & Material Master (Rate, SOB, Requirement & Stock)`;
   $("#ovHead2").textContent = `2. ${who} · Parts BOM (L2, L3) & Sub Supplier (T2, T3) Master (Qty, SOB)`;
   $("#ovHead3").textContent = `3. ${who} · RM Master (Blended SOB, Requirement, Rate & Stock)`;
+  document.querySelectorAll("[data-ov-template]").forEach((link) => { link.href = `/api/planning/supplier-overview/${data.supplier.id}/template/${link.dataset.ovTemplate}.xlsx?${new URLSearchParams({ month: data.month, workspace: state.workspace || "trial" })}`; });
   $("#ovPlan").textContent = data.plan ? `${monthLabel(data.month)} · plan ${data.plan.revision}${data.plan.release_date ? ` of ${ddmm(data.plan.release_date)}` : ""}` : `${monthLabel(data.month)} · no plan uploaded: requirement 0`;
   const qty = (value) => (value === null || value === undefined ? "" : number(value));
   const rate = (item) => (priced && item.unit_price !== undefined ? money(item.unit_price, item.currency) : "Restricted");
@@ -2293,12 +2294,12 @@ async function renderSupplierControl() {
     body = `<nav class="crumbs"><a href="#" data-close-overview>Supplier register</a> › <strong id="ovTitle">Supplier</strong></nav>
       <section class="panel table-panel">${panelHeader("Supplier overview", "The parts this supplier makes for you with SOB, rate, FG stock and requirement (from the plan in force for the month × each model's BOM × SOB); each part's BOM with its sub-suppliers' SOB, rate, requirement and stock; and the sub-supplier list. Change data in Supplier/material relationship (parts) and the part's coverage (BOM and sub-suppliers).")}
         <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Month</span><input class="form-control" type="month" id="ovMonth" value="${state.overviewMonth || monthNow()}" /></label><span class="subtle" id="ovPlan"></span></div><span class="toolbar-add"><button type="button" class="button button-small" id="ovEditParts">Edit parts</button></span></div>
-        <h3 class="subtable-heading" id="ovHead1">1. Parts supplied & Material Master (Rate, SOB, Requirement & Stock)</h3>
+        <h3 class="subtable-heading" id="ovHead1">1. Parts supplied & Material Master (Rate, SOB, Requirement & Stock)</h3><form class="inline-upload ov-upload" data-ov-upload="parts"><input class="form-control" type="file" name="workbook" accept=".xlsx" required /><button class="button button-small button-primary" type="submit">Upload</button><a class="button button-small" data-ov-template="parts" href="#">Download template</a></form>
         <div id="ovParts"><div class="tree-loading">Loading…</div></div>
-        <h3 class="subtable-heading" id="ovHead2">2. Parts BOM (L2, L3) & Sub Supplier (T2, T3) Master (Qty, SOB)</h3>
+        <h3 class="subtable-heading" id="ovHead2">2. Parts BOM (L2, L3) & Sub Supplier (T2, T3) Master (Qty, SOB)</h3><form class="inline-upload ov-upload" data-ov-upload="bom"><input class="form-control" type="file" name="workbook" accept=".xlsx" required /><button class="button button-small button-primary" type="submit">Upload</button><a class="button button-small" data-ov-template="bom" href="#">Download template</a></form>
         <div class="table-toolbar"><span class="toolbar-add"><button type="button" class="button button-small" id="ovOpenAll">Open all</button><button type="button" class="button button-small" id="ovCloseAll">Close all</button></span></div>
         <div id="ovTree"></div>
-        <h3 class="subtable-heading" id="ovHead3">3. RM Master (Blended SOB, Requirement, Rate & Stock)</h3>
+        <h3 class="subtable-heading" id="ovHead3">3. RM Master (Blended SOB, Requirement, Rate & Stock)</h3><form class="inline-upload ov-upload" data-ov-upload="rm"><input class="form-control" type="file" name="workbook" accept=".xlsx" required /><button class="button button-small button-primary" type="submit">Upload</button><a class="button button-small" data-ov-template="rm" href="#">Download template</a></form>
         <div id="ovSubs"></div>
       </section>`;
   } else if (tab === "Supplier register") {
@@ -2497,6 +2498,18 @@ async function renderSupplierControl() {
     await loadSupplierOverview();
     $("#ovMonth").addEventListener("change", (event) => { state.overviewMonth = event.target.value; loadSupplierOverview(); });
     $("#ovEditParts").addEventListener("click", () => { state.supplierTab = "Supplier/material relationship"; state.relSupplierId = state.overviewSupplierId; state.coverageLinkId = null; renderSupplierControl(); });
+    document.querySelectorAll("[data-ov-upload]").forEach((form) => form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const section = form.dataset.ovUpload;
+      const { supplier, month } = state.overview;
+      if (section === "bom" && !window.confirm(`Replace the BOM and sub-suppliers of every ${supplier.name} part in the file?`)) return;
+      try {
+        const result = await uploadExcel(`/api/planning/supplier-overview/${supplier.id}/upload/${section}?${new URLSearchParams({ month, workspace: state.workspace || "trial" })}`, new FormData(form).get("workbook"));
+        form.reset();
+        await loadSupplierOverview();
+        toast(section === "bom" ? `${result.parts} part${result.parts === 1 ? "" : "s"}: ${result.lines} material lines, ${result.suppliers} sub-supplier rows saved` : `${result.rows} row${result.rows === 1 ? "" : "s"} saved for ${monthLabel(result.month)}`);
+      } catch (error) { toast(error.message, true); }
+    }));
     $("#ovOpenAll").addEventListener("click", () => renderOverviewTree(true));
     $("#ovCloseAll").addEventListener("click", () => renderOverviewTree(false));
     return;

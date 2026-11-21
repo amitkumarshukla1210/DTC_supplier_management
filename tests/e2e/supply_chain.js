@@ -236,6 +236,23 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   check("T2 stock typed in the sub-supplier list is saved", true);
   const stockList = (await api("GET", `/api/planning/supplier-stock/${new Date().toISOString().slice(0, 7)}?workspace=trial`)).items.map((r) => [r.supplier_code, r.material_code, r.quantity]);
   check("Both are in the month's stock list (Upload supplier stock)", JSON.stringify(stockList.filter((r) => r[1] === "UF220BFB010" || r[0] === "SUP-2014")) === JSON.stringify([["SUP-2013", "UF220BFB010", 9000], ["SUP-2014", "FL001STEEL0.7", 3000]]), JSON.stringify(stockList));
+  // a template and an upload for each of the three sections
+  const tplLinks = await page.locator("[data-ov-template]").evaluateAll((links) => links.map((a) => a.getAttribute("href").split("?")[0].split("/").slice(-1)[0]));
+  check("Three sections, three templates: parts, bom, rm", JSON.stringify(tplLinks) === JSON.stringify(["parts.xlsx", "bom.xlsx", "rm.xlsx"]), JSON.stringify(tplLinks));
+  const partsFile = require("path").join(require("os").tmpdir(), `parts-${Date.now()}.xlsx`);
+  require("fs").writeFileSync(partsFile, await (await page.request.get(BASE + await page.getAttribute('[data-ov-template="parts"]', "href"))).body());
+  const py = require("child_process").spawnSync(process.env.PYTHON || require("path").join(__dirname, "..", "..", ".venv", "bin", "python"), ["-c", `import sys, openpyxl
+wb = openpyxl.load_workbook(sys.argv[1]); ws = wb.active
+print("ROW", [c.value for c in ws[4]])
+ws.cell(4, 11).value = 9500
+wb.save(sys.argv[1])`, partsFile]);
+  check("Parts template filled with the saved row (FG stock 9,000)", String(py.stdout).includes("'UF220BFB010', 'Base Front Beam', 60") && String(py.stdout).includes("9000"), String(py.stdout) + String(py.stderr));
+  await page.setInputFiles('[data-ov-upload="parts"] input[type="file"]', partsFile);
+  await clearToast();
+  await page.click('[data-ov-upload="parts"] button[type="submit"]');
+  await waitToast("1 row saved");
+  await page.waitForFunction(() => document.querySelector("#ovParts input.ov-stock")?.value === "9500");
+  check("Parts template uploaded: FG stock 9,500", true);
   await page.click("#ovEditParts");
   await page.waitForSelector("#relListTable tbody tr");
   check("Breadcrumb goes back to Savera's relationships", (await page.locator("#relListTable tbody tr").count()) === 1);

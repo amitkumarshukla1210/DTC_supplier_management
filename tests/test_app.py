@@ -645,6 +645,50 @@ class SupplierHubApiTests(unittest.TestCase):
         jgi_line = next(r for r in api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()["sub_supplier_summary"] if r["code"] == "OV-1004")
         self.assertEqual((jgi_line["requirement"], jgi_line["stock"], jgi_line["net_requirement"]), (114300, 2000, 112300))
         self.assertEqual(edit({"sub_supplier_id": jgi, "stock": -1, "month": "2026-11"}).status_code, 422)
+        # templates and uploads of the three sections
+        xlsx_type = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        def load(section):
+            return load_workbook(io.BytesIO(api.get(f"/api/planning/supplier-overview/{savera}/template/{section}.xlsx", params={"month": "2026-11"}).content))
+        def send(section, book):
+            content = io.BytesIO()
+            book.save(content)
+            return api.post(f"/api/planning/supplier-overview/{savera}/upload/{section}?month=2026-11&workspace=trial", content=content.getvalue(), headers=xlsx_type)
+        # 1. parts: filled with what is saved; change the beam's SOB and FG stock, add a new part
+        mat("OV-BRKT", "Bracket", "Nos")
+        parts_book = load("parts")
+        sheet = parts_book.active
+        self.assertEqual([c.value for c in sheet[3]], ["Supplier Code", "Supplier Name", "T1 Part Code", "T1 Part Name", "SOB", "Unit price", "Currency", "Lead time", "MOQ", "Buffer days", "FG stock"])
+        self.assertEqual([[c.value for c in row][:5] + [row[10].value] for row in sheet.iter_rows(min_row=4)], [["OV-1013", "OV Savera", "OV-BEAM", "Base Front Beam", 60, 7500], ["OV-1013", "OV Savera", "OV-TOPB", "Top Beam", 100, None]])
+        sheet.cell(4, 5).value, sheet.cell(4, 11).value = 55, 6000
+        sheet.append(["OV-1013", "OV Savera", "OV-BRKT", "Bracket", 100, 12, "INR", 7, 50, 3, 400])
+        up = send("parts", parts_book)
+        self.assertEqual((up.status_code, up.json()["rows"]), (201, 3), up.text)
+        after_parts = {p["code"]: p for p in api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()["parts"]}
+        self.assertEqual((after_parts["OV-BEAM"]["sob_percent"], after_parts["OV-BEAM"]["stock"], after_parts["OV-BRKT"]["sob_percent"], after_parts["OV-BRKT"]["unit_price"], after_parts["OV-BRKT"]["stock"]), (55, 6000, 100, 12, 400))
+        sheet.cell(4, 5).value = 70  # 70 + Supangita's 40 > 100: refused, nothing saved
+        sheet.cell(5, 11).value = 1234
+        refused = send("parts", parts_book)
+        self.assertEqual(refused.status_code, 422)
+        self.assertIn("Row 4: Supplier SOB cannot exceed 100%", refused.json()["detail"])
+        self.assertIsNone(next(p for p in api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()["parts"] if p["code"] == "OV-TOPB")["stock"])
+        # 2. BOM & sub-supplier master: the supplier-wise BOM workbook
+        self.assertIn("Supplier/material coverage · OV-1013", load("bom").active["A1"].value)
+        # 3. RM Master: only changed values are applied (JGI rate 81 on both parts, TATA stock 4,000)
+        rm_book = load("rm")
+        sheet = rm_book.active
+        self.assertEqual([c.value for c in sheet[3]], ["Sub-supplier Code", "Sub-supplier Name", "Tier", "Material code", "Material name", "Blended SOB", "Rate", "Currency", "Stock"])
+        rm_rows = {(row[0].value, row[3].value): row[0].row for row in sheet.iter_rows(min_row=4)}
+        sheet.cell(rm_rows[("OV-1004", "OV-STEEL")], 7).value = 81
+        sheet.cell(rm_rows[("OV-1014", "OV-STEEL")], 9).value = 4000
+        up_rm = send("rm", rm_book)
+        self.assertEqual((up_rm.status_code, up_rm.json()["rows"]), (201, 2), up_rm.text)
+        final = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-11"}).json()
+        prices = {(r["code"], r["part_code"]): (r["sob_percent"], r["unit_price"]) for r in final["sub_suppliers"]}
+        self.assertEqual((prices[("OV-1004", "OV-BEAM")], prices[("OV-1004", "OV-TOPB")], prices[("OV-1014", "OV-BEAM")]), ((30, 81), (100, 81), (50, 72)))  # SOB unchanged
+        self.assertEqual(next(r for r in final["sub_supplier_summary"] if r["code"] == "OV-1014")["stock"], 4000)
+        sheet.cell(rm_rows[("OV-1004", "OV-STEEL")], 4).value = "OV-NOPE"
+        self.assertIn("does not supply OV-NOPE", send("rm", rm_book).json()["detail"])
+        self.assertEqual(api.get(f"/api/planning/supplier-overview/{savera}/template/other.xlsx").status_code, 404)
         # no plan for the month: requirement 0; unknown supplier 404
         later = api.get(f"/api/planning/supplier-overview/{savera}", params={"month": "2026-10"}).json()
         self.assertEqual((later["plan"], later["parts"][0]["part_requirement"], later["sub_suppliers"][0]["requirement"]), (None, 0, 0))
