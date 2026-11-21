@@ -15,6 +15,8 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.goto(BASE);
   await page.request.post(BASE + "/api/auth/setup", { data: { username: "admin", full_name: "Admin", password: "Secure-test-password-2026!" } });
   await page.goto(BASE);
+  const tabs = (await page.locator("nav .nav-link").allTextContents()).map((t) => t.trim());
+  check("Product Master comes before Plans & actuals", tabs.indexOf("Product Master") === tabs.indexOf("Plans & actuals") - 1 && tabs[0] === "Dashboard", JSON.stringify(tabs));
   await page.click('[data-page="suppliers"]');
   await page.waitForSelector("#supplierRegisterTable tbody tr");
   const rows = await page.locator("#supplierRegisterTable tbody tr:visible").count();
