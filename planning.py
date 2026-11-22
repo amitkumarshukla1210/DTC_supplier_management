@@ -5843,21 +5843,49 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 out.append({"month": month, "requirement": need, "net": net, "po": po, "order_by": _month_text(_plus_months(_month(month), -lead_months(lead_days))) if po else None})
             return out
 
-        # T1 rows (and each T1 part's net requirement, which drives T2 / T3)
-        t1_rows, t1_net = [], {}
-        stock = {row.supplier_part_id: row.quantity for row in db.scalars(select(SupplierStockSnapshot).where(
+        # T1: your PO to the T1 supplier. Per part: your opening stock (01st month) and open POs are used month by month;
+        # PO = requirement + buffer (buffer norm days x the month's daily requirement) - what you have left. The supplier's
+        # FG stock is its property and is not counted. Split by SOB, rounded up to each supplier's MOQ.
+        t1_rows, t1_balance = [], {}
+        fg_stock = {row.supplier_part_id: row.quantity for row in db.scalars(select(SupplierStockSnapshot).where(
             SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == start)).all()}
         open_po: dict[tuple[int, str], float] = {}
         for po in db.scalars(select(PlanningPO).where(PlanningPO.workspace == workspace, PlanningPO.status.in_(["Planned", "Issued", "Partially received"]),
                                                      PlanningPO.expected_month.in_(month_list))).all():
             open_po[(po.supplier_part_id, po.expected_month)] = open_po.get((po.supplier_part_id, po.expected_month), 0) + max(0, po.quantity_ordered - po.quantity_received)
+        links_by_item: dict[int, list[SupplierPart]] = {}
+        for link in links:
+            links_by_item.setdefault(link.material_id, []).append(link)
+        part_po: dict[int, list[float]] = {}
+        for item_id, item_links in links_by_item.items():
+            item = items[item_id]
+            available, orders = float(item.stock_on_hand or 0), []
+            for month in month_list:
+                available += sum(open_po.get((link.id, month), 0.0) for link in item_links)
+                need = demand_by_month[month].get(item_id, 0.0)
+                buffer = need / 30.4375 * (item.buffer_days or 0)
+                projected = available - need
+                order = max(0.0, buffer - projected)
+                orders.append(order)
+                available = projected + order
+            part_po[item_id] = orders
         for link in links:
             item, who = items[link.material_id], suppliers[link.supplier_id]
-            needs = [demand_by_month[m].get(item.id, 0.0) * (link.sob_percent or 0) / 100 for m in month_list]
-            plan = roll(needs, stock.get(link.id, 0.0), [open_po.get((link.id, m), 0.0) for m in month_list], link.moq, link.lead_time_days)
-            t1_net[link.id] = [cell["net"] for cell in plan]
+            share = (link.sob_percent or 0) / 100
+            plan, balance, fg_left = [], [], fg_stock.get(link.id, 0.0)
+            for index, month in enumerate(month_list):
+                net = part_po[item.id][index] * share
+                po = math.ceil(net / link.moq) * link.moq if net > 0 and link.moq and link.moq > 0 else net
+                plan.append({"month": month, "requirement": demand_by_month[month].get(item.id, 0.0) * share, "net": net, "po": po,
+                             "order_by": _month_text(_plus_months(_month(month), -lead_months(link.lead_time_days))) if po else None})
+                # the T1 supplier's balance demand (your PO - its FG stock), which drives its PO to T2 / T3
+                left = max(0.0, po - fg_left)
+                fg_left = max(0.0, fg_left - po)
+                balance.append(left)
+            t1_balance[link.id] = balance
             row = {"supplier_code": who.code, "supplier_name": who.name, "code": item.code, "name": item.name, "uom": item.uom, "for": "OEM",
-                   "sob_percent": link.sob_percent, "lead_time_days": link.lead_time_days, "moq": link.moq, "stock": stock.get(link.id), "months": plan}
+                   "sob_percent": link.sob_percent, "lead_time_days": link.lead_time_days, "moq": link.moq, "stock": item.stock_on_hand, "buffer_days": item.buffer_days,
+                   "supplier_fg_stock": fg_stock.get(link.id), "months": plan}
             if can_price:
                 row.update(unit_price=link.unit_price, currency=link.currency)
             t1_rows.append(row)
@@ -5884,7 +5912,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                                                         "code": component["code"], "name": component["name"], "uom": component["uom"], "t1_supplier_id": link.supplier_id,
                                                         "for": suppliers[link.supplier_id].name, "parts": [], "needs": [0.0] * months, "lead_time_days": 0, "moq": 0.0,
                                                         "_rates": []})
-                        share = [net * per_piece * src["sob_percent"] / 100 for net in t1_net[link.id]]
+                        share = [left * per_piece * src["sob_percent"] / 100 for left in t1_balance[link.id]]
                         group["needs"] = [a + b for a, b in zip(group["needs"], share)]
                         group["parts"].append({"part_code": part.code, "sob_percent": src["sob_percent"]})
                         group["lead_time_days"] = max(group["lead_time_days"], src["lead_time_days"] or 0)
@@ -5904,7 +5932,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 sobs = [part["sob_percent"] for part in group["parts"]]
                 group["sob_percent"] = round(sum(group["needs"]) * 100 / total, 4) if total else round(sum(sobs) / len(sobs), 4)
                 group["stock"] = source_stock.get(key)
-                group["months"] = roll(group.pop("needs"), group["stock"] or 0.0, [0.0] * months, group["moq"], group["lead_time_days"])
+                group["months"] = roll(group.pop("needs"), 0.0, [0.0] * months, group["moq"], group["lead_time_days"])  # its own stock is its property
                 rates = group.pop("_rates")
                 if can_price and rates:
                     weight = sum(need for _, need, _ in rates)
@@ -5936,9 +5964,10 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = f"{tier} planning"
-        fixed = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB %", "Lead time days", "MOQ", "Opening stock", "Unit"]
+        fixed = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB %", "Lead time days", "MOQ", "Opening Stock 01st Month" if tier == "T1" else "Sub-supplier stock (not deducted)", "Unit"]
         sheet.append([f"Design to Cost · {tier} Supplier part Planning · from {result['months'][0]}"])
-        sheet.append(["Requirement = plan in force x BOM x SOB (T2 / T3 from the T1 supplier's net requirement); stock is used month by month; suggested PO = net rounded up to MOQ, ordered lead time ahead."])
+        sheet.append(["T1: PO = requirement (plan x BOM) + buffer - your opening stock / open POs, month by month; the T1 supplier's FG stock is not counted. "
+                      "T2 / T3: demand (your PO) - T1 supplier's FG stock = balance demand x part BOM qty x SOB. Suggested PO rounded up to MOQ, ordered lead time ahead."])
         group = fixed + [cell for month in result["months"] for cell in (month, None, None)]
         sheet.append(group)
         sheet.append([None] * len(fixed) + [label for _ in result["months"] for label in ("Requirement", "Suggested PO", "Order by")])
@@ -6858,7 +6887,7 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             with open_db() as db:
                 materials = db.scalars(select(Item).order_by(Item.code)).all()
                 can_price = _check_price_access(request)
-                headers = ["Material code", "Material name", "Used in", "Category", "Unit", "On hand", "Buffer days"]
+                headers = ["Material code", "Material name", "Used in", "Category", "Unit", "Opening Stock 01st Month", "Buffer days"]
                 if can_price:
                     headers += ["Unit cost", "Currency"]
                 levels = bom_levels(db)

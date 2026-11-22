@@ -19,7 +19,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   };
   await page.goto(BASE);
   await api("POST", "/api/auth/setup", { username: "admin", full_name: "Admin", password: "Secure-test-password-2026!" });
-  const beam = (await api("POST", "/api/planning/materials", { code: "UF220BFB010", name: "Base Front Beam", uom: "Nos" })).id;
+  const beam = (await api("POST", "/api/planning/materials", { code: "UF220BFB010", name: "Base Front Beam", uom: "Nos", stock_on_hand: 10000, buffer_days: 15 })).id;
   const steel = (await api("POST", "/api/planning/tier-materials", { tier: "T2", code: "FL001STEEL0.7", name: "STEEL0.7", uom: "kg" })).id;
   const ore = (await api("POST", "/api/planning/tier-materials", { tier: "T3", code: "ORE-01", name: "Iron ore", uom: "kg" })).id;
   const product = (await api("POST", "/api/planning/products", { code: "FL", name: "Fans" })).id;
@@ -42,24 +42,26 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   await page.fill("#dpStart", "2026-11");
   await page.dispatchEvent("#dpStart", "change");
   await page.selectOption("#dpMonths", "3");
-  await page.waitForFunction(() => document.querySelectorAll("#dpTable thead th summary").length === 16);
+  await page.waitForFunction(() => document.querySelectorAll("#dpTable thead th summary").length === 18);
   const heads = await page.locator("#dpTable thead th summary").allTextContents();
-  check("Month columns: Requirement and Suggested PO", heads.slice(10).join("|") === "Nov-26 Requirement|Nov-26 Suggested PO|Dec-26 Requirement|Dec-26 Suggested PO|Jan-27 Requirement|Jan-27 Suggested PO", heads.join("|"));
+  check("T1 columns: Opening Stock 01st Month, Buffer norm, Supplier FG stock (not counted)", heads.slice(8, 11).join("|") === "Opening Stock 01st Month|Buffer norm|Supplier FG stock (not counted)", heads.join("|"));
+  check("Month columns: Requirement and Suggested PO", heads.slice(12).join("|") === "Nov-26 Requirement|Nov-26 Suggested PO|Dec-26 Requirement|Dec-26 Suggested PO|Jan-27 Requirement|Jan-27 Suggested PO", heads.join("|"));
   const t1 = await page.locator("#dpTable tbody tr").first().locator("td").allTextContents();
-  // Nov 36,000 - FG 9,000 = 27,000 -> PO 30,000 (MOQ 5,000) by Sep-26; Dec 18,000 -> 20,000 by Oct-26; Jan no plan
-  check("T1 Savera beam: Nov 36,000 -> PO 30,000 by Sep-26; Dec 18,000 -> 20,000 by Oct-26", t1[0] === "SUP-2013" && t1[4] === "OEM" && t1[8] === "9,000" && t1[10] === "36,000" && t1[11] === "30,000by Sep-26" && t1[12] === "18,000" && t1[13] === "20,000by Oct-26" && t1[15] === "—", JSON.stringify(t1));
+  // your PO (Savera's FG 9,000 NOT counted): Nov need 60,000 + buffer 60,000/30.4375x15 = 29,568 - opening 10,000 = 79,568 x 60% = 47,740.8 -> 50,000 (MOQ 5,000) by Sep-26;
+  // Dec 30,000 + 14,784 - 29,568 left = 15,216 x 60% = 9,129.6 -> 10,000 by Oct-26; Jan no plan
+  check("T1 Savera beam: Nov 36,000 -> PO 50,000 by Sep-26; Dec 18,000 -> 10,000 by Oct-26", t1[0] === "SUP-2013" && t1[4] === "OEM" && t1[8] === "10,000" && t1[9] === "15 days" && t1[10] === "9,000" && t1[12] === "36,000" && t1[13] === "50,000by Sep-26" && t1[14] === "18,000" && t1[15] === "10,000by Oct-26" && t1[17] === "—", JSON.stringify(t1));
   check("T1 tab keeps the PO issue and register", await page.locator("#poForm").isVisible() && await page.locator("#poTable").isVisible());
   check("Excel download follows the tab and months", /demand-plan\.xlsx\?tier=T1&start_month=2026-11&months=3/.test(await page.getAttribute("#dpExcel", "href")));
   await page.click('[data-dp-tab="T2"]');
   await page.waitForSelector("#dpTable tbody tr");
   const t2 = await page.locator("#dpTable tbody tr").evaluateAll((trs) => trs.map((tr) => [tr.cells[0].textContent, tr.cells[2].textContent, tr.cells[4].textContent, tr.cells[10].textContent, tr.cells[11].textContent]));
-  // from Savera's net 27,000 x 2 kg: JGI 30% = 16,200 -> PO 20,000 (MOQ 10,000) by Oct-26; TATA 70% = 37,800
-  check("T2: JGI 16,200 kg -> PO 20,000 by Oct-26; TATA 37,800 kg, for Savera", JSON.stringify(t2) === JSON.stringify([["SUP-2004", "FL001STEEL0.7", "Savera", "16,200", "20,000by Oct-26"], ["SUP-2014", "FL001STEEL0.7", "Savera", "37,800", "37,800by Nov-26"]]), JSON.stringify(t2));
+  // Savera's balance demand = your PO 50,000 - its FG 9,000 = 41,000 x 2 kg: JGI 30% = 24,600 -> PO 30,000 (MOQ 10,000) by Oct-26; TATA 70% = 57,400
+  check("T2: JGI 24,600 kg -> PO 30,000 by Oct-26; TATA 57,400 kg, for Savera", JSON.stringify(t2) === JSON.stringify([["SUP-2004", "FL001STEEL0.7", "Savera", "24,600", "30,000by Oct-26"], ["SUP-2014", "FL001STEEL0.7", "Savera", "57,400", "57,400by Nov-26"]]), JSON.stringify(t2));
   check("T2 tab has no PO form", (await page.locator("#poForm").count()) === 0);
   await page.click('[data-dp-tab="T3"]');
   await page.waitForSelector("#dpTable tbody tr");
   const t3 = await page.locator("#dpTable tbody tr").first().locator("td").allTextContents();
-  check("T3: XYZ ore 27,000 x 3.4 = 91,800 kg", t3[0] === "SUP-2030" && t3[2] === "ORE-01" && t3[10] === "91,800", JSON.stringify(t3));
+  check("T3: XYZ ore 41,000 x 3.4 = 139,400 kg", t3[0] === "SUP-2030" && t3[2] === "ORE-01" && t3[10] === "139,400", JSON.stringify(t3));
   await page.fill("#dpSearch", "nothing");
   await page.waitForFunction(() => document.querySelector("#dpTable")?.textContent.includes("Nothing matches"));
   check("Search filters the rows", true);

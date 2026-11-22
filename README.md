@@ -98,11 +98,12 @@ Tabs, in order: **Supplier register** (first), Supplier/material relationship, S
 ## Demand & PO Plan (was PO schedule)
 
 Three tabs, month-wise from a start month (3, 6 or 12 months), one row per supplier and part:
-- **T1 Supplier part Planning**: parts your T1 suppliers supply to you (OEM). Requirement = plan in force × model BOM × SOB.
-- **T2 Supplier part Planning**: materials T2 suppliers supply to each T1 supplier. Requirement = the T1 supplier's **net** requirement × part BOM qty × SOB (as on the Supplier overview).
-- **T3 Supplier part Planning**: materials T3 suppliers supply to the T2 suppliers (from the L2 BOM).
+- **T1 Supplier part Planning**: your PO to each T1 supplier, per part. PO = requirement (plan in force × model BOM) + buffer (**Buffer norm** days × the month's daily requirement) − what you have (**Opening Stock 01st Month** from the T1 Material Master, then what is left plus open POs arriving), month by month. The **T1 supplier's own FG stock is its property and is not counted**: you issue the PO and bring the parts. The PO is split by SOB and rounded up to MOQ, with **Order by** = month − lead time.
+  Example (PCB1): requirement 90,000, buffer norm 90 days, opening stock 60,000 → PO = 90,000 + 90,000 / 30.4375 × 90 − 60,000; the supplier's FG 20,000 does not reduce it.
+- **T2 Supplier part Planning**: what each T1 supplier orders from its T2 suppliers. **Demand** = your PO to the T1 supplier → less the T1 supplier's **opening FG stock** → **balance demand** → × part BOM qty (L2) × SOB = requirement. The T2 supplier's own stock is its property and is not deducted.
+- **T3 Supplier part Planning**: the same from the balance demand down the L3 BOM (materials T3 suppliers supply to T2 suppliers).
 
-The start month's stock (and open POs for T1) is used up month by month: Net = requirement − what is left; **Suggested PO** = net rounded up to MOQ, with **Order by** = month − lead time. Search, Download Excel. The PO issue and register stay on the T1 tab.
+Suggested PO = requirement rounded up to MOQ, Order by = month − lead time. Search, Download Excel. The PO issue and register stay on the T1 tab.
 
 ## Production plan (Plans & actuals)
 
