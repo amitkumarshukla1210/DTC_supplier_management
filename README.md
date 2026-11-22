@@ -103,7 +103,16 @@ Three tabs, month-wise from a start month (3, 6 or 12 months), one row per suppl
 - **T2 Supplier part Planning**: what each T1 supplier orders from its T2 suppliers. **Demand** = your PO to the T1 supplier → less the T1 supplier's **opening FG stock** → **balance demand** → × part BOM qty (L2) × SOB = requirement. The T2 supplier's own stock is its property and is not deducted.
 - **T3 Supplier part Planning**: the same from the balance demand down the L3 BOM (materials T3 suppliers supply to T2 suppliers).
 
-Suggested PO = requirement rounded up to MOQ, Order by = month − lead time. Search, Download Excel. The PO issue and register stay on the T1 tab.
+Each tab shows three blocks of months (default 12): **1 · Requirement**, **2 · PO demand** (rounded up to MOQ, with Order by = month − lead time) and **3 · Actual PO** (editable). Actual PO = the PO demand until you type the quantity you actually issue (e.g. demand 15,000, you issue 11,000 or 20,000) and press Enter; the later months' PO demand is re-planned from it (what arrives over or under the need carries to the next month). Clear the box and press Enter to go back to the PO demand. A T1 Actual PO also changes the T1 supplier's balance demand (T2 / T3). Search, Download Excel (Requirement | PO demand | Order by | Actual PO blocks). The PO issue and register stay on the T1 tab.
+
+## Shortage & excess → Rev. Change Impact
+
+Tabs **Shortage & excess report** | **Rev. Change Impact**, with sub-tabs **T1 Supplier / T2 Supplier / T3 Supplier**. Pick the **Old** and **New revision** (e.g. Nov Rev.02 vs Nov Rev.03; default: the two latest). From the new revision's month up to the last planned month:
+- Requirement by the old and new revision, Change and Change % (**big change** above the % you set, default 10 %).
+- POs **inside the lead time** (order by on or before the new revision's month) are already issued and stay fixed: the Actual PO you saved, else the old revision's PO demand. Later months are re-planned with the new revision.
+- Closing stock with the new requirement → **Shortage** (below 0), **Below buffer**, **OK** or **Over stock** (above the month's requirement + buffer norm), with the shortage / over stock quantity and month.
+- T2 / T3: the T1 supplier's demand follows your POs (fixed in your lead time) less its FG stock; its own POs inside the sub-supplier's lead time are fixed.
+- **Only changes & issues** (default) hides months with no big change and status OK. Download Excel.
 
 ## Production plan (Plans & actuals)
 

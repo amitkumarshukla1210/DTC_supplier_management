@@ -2756,6 +2756,12 @@ new MutationObserver(() => {
   });
 }).observe(content, { childList: true, subtree: true });
 
+// a multi-select filter (checkboxes with a search box) over one field of the report rows
+function filterSelector(title, key, values) {
+  const options = [...new Set(values.map((value) => String(value ?? "")).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  return `<details class="multi-filter"><summary>${esc(title)}</summary><div class="multi-popover"><input class="form-control multi-search" type="search" placeholder="Search ${esc(title.toLowerCase())}" /><div class="multi-options">${options.map((value) => `<label><input type="checkbox" data-filter-key="${esc(key)}" value="${esc(value)}" />${esc(value)}</label>`).join("") || '<span class="subtle">None</span>'}</div></div></details>`;
+}
+
 function reportRows(rows = state.report) {
   const checked = {};
   document.querySelectorAll("[data-filter-key]:checked").forEach((input) => {
@@ -2779,10 +2785,77 @@ function reportRows(rows = state.report) {
   </tr>`).join("");
 }
 
+// Shortage & excess page: the report, and the Rev. Change Impact (T1 / T2 / T3 Supplier sub-tabs)
+const IMPACT_TIERS = [["T1", "T1 Supplier"], ["T2", "T2 Supplier"], ["T3", "T3 Supplier"]];
 async function renderReports() {
+  state.reportTab = state.reportTab || "report";
+  const tabs = `<div class="tab-strip">${[["report", "Shortage & excess report"], ["impact", "Rev. Change Impact"]].map(([key, label]) => `<button class="tab-button ${key === state.reportTab ? "active" : ""}" data-report-tab="${key}">${esc(label)}</button>`).join("")}</div>`;
+  if (state.reportTab === "impact") return renderRevImpact(tabs);
+  return renderShortageReport(tabs);
+}
+async function renderRevImpact(tabs) {
+  state.impactTier = state.impactTier || "T1";
+  content.innerHTML = `${heading("Shortage & excess analysis", "Rev. Change Impact: compare two plan revisions. POs inside the lead time are already issued (fixed); see which month goes into shortage or over stock.", "")}${tabs}
+    <div class="tab-strip tab-strip-sub">${IMPACT_TIERS.map(([key, label]) => `<button class="tab-button ${key === state.impactTier ? "active" : ""}" data-impact-tier="${key}">${esc(label)}</button>`).join("")}</div>
+    <section class="panel table-panel">${panelHeader(`${state.impactTier} Supplier · Rev. Change Impact`, state.impactTier === "T1" ? "Your parts: requirement by the old and new revision; your POs inside the lead time (order by on or before the new revision's month) stay as issued (Actual PO, else the old PO demand); later months are re-planned. Closing stock vs buffer norm: Shortage (below 0), Below buffer, OK, Over stock (above the month's requirement + buffer)." : "The T1 supplier's PO to its sub-suppliers: its demand follows your POs (fixed inside your lead time) less its FG stock; its own POs inside the sub-supplier lead time are fixed. Closing = what the T1 supplier holds of the material: Shortage below 0, Over stock above the month's requirement.")}
+      <div class="table-toolbar"><div class="toolbar-group">
+        <label class="field"><span>Old revision</span><select class="form-control" id="impOld"></select></label>
+        <label class="field"><span>New revision</span><select class="form-control" id="impNew"></select></label>
+        <label class="field"><span>Months</span><select class="form-control" id="impMonths">${[6, 12, 24].map((n) => `<option ${n === (state.impMonths || 12) ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+        <label class="field"><span>Big change above %</span><input class="form-control" id="impThreshold" type="number" min="0" step="any" value="${state.impThreshold ?? 10}" style="width:90px" /></label>
+        <label class="check-field"><input type="checkbox" id="impIssues" ${state.impIssues === false ? "" : "checked"} /> Only changes &amp; issues</label>
+        <span class="subtle" id="impSummary"></span></div>
+        <span class="toolbar-add"><a class="button button-small" id="impExcel" href="#">Download Excel</a></span></div>
+      <div id="impTable"><div class="tree-loading">Loading…</div></div></section>`;
+  try {
+    const plans = await api(`/api/planning/plans?workspace=${encodeURIComponent(state.workspace || "trial")}`);
+    const option = (plan, chosen) => `<option value="${plan.id}" ${String(plan.id) === String(chosen) ? "selected" : ""}>${esc(monthLabel(plan.issue_month))} ${esc(plan.revision)}${plan.release_date ? ` · ${esc(plan.release_date)}` : ""}</option>`;
+    if (plans.length < 2) {
+      $("#impTable").innerHTML = `<p class="subtle" style="padding:14px">Upload at least two plan revisions (Plans &amp; actuals) to compare them.</p>`;
+      return;
+    }
+    const known = (id) => plans.some((plan) => String(plan.id) === String(id));
+    if (!known(state.impNew)) state.impNew = plans[0].id;
+    if (!known(state.impOld) || String(state.impOld) === String(state.impNew)) state.impOld = (plans.find((plan) => String(plan.id) !== String(state.impNew)) || plans[1]).id;
+    $("#impOld").innerHTML = plans.map((plan) => option(plan, state.impOld)).join("");
+    $("#impNew").innerHTML = plans.map((plan) => option(plan, state.impNew)).join("");
+    ["#impOld", "#impNew", "#impMonths", "#impThreshold", "#impIssues"].forEach((id) => $(id).addEventListener("change", loadRevImpact));
+    loadRevImpact();
+  } catch (error) { toast(error.message, true); }
+}
+async function loadRevImpact() {
+  state.impOld = $("#impOld").value;
+  state.impNew = $("#impNew").value;
+  state.impMonths = Number($("#impMonths").value || 12);
+  state.impThreshold = Number($("#impThreshold").value || 0);
+  state.impIssues = $("#impIssues").checked;
+  if (state.impOld === state.impNew) { $("#impTable").innerHTML = `<p class="subtle" style="padding:14px">Pick two different revisions.</p>`; return; }
+  const query = new URLSearchParams({ old_cycle: state.impOld, new_cycle: state.impNew, tier: state.impactTier, months: String(state.impMonths), threshold: String(state.impThreshold), workspace: state.workspace || "trial" });
+  $("#impExcel").href = `/api/planning/rev-impact.xlsx?${query}&issues_only=${state.impIssues}`;
+  const ticket = (state.impTicket = (state.impTicket || 0) + 1);
+  try {
+    const result = await api(`/api/planning/rev-impact?${query}`);
+    if (ticket !== state.impTicket || !$("#impTable")) return;
+    const short = (month) => monthLabel(month).replace(/ (\d{2})(\d{2})$/, "-$2");
+    const lines = [];
+    const count = { Shortage: 0, "Over stock": 0, "Below buffer": 0, big: 0 };
+    result.rows.forEach((row) => row.months.forEach((cell) => {
+      if (cell.status !== "OK") count[cell.status] += 1;
+      if (cell.big_change) count.big += 1;
+      if (state.impIssues && !cell.big_change && cell.status === "OK") return;
+      const statusClass = { Shortage: "imp-short", "Over stock": "imp-over", "Below buffer": "imp-low" }[cell.status] || "";
+      lines.push(`<tr><td>${esc(row.suppliers)}</td><td>${esc(row.for)}</td><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.uom || "")}</td><td>${esc(short(cell.month))}</td><td>${number(cell.old_requirement)}</td><td>${number(cell.new_requirement)}</td><td class="${cell.change < 0 ? "imp-down" : cell.change > 0 ? "imp-up" : ""}">${cell.change > 0 ? "+" : ""}${number(cell.change)}</td><td class="${cell.big_change ? "imp-big" : ""}">${cell.change_percent > 0 ? "+" : ""}${number(cell.change_percent, 1)}%</td><td>${cell.locked ? number(cell.fixed_po) : "—"}</td><td>${cell.locked ? "—" : number(cell.new_po)}</td><td>${number(cell.closing)}</td><td>${number(cell.buffer)}</td><td class="${statusClass}">${esc(cell.status)}</td><td class="${cell.shortage ? "imp-short" : ""}">${cell.shortage ? number(cell.shortage) : "—"}</td><td class="${cell.excess ? "imp-over" : ""}">${cell.excess ? number(cell.excess) : "—"}</td></tr>`);
+    }));
+    $("#impSummary").textContent = `${result.old} → ${result.new} · from ${short(result.start)}: ${count.Shortage} shortage, ${count["Over stock"]} over stock, ${count["Below buffer"]} below buffer, ${count.big} big change (> ${result.threshold}%)`;
+    const headers = [state.impactTier === "T1" ? "T1 Supplier" : `${state.impactTier} Supplier`, "Supplies to", "Part / material code", "Part / material name", "Unit", "Month", `Requirement ${result.old}`, `Requirement ${result.new}`, "Change", "Change %", "PO fixed (in lead time)", "PO re-planned", "Closing stock", "Buffer norm", "Status", "Shortage", "Over stock"];
+    $("#impTable").innerHTML = table(headers, lines.join(""), state.impIssues ? "No big change, shortage or over stock between these revisions." : `No ${state.impactTier} supplier parts.`);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function renderShortageReport(tabs) {
   const end = monthNow();
   const start = monthOffset(end, -11);
-  content.innerHTML = `${heading("Shortage & excess analysis", "One-click, month-by-month shortage report by material and supplier. Planning demand and actual demand are shown separately.", "")}
+  content.innerHTML = `${heading("Shortage & excess analysis", "One-click, month-by-month shortage report by material and supplier. Planning demand and actual demand are shown separately.", "")}${tabs}
     <section class="panel">${panelHeader("Report controls", "Select any historical period. Supplier buffer norms and long lead times determine criticality and target coverage.")}
       <form id="reportForm" class="table-toolbar report-controls">
         ${field("Start month", "start_month", "month", { required: true, value: start })}
@@ -2851,16 +2924,16 @@ const DEMAND_TABS = [["T1", "T1 Supplier part Planning", "parts your T1 supplier
 function demandPlanPanel(tab) {
   const [, label, what] = DEMAND_TABS.find(([key]) => key === tab);
   const help = tab === "T1"
-    ? "Your PO to the T1 supplier, per part: requirement (plan in force × model BOM) + buffer (Buffer norm days) − what you have (Opening Stock 01st Month, then what is left plus open POs arriving). The T1 supplier's own FG stock is its property and is NOT counted. PO split by SOB, rounded up to MOQ, to order by the month shown (month − lead time)."
-    : "Demand = your PO to the T1 supplier → less the T1 supplier's opening FG stock → balance demand → × part BOM qty (L2 / L3) × SOB = requirement. The sub-supplier's own stock is its property and is not deducted. Suggested PO = requirement rounded up to MOQ, to order by the month shown (month − lead time).";
+    ? "Your PO to the T1 supplier, per part: requirement (plan in force × model BOM) + buffer (Buffer norm days) − what you have (Opening Stock 01st Month, then what is left plus open POs arriving). The T1 supplier's own FG stock is its property and is NOT counted. PO split by SOB, rounded up to MOQ, to order by the month shown (month − lead time). Actual PO = the qty you issue (blank = PO demand); a change re-plans the later months."
+    : "Demand = your PO to the T1 supplier → less the T1 supplier's opening FG stock → balance demand → × part BOM qty (L2 / L3) × SOB = requirement. The sub-supplier's own stock is its property and is not deducted. PO demand = requirement rounded up to MOQ (extra carries to the next month), to order by the month shown (month − lead time). Actual PO = the qty issued (blank = PO demand).";
   return `<section class="panel table-panel">${panelHeader(label, `${what}. ${help}`)}
-    <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Start month</span><input class="form-control" type="month" id="dpStart" value="${state.dpStart || monthNow()}" /></label><label class="field"><span>Months</span><select class="form-control" id="dpMonths">${[3, 6, 12].map((n) => `<option ${n === (state.dpMonths || 6) ? "selected" : ""}>${n}</option>`).join("")}</select></label><label class="search-field"><input class="form-control" id="dpSearch" type="search" placeholder="Search supplier or part" value="${esc(state.dpSearch || "")}" /></label><span class="subtle" id="dpPlans"></span></div><span class="toolbar-add"><a class="button button-small" id="dpExcel" href="#">Download Excel</a></span></div>
+    <div class="table-toolbar"><div class="toolbar-group"><label class="field"><span>Start month</span><input class="form-control" type="month" id="dpStart" value="${state.dpStart || monthNow()}" /></label><label class="field"><span>Months</span><select class="form-control" id="dpMonths">${[3, 6, 12, 24].map((n) => `<option ${n === (state.dpMonths || 12) ? "selected" : ""}>${n}</option>`).join("")}</select></label><label class="search-field"><input class="form-control" id="dpSearch" type="search" placeholder="Search supplier or part" value="${esc(state.dpSearch || "")}" /></label><span class="subtle" id="dpPlans"></span></div><span class="toolbar-add"><a class="button button-small" id="dpExcel" href="#">Download Excel</a></span></div>
     <div id="dpTable"><div class="tree-loading">Loading…</div></div></section>`;
 }
 async function loadDemandPlan() {
   const tab = state.dpTab || "T1";
   state.dpStart = $("#dpStart").value || monthNow();
-  state.dpMonths = Number($("#dpMonths").value || 6);
+  state.dpMonths = Number($("#dpMonths").value || 12);
   state.dpSearch = $("#dpSearch").value.trim();
   const query = new URLSearchParams({ tier: tab, start_month: state.dpStart, months: String(state.dpMonths), workspace: state.workspace || "trial", search: state.dpSearch });
   $("#dpExcel").href = `/api/planning/demand-plan.xlsx?${query}`;
@@ -2871,12 +2944,30 @@ async function loadDemandPlan() {
     const plans = [...new Set(Object.values(result.plans).filter(Boolean))];
     $("#dpPlans").textContent = plans.length ? `plan ${plans.join(", ")}` : "no plan uploaded for these months: requirement 0";
     const short = (month) => monthLabel(month).replace(/ (\d{2})(\d{2})$/, "-$2");
-    const rows = result.rows.map((row) => `<tr><td>${esc(row.supplier_code)}</td><td>${esc(row.supplier_name)}</td><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.for)}</td><td>${number(row.sob_percent, 1)}%</td><td>${number(row.lead_time_days, 0)} days</td><td>${number(row.moq)}</td><td>${row.stock === null || row.stock === undefined ? "" : number(row.stock)}</td>${tab === "T1" ? `<td>${number(row.buffer_days || 0, 0)} days</td><td>${number(row.supplier_fg_stock || 0)}</td>` : ""}<td>${esc(row.uom || "")}</td>${row.months.map((cell) => `<td>${number(cell.requirement)}</td><td class="dp-po${cell.po ? " dp-po-due" : ""}" title="${cell.po ? `Net ${number(cell.net)}; order by ${monthLabel(cell.order_by)}` : "Covered by stock"}">${cell.po ? `${number(cell.po)}<small>by ${esc(short(cell.order_by))}</small>` : "—"}</td>`).join("")}</tr>`).join("");
-    const headers = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB", "Lead time", "MOQ", ...(tab === "T1" ? ["Opening Stock 01st Month", "Buffer norm", "Supplier FG stock (not counted)"] : ["Sub-supplier stock (not deducted)"]), "Unit", ...result.months.flatMap((month) => [`${short(month)} Requirement`, `${short(month)} Suggested PO`])];
+    const fixedCells = (row) => `<td>${esc(row.supplier_code)}</td><td>${esc(row.supplier_name)}</td><td>${esc(row.code)}</td><td>${esc(row.name)}</td><td>${esc(row.for)}</td><td>${number(row.sob_percent, 1)}%</td><td>${number(row.lead_time_days, 0)} days</td><td>${number(row.moq)}</td><td>${row.stock === null || row.stock === undefined ? "" : number(row.stock)}</td>${tab === "T1" ? `<td>${number(row.buffer_days || 0, 0)} days</td><td>${number(row.supplier_fg_stock || 0)}</td>` : ""}<td>${esc(row.uom || "")}</td>`;
+    // three blocks of months: 1 Requirement, 2 PO demand (with order-by month), 3 Actual PO (editable; blank = the PO demand)
+    const rows = result.rows.map((row) => `<tr>${fixedCells(row)}${row.months.map((cell) => `<td class="dp-req">${number(cell.requirement)}</td>`).join("")}${row.months.map((cell) => `<td class="dp-po${cell.po ? " dp-po-due" : ""}" title="${cell.po ? `Net ${number(cell.net)}; order by ${monthLabel(cell.order_by)}` : "Covered by stock"}">${cell.po ? `${number(cell.po)}<small>by ${esc(short(cell.order_by))}</small>` : "—"}</td>`).join("")}${row.months.map((cell) => `<td class="dp-actual"><input class="form-control dp-actual-input${cell.saved ? " dp-actual-saved" : ""}" type="number" min="0" step="any" data-dp-key="${esc(row.key)}" data-dp-month="${cell.month}" value="${Math.round(cell.actual * 10000) / 10000}" title="${cell.saved ? `Your PO qty (PO demand ${number(cell.po)}). Clear and press Enter to go back to the PO demand.` : "= PO demand. Type the PO qty you issue and press Enter."}" /></td>`).join("")}</tr>`).join("");
+    const fixedHeads = ["Supplier Code", "Supplier Name", "Part / material code", "Part / material name", "Supplies to", "SOB", "Lead time", "MOQ", ...(tab === "T1" ? ["Opening Stock 01st Month", "Buffer norm", "Supplier FG stock (not counted)"] : ["Sub-supplier stock (not deducted)"]), "Unit"];
+    const headers = [...fixedHeads, ...result.months.map((month) => `Requirement ${short(month)}`), ...result.months.map((month) => `PO demand ${short(month)}`), ...result.months.map((month) => `Actual PO ${short(month)}`)];
     $("#dpTable").innerHTML = table(headers, rows, state.dpSearch ? "Nothing matches this search." : `No ${tab} supplier parts yet.`);
+    const thead = $("#dpTable thead");
+    if (thead) {
+      const count = result.months.length;
+      thead.insertAdjacentHTML("afterbegin", `<tr class="dp-band"><th colspan="${fixedHeads.length}"></th><th colspan="${count}" class="dp-band-req">1 · Requirement</th><th colspan="${count}" class="dp-band-po">2 · PO demand (to issue)</th><th colspan="${count}" class="dp-band-actual">3 · Actual PO (editable)</th></tr>`);
+    }
+  } catch (error) { toast(error.message, true); }
+}
+async function saveActualPo(input) {
+  const value = input.value.trim();
+  try {
+    await api("/api/planning/demand-plan/actual-po", { method: "POST", body: JSON.stringify({ workspace: state.workspace || "trial", row_key: input.dataset.dpKey, month: input.dataset.dpMonth, quantity: value === "" ? null : Number(value) }) });
+    await loadDemandPlan();
+    toast(value === "" ? "Back to the PO demand; later months re-planned" : "Actual PO saved; later months re-planned");
   } catch (error) { toast(error.message, true); }
 }
 function bindDemandPlan() {
+  $("#dpTable").addEventListener("change", (event) => { if (event.target.matches(".dp-actual-input")) saveActualPo(event.target); });
+  $("#dpTable").addEventListener("keydown", (event) => { if (event.key === "Enter" && event.target.matches(".dp-actual-input")) { event.preventDefault(); event.target.blur(); } });
   $("#dpStart").addEventListener("change", loadDemandPlan);
   $("#dpMonths").addEventListener("change", loadDemandPlan);
   $("#dpSearch").addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(loadDemandPlan, 250); });
@@ -3623,6 +3714,10 @@ document.addEventListener("click", async (event) => {
     try { await api(`/api/suppliers/${supplierDelete.dataset.deleteSupplier}`, { method: "DELETE" }); toast("Supplier deleted"); return renderSupplierControl(); }
     catch (error) { toast(error.message, true); return; }
   }
+  const reportTab = event.target.closest("[data-report-tab]");
+  if (reportTab) { state.reportTab = reportTab.dataset.reportTab; return renderReports(); }
+  const impactTier = event.target.closest("[data-impact-tier]");
+  if (impactTier) { state.impactTier = impactTier.dataset.impactTier; return renderReports(); }
   const dpTab = event.target.closest("[data-dp-tab]");
   if (dpTab) { state.dpTab = dpTab.dataset.dpTab; return renderPurchaseOrders(); }
   const openOverview = event.target.closest("[data-open-supplier-overview]");

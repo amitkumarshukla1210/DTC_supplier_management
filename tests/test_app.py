@@ -586,33 +586,101 @@ class SupplierHubApiTests(unittest.TestCase):
         self.assertEqual(api.post("/api/planning/purchase-orders", json={"supplier_part_id": link, "quantity_ordered": 5000, "expected_month": "2026-12", "workspace": "trial", "ncnr": False}).status_code, 201)
         plan = lambda tier: api.get("/api/planning/demand-plan", params={"tier": tier, "start_month": "2026-11", "months": 2, "search": "DP-"}).json()
         cells = lambda row: [(c["month"], c["requirement"], c["net"], c["po"], c["order_by"]) for c in row["months"]]
-        # T1 (your PO to Savera), worked out per part: Nov 60,000 needed, buffer 60,000 / 30.4375 x 15, you have 10,000
-        # -> 60,000 + buffer - 10,000; Dec 30,000 + its buffer - (Nov buffer left + open PO 5,000). Savera's FG stock is NOT counted.
-        nov_buffer, dec_buffer = 60000 / 30.4375 * 15, 30000 / 30.4375 * 15
-        nov_order = 60000 + nov_buffer - 10000
-        dec_order = 30000 + dec_buffer - (nov_buffer + 5000)
+        # T1 (your PO to Savera), worked out per part. Savera's FG stock is NOT counted.
+        # Nov: need 60,000, buffer 60,000 / 30.4375 x 15 (29,568.8), you have 10,000 -> order 79,568.8; Savera 60% = 47,741.3 -> 50,000 (MOQ 5,000).
+        # What arrives: Savera's 50,000 + the 40% not linked here (assumed as planned) -> Nov closing 31,827.5.
+        # Dec: 31,827.5 + open PO 5,000 - 30,000 = 6,827.5; buffer 14,784.4 -> order 7,956.9; 60% = 4,774.1 -> 5,000.
+        b1 = 60000 / 30.4375 * 15
+        o1 = 60000 + b1 - 10000
+        c1 = 10000 - 60000 + o1 * 0.4 + 50000
+        b2 = 30000 / 30.4375 * 15
+        o2 = b2 - (c1 + 5000 - 30000)
+        c2 = c1 + 5000 - 30000 + o2 * 0.4 + 5000
+        r4 = lambda value: round(value, 4)
         t1 = plan("T1")
         self.assertEqual((t1["months"], t1["plans"]), (["2026-11", "2026-12"], {"2026-11": "Rev.00", "2026-12": "Rev.00"}))
         row = t1["rows"][0]
-        self.assertEqual((row["supplier_code"], row["code"], row["for"], row["stock"], row["buffer_days"], row["supplier_fg_stock"]), ("DP-1013", "DP-BEAM", "OEM", 10000, 15, 9000))
-        got = [(c["month"], c["requirement"], round(c["net"], 4), c["po"], c["order_by"]) for c in row["months"]]
-        nov_po, dec_po = math.ceil(nov_order * 0.6 / 5000) * 5000, math.ceil(dec_order * 0.6 / 5000) * 5000  # Savera 60%, MOQ 5,000
-        self.assertEqual(got, [("2026-11", 36000, round(nov_order * 0.6, 4), nov_po, "2026-09"), ("2026-12", 18000, round(dec_order * 0.6, 4), dec_po, "2026-10")])
-        self.assertEqual((nov_po, dec_po), (50000, 10000))
-        # T2: Savera's demand = your PO (50,000 / 10,000) - its FG stock 9,000 = balance 41,000 / 10,000; x 2 kg x SOB.
-        # JGI's own stock (5,000) is its property: not deducted. JGI 30% = 24,600 -> PO 30,000 (MOQ 10,000) by Oct; Dec 6,000 -> 10,000
+        self.assertEqual((row["key"], row["supplier_code"], row["code"], row["for"], row["stock"], row["buffer_days"], row["supplier_fg_stock"]), (f"T1:{link}", "DP-1013", "DP-BEAM", "OEM", 10000, 15, 9000))
+        got = [(c["month"], c["requirement"], round(c["net"], 4), c["po"], c["actual"], c["saved"], c["order_by"], round(c["closing"], 4)) for c in row["months"]]
+        self.assertEqual(got, [("2026-11", 36000, r4(o1 * 0.6), 50000, 50000, False, "2026-09", r4(c1)), ("2026-12", 18000, r4(o2 * 0.6), 5000, 5000, False, "2026-10", r4(c2))])
+        # T2: Savera's balance demand = your actual PO - its FG stock 9,000: Nov 41,000, Dec 5,000; x 2 kg x SOB.
+        # JGI's own stock (5,000) is its property: not deducted. JGI 30%: Nov 24,600 -> 30,000 (MOQ 10,000) by Oct; the extra 5,400
+        # carries: Dec 3,000 is covered -> no PO. TATA 70%: 57,400 and 7,000 (no MOQ, no lead time).
         t2 = {r["supplier_code"]: r for r in plan("T2")["rows"]}
-        self.assertEqual((t2["DP-1004"]["for"], t2["DP-1004"]["code"], t2["DP-1004"]["stock"], round(t2["DP-1004"]["sob_percent"], 4), t2["DP-1004"]["unit_price"]), ("DP Savera", "DP-STEEL", 5000, 30, 74))
-        self.assertEqual(cells(t2["DP-1004"]), [("2026-11", 24600, 24600, 30000, "2026-10"), ("2026-12", 6000, 6000, 10000, "2026-11")])
-        self.assertEqual(cells(t2["DP-1014"]), [("2026-11", 57400, 57400, 57400, "2026-11"), ("2026-12", 14000, 14000, 14000, "2026-12")])  # no MOQ, no lead time
+        self.assertEqual((t2["DP-1004"]["key"], t2["DP-1004"]["for"], t2["DP-1004"]["code"], t2["DP-1004"]["stock"], round(t2["DP-1004"]["sob_percent"], 4), t2["DP-1004"]["unit_price"]),
+                         (f"T2:{jgi}:dp-steel:{savera}", "DP Savera", "DP-STEEL", 5000, 30, 74))
+        self.assertEqual(cells(t2["DP-1004"]), [("2026-11", 24600, 24600, 30000, "2026-10"), ("2026-12", 3000, 0, 0, None)])
+        self.assertEqual(cells(t2["DP-1014"]), [("2026-11", 57400, 57400, 57400, "2026-11"), ("2026-12", 7000, 7000, 7000, "2026-12")])
         # T3: ore 1.7 kg per kg steel = 3.4 kg per beam x Savera's balance demand
         t3 = plan("T3")["rows"]
         self.assertEqual([(r["supplier_code"], r["code"]) for r in t3], [("DP-1030", "DP-ORE")])
-        self.assertEqual([c["requirement"] for c in t3[0]["months"]], [139400, 34000])
-        # Excel: month groups with Requirement / Suggested PO / Order by
+        self.assertEqual([c["requirement"] for c in t3[0]["months"]], [139400, 17000])
+        # Excel: blocks Requirement | PO demand | Order by | Actual PO, each with the months
         book = load_workbook(io.BytesIO(api.get("/api/planning/demand-plan.xlsx", params={"tier": "T2", "start_month": "2026-11", "months": 2, "search": "DP-"}).content)).active
-        self.assertEqual((book["K3"].value, book["K4"].value, book["L4"].value, book["M4"].value, book["N3"].value), ("2026-11", "Requirement", "Suggested PO", "Order by", "2026-12"))
-        self.assertEqual([book.cell(5, c).value for c in (1, 3, 5, 11, 12, 13)], ["DP-1004", "DP-STEEL", "DP Savera", 24600, 30000, "2026-10"])
+        self.assertEqual([book.cell(3, c).value for c in (11, 13, 15, 17)], ["Requirement", "PO demand", "Order by", "Actual PO"])
+        self.assertEqual([book.cell(4, c).value for c in (11, 12, 17, 18)], ["2026-11", "2026-12", "2026-11", "2026-12"])
+        self.assertEqual([book.cell(5, c).value for c in (1, 3, 5, 11, 12, 13, 14, 15, 17, 18)], ["DP-1004", "DP-STEEL", "DP Savera", 24600, 3000, 30000, 0, "2026-10", 30000, 0])
+
+        # Actual PO: you issue 40,000 in Nov instead of 50,000 -> Nov closing 10,000 less (21,827.5); Dec: 21,827.5 + 5,000 - 30,000
+        # = -3,172.5, order 14,784.4 + 3,172.5 = 17,956.9; 60% = 10,774.1 -> PO demand 15,000. Savera's balance Nov 40,000 - 9,000 = 31,000:
+        # JGI 18,600 -> 20,000; Dec balance 15,000 -> JGI 9,000 - 1,400 carried = 7,600 -> 10,000.
+        save = lambda key, month, quantity: api.post("/api/planning/demand-plan/actual-po", json={"workspace": "trial", "row_key": key, "month": month, "quantity": quantity})
+        self.assertEqual(save(f"T1:{link}", "2026-11", 40000).status_code, 200)
+        row = plan("T1")["rows"][0]
+        self.assertEqual([(c["po"], c["actual"], c["saved"], round(c["net"], 4), round(c["closing"], 4)) for c in row["months"]],
+                         [(50000, 40000, True, r4(o1 * 0.6), r4(c1 - 10000)), (15000, 15000, False, r4((b2 - (c1 - 10000 + 5000 - 30000)) * 0.6), r4(c1 - 10000 + 5000 - 30000 + (b2 - (c1 - 10000 + 5000 - 30000)) * 0.4 + 15000))])
+        jgi_row = {r["supplier_code"]: r for r in plan("T2")["rows"]}["DP-1004"]
+        self.assertEqual(cells(jgi_row), [("2026-11", 18600, 18600, 20000, "2026-10"), ("2026-12", 9000, 7600, 10000, "2026-11")])
+        self.assertEqual(save(f"T1:{link}", "2026-11", -5).status_code, 422)
+        self.assertEqual(save("T1:abc", "2026-11", 5).status_code, 422)
+        self.assertEqual(save(f"T1:{link}", "2026-11", None).status_code, 200)  # blank = back to the PO demand
+        self.assertEqual([c["actual"] for c in plan("T1")["rows"][0]["months"]], [50000, 5000])
+
+        # Rev. Change Impact: Nov Rev.01 drops Dec to 15,000 (-50 %). Savera's lead time 45 days = 2 months: Nov and Dec POs
+        # (order by Sep / Oct, on or before Nov) are fixed at 50,000 / 5,000. Nov: unchanged, closing 31,827.5 (OK).
+        # Dec: 31,827.5 + open PO 5,000 + fixed 5,000 - 15,000 = 26,827.5; buffer 15,000 / 30.4375 x 15 = 7,392.2; above 15,000 + 7,392.2
+        # -> Over stock 26,827.5 - 7,392.2 = 19,435.3.
+        b3 = 15000 / 30.4375 * 15
+        c3 = c1 + 5000 + 5000 - 15000
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Model Code", "Model Name", "01-11-2026", "01-12-2026"])
+        sheet.append(["DP12000", "Eva 8014", 60000, 15000])
+        content = io.BytesIO()
+        workbook.save(content)
+        self.assertEqual(api.post("/api/planning/plans/2026-11/upload?workspace=trial&release_date=2026-11-20", content=content.getvalue(), headers=xlsx).status_code, 201)
+        revisions = {r["revision"]: r["id"] for r in api.get("/api/planning/plans", params={"issue_month": "2026-11"}).json()}
+        impact = lambda tier: api.get("/api/planning/rev-impact", params={"old_cycle": revisions["Rev.00"], "new_cycle": revisions["Rev.01"], "tier": tier, "months": 2}).json()
+        t1i = [r for r in impact("T1")["rows"] if r["code"] == "DP-BEAM"][0]
+        self.assertEqual(t1i["suppliers"], "DP Savera")
+        got = [(c["month"], c["old_requirement"], c["new_requirement"], c["change"], c["change_percent"], c["big_change"], c["locked"], c["fixed_po"], round(c["closing"], 4), round(c["buffer"], 4), c["status"], round(c["excess"], 4), c["shortage"]) for c in t1i["months"]]
+        self.assertEqual(got, [("2026-11", 60000, 60000, 0, 0.0, False, True, 50000, r4(c1), r4(b1), "OK", 0, 0),
+                               ("2026-12", 30000, 15000, -15000, -50.0, True, True, 5000, r4(c3), r4(b3), "Over stock", r4(c3 - b3), 0)])
+        # T2: Savera's POs are fixed inside its lead time, so its balance demand and JGI's requirement do not change
+        jgi_i = [r for r in impact("T2")["rows"] if r["suppliers"] == "DP JGI"][0]
+        self.assertEqual([(c["old_requirement"], c["new_requirement"], c["status"], c["locked"], c["fixed_po"]) for c in jgi_i["months"]], [(24600, 24600, "OK", True, 30000), (3000, 3000, "OK", True, 0)])
+        self.assertEqual(api.get("/api/planning/rev-impact", params={"old_cycle": revisions["Rev.01"], "new_cycle": revisions["Rev.01"]}).status_code, 422)
+        self.assertEqual(api.get("/api/planning/rev-impact", params={"old_cycle": 99999, "new_cycle": revisions["Rev.01"]}).status_code, 404)
+        book = load_workbook(io.BytesIO(api.get("/api/planning/rev-impact.xlsx", params={"old_cycle": revisions["Rev.00"], "new_cycle": revisions["Rev.01"], "tier": "T1", "months": 2, "issues_only": True}).content)).active
+        beam_rows = [[c.value for c in r] for r in book.iter_rows(min_row=4) if r[2].value == "DP-BEAM"]
+        self.assertEqual([(r[5], r[9], r[15], r[17]) for r in beam_rows], [("2026-12", -50.0, "Over stock", r4(c3 - b3))])
+        # Rev.02 raises Dec to 90,000 (+200 %): Dec 31,827.5 + open PO 5,000 - 90,000 = -53,172.5; buffer 90,000 / 30.4375 x 15;
+        # Savera's Dec PO is fixed at 5,000, the 40 % not linked arrives as re-planned -> closing below 0 = Shortage.
+        # 12 months asked, but both plans stop at Dec -> only Nov and Dec.
+        sheet = workbook.active
+        sheet.delete_rows(2)
+        sheet.append(["DP12000", "Eva 8014", 60000, 90000])
+        content = io.BytesIO()
+        workbook.save(content)
+        self.assertEqual(api.post("/api/planning/plans/2026-11/upload?workspace=trial&release_date=2026-11-25", content=content.getvalue(), headers=xlsx).status_code, 201)
+        revisions = {r["revision"]: r["id"] for r in api.get("/api/planning/plans", params={"issue_month": "2026-11"}).json()}
+        result = api.get("/api/planning/rev-impact", params={"old_cycle": revisions["Rev.00"], "new_cycle": revisions["Rev.02"], "tier": "T1", "months": 12}).json()
+        self.assertEqual(result["months"], ["2026-11", "2026-12"])
+        b4 = 90000 / 30.4375 * 15
+        p4 = c1 + 5000 - 90000
+        c4 = p4 + (b4 - p4) * 0.4 + 5000
+        dec = [r for r in result["rows"] if r["code"] == "DP-BEAM"][0]["months"][1]
+        self.assertEqual((dec["change_percent"], dec["status"], r4(dec["closing"]), r4(dec["shortage"]), dec["excess"]), (200.0, "Shortage", r4(c4), r4(-c4), 0))
         self.assertEqual(api.get("/api/planning/demand-plan", params={"tier": "T9"}).status_code, 422)
 
     def test_supplier_overview_parts_bom_sub_suppliers_rates_and_requirement(self):

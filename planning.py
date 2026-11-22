@@ -307,6 +307,19 @@ class PlanningPO(Base):
     change_note: Mapped[str] = mapped_column(Text, default="")
 
 
+class PlanActualPO(Base):
+    """Demand & PO Plan: the PO quantity you actually issue for a row and month (edited over the PO demand).
+    Row key: T1:<supplier part id>, or T2 / T3:<sub-supplier id>:<material code>:<T1 supplier id>."""
+    __tablename__ = "planning_actual_po"
+    __table_args__ = (UniqueConstraint("workspace", "row_key", "month"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(16), index=True)
+    row_key: Mapped[str] = mapped_column(String(200), index=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    quantity: Mapped[float] = mapped_column(Float)
+
+
 class TierMaterial(Base):
     """T2 / T3 Material Master: codes used further down the supply chain (by your
     suppliers' suppliers). Not planned by you; picked into supplier material masters."""
@@ -5441,8 +5454,11 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"workspace": payload.workspace, "period": payload.period, "rows": saved, "as_of": as_of.isoformat() if as_of else None}
 
-    def month_plan(db: Session, workspace: str, period: str) -> tuple[PlanningCycle | None, dict[int, float]]:
-        """The plan in force for a production month: the latest revision of the latest plan issued up to that month."""
+    def month_plan(db: Session, workspace: str, period: str, cycle: PlanningCycle | None = None) -> tuple[PlanningCycle | None, dict[int, float]]:
+        """The plan in force for a production month: the latest revision of the latest plan issued up to that month
+        (or the given plan revision)."""
+        if cycle is not None:
+            return cycle, {line.model_id: line.quantity for line in db.scalars(select(PlanLine).where(PlanLine.cycle_id == cycle.id, PlanLine.target_month == period)).all()}
         cycle = db.scalar(select(PlanningCycle).where(PlanningCycle.workspace == workspace, PlanningCycle.issue_month <= period)
                           .order_by(PlanningCycle.issue_month.desc(), PlanningCycle.revision.desc()).limit(1))
         if not cycle:
@@ -5476,9 +5492,9 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                         "items": rows}
             return [row for row in rows if row["actual_quantity"] is not None]
 
-    def month_material_demand(db: Session, workspace: str, month: str) -> tuple[PlanningCycle | None, dict[int, float]]:
-        """Plan demand of every material in a month: the plan in force x each model's BOM (L1-L3, alternates' SOB)."""
-        cycle, planned = month_plan(db, workspace, month)
+    def month_material_demand(db: Session, workspace: str, month: str, cycle: PlanningCycle | None = None) -> tuple[PlanningCycle | None, dict[int, float]]:
+        """Plan demand of every material in a month: the plan in force (or the given revision) x each model's BOM (L1-L3, alternates' SOB)."""
+        cycle, planned = month_plan(db, workspace, month, cycle)
         if not planned:
             return cycle, {}
         _, children = _item_map(db)
@@ -5817,36 +5833,54 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"rows": changed, "month": stock_month}
 
-    def demand_plan(db: Session, workspace: str, start: str, months: int, tier: str, can_price: bool) -> dict:
-        """Month-wise demand and PO plan for one tier. T1: plan in force x model BOM x SOB, per T1 supplier and part.
-        T2 / T3: the T1 supplier's net requirement x part BOM quantity x SOB, per sub-supplier, material and T1 supplier.
-        Stock (and open POs for T1) is used up month by month; suggested PO = net requirement rounded up to MOQ,
-        to be ordered lead time ahead."""
+    def demand_plan(db: Session, workspace: str, start: str, months: int, tier: str, can_price: bool,
+                    demand_by_month: dict | None = None, plans: dict | None = None, overrides: dict | None = None, load_saved: bool = True) -> dict:
+        """Month-wise demand and PO plan for one tier.
+        T1 (your PO to the T1 supplier), per part: requirement (plan x model BOM) + buffer - what you have (opening stock,
+        then what is left plus open POs and the POs received); the T1 supplier's FG stock is not counted. Split by SOB,
+        rounded up to MOQ (PO demand). Actual PO = the quantity you issue (edited; else the PO demand): what arrives.
+        T2 / T3: the T1 supplier's balance demand (your actual PO - its FG stock) x part BOM qty x SOB; MOQ excess and
+        actual PO changes carry to the next month. demand_by_month / overrides: for the revision change impact."""
         month_list = [_month_text(_plus_months(_month(start), offset)) for offset in range(months)]
-        demand_by_month, plans = {}, {}
-        for month in month_list:
-            cycle, demand = month_material_demand(db, workspace, month)
-            demand_by_month[month] = demand
-            plans[month] = f"Rev.{cycle.revision:02d}" if cycle else None
+        if demand_by_month is None:
+            demand_by_month, plans = {}, {}
+            for month in month_list:
+                cycle, demand = month_material_demand(db, workspace, month)
+                demand_by_month[month] = demand
+                plans[month] = f"Rev.{cycle.revision:02d}" if cycle else None
+        fixed: dict[str, dict[str, float]] = {}
+        if load_saved:
+            for saved in db.scalars(select(PlanActualPO).where(PlanActualPO.workspace == workspace, PlanActualPO.month.in_(month_list))).all():
+                fixed.setdefault(saved.row_key, {})[saved.month] = saved.quantity
+        for key, by_month in (overrides or {}).items():
+            fixed.setdefault(key, {}).update(by_month)
         suppliers = {who.id: who for who in db.scalars(select(Supplier)).all()}
         links = db.scalars(select(SupplierPart).where(SupplierPart.tier == TOP_TIER, SupplierPart.material_id.is_not(None))).all()
         items = {item.id: item for item in db.scalars(select(Item).where(Item.id.in_({link.material_id for link in links})))} if links else {}
         lead_months = lambda days: math.ceil((days or 0) / 30.4375)
+        order_by = lambda month, days: _month_text(_plus_months(_month(month), -lead_months(days)))
+        to_moq = lambda net, moq: math.ceil(round(net / moq, 9)) * moq if net > 0 and moq and moq > 0 else net
 
-        def roll(requirements: list[float], stock: float, incoming: list[float], moq: float, lead_days: int) -> list[dict]:
-            out, available = [], stock
-            for month, need, extra in zip(month_list, requirements, incoming):
-                available += extra
-                net = max(0.0, need - available)
-                available = max(0.0, available - need)
-                po = math.ceil(net / moq) * moq if net > 0 and moq and moq > 0 else net
-                out.append({"month": month, "requirement": need, "net": net, "po": po, "order_by": _month_text(_plus_months(_month(month), -lead_months(lead_days))) if po else None})
+        def actual_of(key: str, month: str, po: float) -> tuple[float, bool]:
+            value = fixed.get(key, {}).get(month)
+            return (po, False) if value is None else (value, True)
+
+        def roll(key: str, requirements: list[float], moq: float, lead_days: int) -> list[dict]:
+            """T2 / T3: stock at the T1 supplier starts at 0 (the sub-supplier's stock is its property); what is
+            received over the need (MOQ, edits) carries over; a shortfall carries as a backlog."""
+            out, available = [], 0.0
+            for month, need in zip(month_list, requirements):
+                net = need - available
+                net = net if net > 1e-6 else 0.0
+                po = to_moq(net, moq)
+                actual, saved = actual_of(key, month, po)
+                available = available + actual - need
+                out.append({"month": month, "requirement": need, "net": net, "po": po, "actual": actual, "saved": saved,
+                            "order_by": order_by(month, lead_days) if po or actual else None, "closing": round(available, 6), "buffer": 0.0})
             return out
 
-        # T1: your PO to the T1 supplier. Per part: your opening stock (01st month) and open POs are used month by month;
-        # PO = requirement + buffer (buffer norm days x the month's daily requirement) - what you have left. The supplier's
-        # FG stock is its property and is not counted. Split by SOB, rounded up to each supplier's MOQ.
-        t1_rows, t1_balance = [], {}
+        # T1: per part, then split by SOB per supplier link
+        t1_rows, t1_balance, parts = [], {}, {}
         fg_stock = {row.supplier_part_id: row.quantity for row in db.scalars(select(SupplierStockSnapshot).where(
             SupplierStockSnapshot.workspace == workspace, SupplierStockSnapshot.report_month == start)).all()}
         open_po: dict[tuple[int, str], float] = {}
@@ -5856,36 +5890,43 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         links_by_item: dict[int, list[SupplierPart]] = {}
         for link in links:
             links_by_item.setdefault(link.material_id, []).append(link)
-        part_po: dict[int, list[float]] = {}
+        cells_of: dict[int, list[dict]] = {link.id: [] for link in links}
         for item_id, item_links in links_by_item.items():
             item = items[item_id]
-            available, orders = float(item.stock_on_hand or 0), []
+            shares = {link.id: (link.sob_percent or 0) / 100 for link in item_links}
+            unrouted = max(0.0, 1 - sum(shares.values()))  # SOB not linked to a supplier here: assumed to arrive as planned
+            available, part_cells = float(item.stock_on_hand or 0), []
             for month in month_list:
                 available += sum(open_po.get((link.id, month), 0.0) for link in item_links)
                 need = demand_by_month[month].get(item_id, 0.0)
                 buffer = need / 30.4375 * (item.buffer_days or 0)
                 projected = available - need
-                order = max(0.0, buffer - projected)
-                orders.append(order)
-                available = projected + order
-            part_po[item_id] = orders
+                order = buffer - projected
+                order = order if order > 1e-6 else 0.0
+                receipts = order * unrouted
+                for link in item_links:
+                    net = order * shares[link.id]
+                    po = to_moq(net, link.moq)
+                    actual, saved = actual_of(f"T1:{link.id}", month, po)
+                    receipts += actual
+                    cells_of[link.id].append({"month": month, "requirement": need * shares[link.id], "net": net, "po": po, "actual": actual, "saved": saved,
+                                              "order_by": order_by(month, link.lead_time_days) if po or actual else None})
+                available = projected + receipts
+                for link in item_links:
+                    cells_of[link.id][-1].update(closing=round(available, 6), buffer=buffer)
+                part_cells.append({"month": month, "requirement": need, "closing": round(available, 6), "buffer": buffer})
+            parts[item_id] = part_cells
         for link in links:
             item, who = items[link.material_id], suppliers[link.supplier_id]
-            share = (link.sob_percent or 0) / 100
-            plan, balance, fg_left = [], [], fg_stock.get(link.id, 0.0)
-            for index, month in enumerate(month_list):
-                net = part_po[item.id][index] * share
-                po = math.ceil(net / link.moq) * link.moq if net > 0 and link.moq and link.moq > 0 else net
-                plan.append({"month": month, "requirement": demand_by_month[month].get(item.id, 0.0) * share, "net": net, "po": po,
-                             "order_by": _month_text(_plus_months(_month(month), -lead_months(link.lead_time_days))) if po else None})
-                # the T1 supplier's balance demand (your PO - its FG stock), which drives its PO to T2 / T3
-                left = max(0.0, po - fg_left)
-                fg_left = max(0.0, fg_left - po)
-                balance.append(left)
+            balance, fg_left = [], fg_stock.get(link.id, 0.0)
+            for cell in cells_of[link.id]:
+                # the T1 supplier's balance demand (your actual PO - its FG stock), which drives its PO to T2 / T3
+                balance.append(max(0.0, cell["actual"] - fg_left))
+                fg_left = max(0.0, fg_left - cell["actual"])
             t1_balance[link.id] = balance
-            row = {"supplier_code": who.code, "supplier_name": who.name, "code": item.code, "name": item.name, "uom": item.uom, "for": "OEM",
+            row = {"key": f"T1:{link.id}", "item_id": item.id, "supplier_code": who.code, "supplier_name": who.name, "code": item.code, "name": item.name, "uom": item.uom, "for": "OEM",
                    "sob_percent": link.sob_percent, "lead_time_days": link.lead_time_days, "moq": link.moq, "stock": item.stock_on_hand, "buffer_days": item.buffer_days,
-                   "supplier_fg_stock": fg_stock.get(link.id), "months": plan}
+                   "supplier_fg_stock": fg_stock.get(link.id), "months": cells_of[link.id]}
             if can_price:
                 row.update(unit_price=link.unit_price, currency=link.currency)
             t1_rows.append(row)
@@ -5932,14 +5973,15 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 sobs = [part["sob_percent"] for part in group["parts"]]
                 group["sob_percent"] = round(sum(group["needs"]) * 100 / total, 4) if total else round(sum(sobs) / len(sobs), 4)
                 group["stock"] = source_stock.get(key)
-                group["months"] = roll(group.pop("needs"), 0.0, [0.0] * months, group["moq"], group["lead_time_days"])  # its own stock is its property
+                group["key"] = f"{tier}:{key[0]}:{key[1]}:{key[2]}"
+                group["months"] = roll(group["key"], group.pop("needs"), group["moq"], group["lead_time_days"])  # its own stock is its property
                 rates = group.pop("_rates")
                 if can_price and rates:
                     weight = sum(need for _, need, _ in rates)
                     group["unit_price"] = round(sum(price * need for price, need, _ in rates) / weight, 4) if weight else round(sum(price for price, _, _ in rates) / len(rates), 4)
                     group["currency"] = rates[0][2] if len({currency for _, _, currency in rates}) == 1 else "mixed"
                 rows.append(group)
-        return {"tier": tier, "months": month_list, "plans": plans, "rows": rows}
+        return {"tier": tier, "months": month_list, "plans": plans, "rows": rows, "_t1": t1_rows, "_parts": parts}
 
     @app.get("/api/planning/demand-plan")
     def get_demand_plan(request: Request, tier: str = "T1", start_month: str = "", months: int = 6, workspace: str = "trial", search: str = ""):
@@ -5953,10 +5995,159 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         start = _month_text(_month(start_month)) if start_month else _month_text(date.today())
         with open_db() as db:
             result = demand_plan(db, workspace, start, months, tier, _check_price_access(request))
+        result.pop("_t1"), result.pop("_parts")
         needle = search.strip().casefold()
         if needle:
             result["rows"] = [row for row in result["rows"] if needle in f"{row['supplier_code']} {row['supplier_name']} {row['code']} {row['name']} {row['for']}".casefold()]
         return result
+
+    @app.post("/api/planning/demand-plan/actual-po")
+    def save_actual_po(payload: dict, request: Request):
+        """Save the PO quantity you actually issue for a row and month; blank (null) = back to the PO demand."""
+        current_user(request)
+        _check_supply_role(request)
+        workspace = str(payload.get("workspace") or "trial")
+        _validate_workspace(workspace)
+        key, month = str(payload.get("row_key") or ""), str(payload.get("month") or "")
+        if not re.fullmatch(r"T[123]:[0-9]+(:[^\n]{1,120}:[0-9]+)?", key) or len(key) > 200:
+            raise HTTPException(status_code=422, detail="Unknown plan row")
+        if not _is_month(month):
+            raise HTTPException(status_code=422, detail="Month must be YYYY-MM")
+        quantity = payload.get("quantity")
+        if quantity is not None and quantity != "":
+            try:
+                quantity = float(quantity)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="PO quantity must be a number")
+            if not 0 <= quantity <= 1_000_000_000:
+                raise HTTPException(status_code=422, detail="PO quantity must be 0 or more")
+        else:
+            quantity = None
+        with open_db() as db:
+            row = db.scalar(select(PlanActualPO).where(PlanActualPO.workspace == workspace, PlanActualPO.row_key == key, PlanActualPO.month == month))
+            if quantity is None:
+                if row:
+                    db.delete(row)
+            elif row:
+                row.quantity = quantity
+            else:
+                db.add(PlanActualPO(workspace=workspace, row_key=key, month=month, quantity=quantity))
+            db.commit()
+        return {"row_key": key, "month": month, "quantity": quantity}
+
+    def rev_impact(db: Session, workspace: str, old: PlanningCycle, new: PlanningCycle, tier: str, months: int, can_price: bool, threshold: float) -> dict:
+        """Revision change impact from the new revision's month: requirement by the old and new revision; POs inside
+        the lead time (order-by month on or before the new revision's month) are fixed at the actual PO (saved, else the
+        old revision's PO demand); later months are re-planned. Closing stock with the new requirement -> Shortage
+        (below 0), Below buffer, OK or Over stock (above the month's requirement + buffer norm)."""
+        start = new.issue_month
+        # up to the last month either revision plans (no plan after it: nothing to compare)
+        last = db.scalar(select(func.max(PlanLine.target_month)).where(PlanLine.cycle_id.in_([old.id, new.id]))) or start
+        months = max(1, min(months, (_month(last).year - _month(start).year) * 12 + _month(last).month - _month(start).month + 1))
+        month_list = [_month_text(_plus_months(_month(start), offset)) for offset in range(months)]
+        demand_of = lambda cycle: {month: month_material_demand(db, workspace, month, cycle)[1] for month in month_list}
+        label = lambda cycle: f"{monthLabel_text(cycle.issue_month)} Rev.{cycle.revision:02d}"
+        old_run = demand_plan(db, workspace, start, months, tier, can_price, demand_of(old), {m: label(old) for m in month_list})
+        lead_months = lambda days: math.ceil((days or 0) / 30.4375)
+        locked: dict[str, dict[str, float]] = {}
+        for row in old_run["_t1"] + (old_run["rows"] if tier != "T1" else []):
+            for cell in row["months"]:
+                if _plus_months(_month(cell["month"]), -lead_months(row["lead_time_days"])) <= _month(start):
+                    locked.setdefault(row["key"], {})[cell["month"]] = cell["actual"]
+        new_run = demand_plan(db, workspace, start, months, tier, can_price, demand_of(new), {m: label(new) for m in month_list}, overrides=locked, load_saved=False)
+
+        def judge(old_need: float, new_need: float, closing: float, buffer: float) -> dict:
+            change = new_need - old_need
+            percent = round(change * 100 / old_need, 1) if old_need else (100.0 if new_need else 0.0)
+            if closing < -1e-6:
+                status = "Shortage"
+            elif closing > new_need + buffer + 1e-6:
+                status = "Over stock"
+            elif closing < buffer - 1e-6:
+                status = "Below buffer"
+            else:
+                status = "OK"
+            return {"old_requirement": old_need, "new_requirement": new_need, "change": change, "change_percent": percent, "big_change": abs(percent) > threshold,
+                    "closing": closing, "buffer": buffer, "status": status, "shortage": max(0.0, -closing), "excess": max(0.0, closing - buffer) if status == "Over stock" else 0.0}
+
+        rows = []
+        if tier == "T1":
+            by_item: dict[int, list[dict]] = {}
+            for row in new_run["_t1"]:
+                by_item.setdefault(row["item_id"], []).append(row)
+            for item_id, item_rows in sorted(by_item.items(), key=lambda pair: pair[1][0]["code"].casefold()):
+                first, out = item_rows[0], []
+                for index, month in enumerate(month_list):
+                    new_part, old_part = new_run["_parts"][item_id][index], old_run["_parts"][item_id][index]
+                    cell = judge(old_part["requirement"], new_part["requirement"], new_part["closing"], new_part["buffer"])
+                    fixed_po = sum(locked.get(row["key"], {}).get(month, 0.0) for row in item_rows)
+                    is_locked = any(month in locked.get(row["key"], {}) for row in item_rows)
+                    free_po = sum(row["months"][index]["actual"] for row in item_rows if month not in locked.get(row["key"], {}))
+                    cell.update(month=month, locked=is_locked, fixed_po=fixed_po, new_po=free_po)
+                    out.append(cell)
+                rows.append({"suppliers": ", ".join(row["supplier_name"] for row in item_rows), "for": "OEM", "code": first["code"], "name": first["name"], "uom": first["uom"],
+                             "lead_time_days": max(row["lead_time_days"] or 0 for row in item_rows), "buffer_days": first["buffer_days"], "months": out})
+        else:
+            old_rows = {row["key"]: row for row in old_run["rows"]}
+            for row in new_run["rows"]:
+                before = old_rows.get(row["key"])
+                out = []
+                for index, cell in enumerate(row["months"]):
+                    old_need = before["months"][index]["requirement"] if before else 0.0
+                    judged = judge(old_need, cell["requirement"], cell["closing"], cell["buffer"])
+                    is_locked = cell["month"] in locked.get(row["key"], {})
+                    judged.update(month=cell["month"], locked=is_locked, fixed_po=locked[row["key"]][cell["month"]] if is_locked else 0.0, new_po=0.0 if is_locked else cell["actual"])
+                    out.append(judged)
+                rows.append({"suppliers": row["supplier_name"], "for": row["for"], "code": row["code"], "name": row["name"], "uom": row["uom"],
+                             "lead_time_days": row["lead_time_days"], "buffer_days": 0, "months": out})
+        return {"tier": tier, "months": month_list, "old": label(old), "new": label(new), "start": start, "threshold": threshold, "rows": rows}
+
+    def monthLabel_text(month: str) -> str:
+        return _month(month).strftime("%b-%y")
+
+    @app.get("/api/planning/rev-impact")
+    def get_rev_impact(request: Request, old_cycle: int, new_cycle: int, tier: str = "T1", months: int = 12, workspace: str = "trial", threshold: float = 10):
+        current_user(request)
+        _check_supply_role(request)
+        _validate_workspace(workspace)
+        if tier not in {"T1", "T2", "T3"}:
+            raise HTTPException(status_code=422, detail="Tier must be T1, T2 or T3")
+        if not 1 <= months <= 24:
+            raise HTTPException(status_code=422, detail="Months must be 1 to 24")
+        if not 0 <= threshold <= 1000:
+            raise HTTPException(status_code=422, detail="Threshold must be 0 to 1000 %")
+        with open_db() as db:
+            old, new = db.get(PlanningCycle, old_cycle), db.get(PlanningCycle, new_cycle)
+            if not old or not new or old.workspace != workspace or new.workspace != workspace:
+                raise HTTPException(status_code=404, detail="Plan revision not found")
+            if old.id == new.id:
+                raise HTTPException(status_code=422, detail="Pick two different revisions")
+            return rev_impact(db, workspace, old, new, tier, months, _check_price_access(request), threshold)
+
+    @app.get("/api/planning/rev-impact.xlsx")
+    def rev_impact_excel(request: Request, old_cycle: int, new_cycle: int, tier: str = "T1", months: int = 12, workspace: str = "trial", threshold: float = 10, issues_only: bool = False):
+        result = get_rev_impact(request, old_cycle, new_cycle, tier, months, workspace, threshold)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = f"{tier} Rev change impact"
+        sheet.append([f"Design to Cost · {tier} Supplier · Rev. Change Impact · {result['old']} vs {result['new']}"])
+        sheet.append([f"PO fixed = inside lead time (order by on or before {result['start']}); big change = more than {result['threshold']} %; Over stock = closing above requirement + buffer norm."])
+        headers = ["Supplier", "Supplies to", "Part / material code", "Part / material name", "Unit", "Month", f"Requirement {result['old']}", f"Requirement {result['new']}",
+                   "Change", "Change %", "Big change", "PO fixed (in lead time)", "PO re-planned", "Closing stock", "Buffer norm", "Status", "Shortage", "Over stock"]
+        sheet.append(headers)
+        for cell in sheet[3]:
+            cell.fill, cell.font = PatternFill("solid", fgColor="12263A"), Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for row in result["rows"]:
+            for cell in row["months"]:
+                if issues_only and not cell["big_change"] and cell["status"] == "OK":
+                    continue
+                sheet.append([row["suppliers"], row["for"], row["code"], row["name"], row["uom"], cell["month"], round(cell["old_requirement"], 4), round(cell["new_requirement"], 4),
+                              round(cell["change"], 4), cell["change_percent"], "Yes" if cell["big_change"] else "", round(cell["fixed_po"], 4) if cell["locked"] else None,
+                              round(cell["new_po"], 4), round(cell["closing"], 4), round(cell["buffer"], 4), cell["status"], round(cell["shortage"], 4), round(cell["excess"], 4)])
+        sheet["A1"].font = Font(bold=True, size=13)
+        sheet.freeze_panes = "C4"
+        return xlsx_response(workbook, f"{tier}-rev-change-impact.xlsx")
 
     @app.get("/api/planning/demand-plan.xlsx")
     def demand_plan_excel(request: Request, tier: str = "T1", start_month: str = "", months: int = 6, workspace: str = "trial", search: str = ""):
@@ -5968,12 +6159,14 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
         sheet.append([f"Design to Cost · {tier} Supplier part Planning · from {result['months'][0]}"])
         sheet.append(["T1: PO = requirement (plan x BOM) + buffer - your opening stock / open POs, month by month; the T1 supplier's FG stock is not counted. "
                       "T2 / T3: demand (your PO) - T1 supplier's FG stock = balance demand x part BOM qty x SOB. Suggested PO rounded up to MOQ, ordered lead time ahead."])
-        group = fixed + [cell for month in result["months"] for cell in (month, None, None)]
-        sheet.append(group)
-        sheet.append([None] * len(fixed) + [label for _ in result["months"] for label in ("Requirement", "Suggested PO", "Order by")])
-        for index in range(len(result["months"])):
-            column = len(fixed) + 1 + index * 3
-            sheet.merge_cells(start_row=3, start_column=column, end_row=3, end_column=column + 2)
+        blocks = ("Requirement", "PO demand", "Order by", "Actual PO")
+        count = len(result["months"])
+        sheet.append(fixed + [cell for block in blocks for cell in [block] + [None] * (count - 1)])
+        sheet.append([None] * len(fixed) + [month for _ in blocks for month in result["months"]])
+        for index in range(len(blocks)):
+            column = len(fixed) + 1 + index * count
+            if count > 1:
+                sheet.merge_cells(start_row=3, start_column=column, end_row=3, end_column=column + count - 1)
         for column in range(1, len(fixed) + 1):
             sheet.merge_cells(start_row=3, start_column=column, end_row=4, end_column=column)
         for row_cells in sheet.iter_rows(min_row=3, max_row=4):
@@ -5982,7 +6175,8 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for row in result["rows"]:
             sheet.append([row["supplier_code"], row["supplier_name"], row["code"], row["name"], row["for"], row["sob_percent"], row["lead_time_days"], row["moq"], row["stock"], row["uom"]]
-                         + [value for cell in row["months"] for value in (round(cell["requirement"], 4), round(cell["po"], 4), cell["order_by"])])
+                         + [round(cell["requirement"], 4) for cell in row["months"]] + [round(cell["po"], 4) for cell in row["months"]]
+                         + [cell["order_by"] for cell in row["months"]] + [round(cell["actual"], 4) for cell in row["months"]])
         sheet["A1"].font = Font(bold=True, size=13)
         sheet.freeze_panes = "E5"
         return xlsx_response(workbook, f"{tier}-supplier-part-planning-{result['months'][0]}.xlsx")

@@ -618,6 +618,18 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 /* demand & PO plan */
 #dpTable td.dp-po small { display: block; color: #7a5a12; font-size: 11px; }
 #dpTable td.dp-po-due { background: #fff7e0; font-weight: 600; }
+#dpTable tr.dp-band th { text-align: center; font-size: 12px; padding: 6px; border-bottom: 1px solid #d7dee8; }
+#dpTable .dp-band-req { background: #e8f0fb; } #dpTable .dp-band-po { background: #fff3d6; } #dpTable .dp-band-actual { background: #e6f5ec; }
+#dpTable td.dp-actual { background: #f3faf6; }
+#dpTable .dp-actual-input { width: 100px; min-width: 0; padding: 4px 6px; text-align: right; }
+#dpTable .dp-actual-input.dp-actual-saved { border-color: #1f8a4c; background: #e3f6ea; font-weight: 600; }
+.tab-strip-sub { margin-top: -6px; } .tab-strip-sub .tab-button { font-size: 13px; padding: 6px 12px; }
+#impTable td.imp-short { background: #fde3e3; color: #a11d1d; font-weight: 600; }
+#impTable td.imp-over { background: #fff1d6; color: #8a5a00; font-weight: 600; }
+#impTable td.imp-low { background: #fff8e6; color: #8a6d00; }
+#impTable td.imp-big { font-weight: 700; color: #a11d1d; }
+#impTable td.imp-down { color: #a11d1d; } #impTable td.imp-up { color: #1f6f3a; }
+.check-field { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
 /* demand & PO plan table: same sizes as the Suppliers tables */
 #dpTable table { border-collapse: separate; border-spacing: 0; white-space: normal; }
 #dpTable th { position: relative; padding: 11px 10px; border: 0; border-bottom: 1px solid #d3dde6; background: #f1f5f8; color: #2c4256; font-size: 12.5px; font-weight: 600; letter-spacing: 0; text-transform: none; white-space: nowrap; }
@@ -626,3 +638,12 @@ td.cell-link:hover { color: #0f4f86; background: #eef6fc; }
 #dpTable .table-heading { position: static; }
 #dpTable td { padding: 10px 10px; border: 0; border-bottom: 1px solid #ebf0f4; color: #1f3446; font-size: 13px; white-space: nowrap; }
 #dpTable tbody > tr:last-child > td { border-bottom: 0; }
+
+/* Rev. Change Impact table: same sizes as the Demand & PO Plan table */
+#impTable table { border-collapse: separate; border-spacing: 0; white-space: normal; }
+#impTable th { position: relative; padding: 11px 10px; border: 0; border-bottom: 1px solid #d3dde6; background: #f1f5f8; color: #2c4256; font-size: 12.5px; font-weight: 600; letter-spacing: 0; text-transform: none; white-space: nowrap; }
+#impTable th + th { box-shadow: inset 1px 0 0 #e1e8ee; }
+#impTable th .table-column-filter summary { min-height: 0; padding: 2px 0; color: #2c4256; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+#impTable .table-heading { position: static; }
+#impTable td { padding: 10px 10px; border: 0; border-bottom: 1px solid #ebf0f4; color: #1f3446; font-size: 13px; white-space: nowrap; }
+#impTable tbody > tr:last-child > td { border-bottom: 0; }
