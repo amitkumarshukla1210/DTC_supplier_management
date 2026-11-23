@@ -681,6 +681,20 @@ class SupplierHubApiTests(unittest.TestCase):
         c4 = p4 + (b4 - p4) * 0.4 + 5000
         dec = [r for r in result["rows"] if r["code"] == "DP-BEAM"][0]["months"][1]
         self.assertEqual((dec["change_percent"], dec["status"], r4(dec["closing"]), r4(dec["shortage"]), dec["excess"]), (200.0, "Shortage", r4(c4), r4(-c4), 0))
+        # Shortage & excess report: the filters list every material of the whole report (not one page) and filter on the server
+        full = api.get("/api/planning/report", params={"start_month": "2026-11", "end_month": "2026-12", "limit": 1}).json()
+        self.assertGreater(full["total"], 1)
+        self.assertEqual(len(full["items"]), 1)
+        self.assertIn(["DP-BEAM", "Base Front Beam"], full["filters"]["material_code"])
+        self.assertIn("DP Savera", full["filters"]["supplier_name"])
+        beam_only = api.get("/api/planning/report", params=[("start_month", "2026-11"), ("end_month", "2026-12"), ("material", "DP-BEAM"), ("limit", 1000)]).json()
+        self.assertTrue(beam_only["total"] >= 2 and {r["material_code"] for r in beam_only["items"]} == {"DP-BEAM"})
+        self.assertEqual(beam_only["filters"], full["filters"])  # the choices stay complete while filtered
+        none = api.get("/api/planning/report", params=[("start_month", "2026-11"), ("end_month", "2026-12"), ("material", "DP-BEAM"), ("supplier", "Nobody")]).json()
+        self.assertEqual(none["total"], 0)
+        book = load_workbook(io.BytesIO(api.get("/api/planning/report.xlsx", params=[("start_month", "2026-11"), ("end_month", "2026-12"), ("material", "DP-BEAM")]).content)).active
+        codes = {c.value for c in book["B"] if c.value and str(c.value).startswith("DP-")}
+        self.assertEqual(codes, {"DP-BEAM"})
         self.assertEqual(api.get("/api/planning/demand-plan", params={"tier": "T9"}).status_code, 422)
 
     def test_supplier_overview_parts_bom_sub_suppliers_rates_and_requirement(self):

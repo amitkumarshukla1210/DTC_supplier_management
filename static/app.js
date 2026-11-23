@@ -2757,9 +2757,12 @@ new MutationObserver(() => {
 }).observe(content, { childList: true, subtree: true });
 
 // a multi-select filter (checkboxes with a search box) over one field of the report rows
-function filterSelector(title, key, values) {
-  const options = [...new Set(values.map((value) => String(value ?? "")).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-  return `<details class="multi-filter"><summary>${esc(title)}</summary><div class="multi-popover"><input class="form-control multi-search" type="search" placeholder="Search ${esc(title.toLowerCase())}" /><div class="multi-options">${options.map((value) => `<label><input type="checkbox" data-filter-key="${esc(key)}" value="${esc(value)}" />${esc(value)}</label>`).join("") || '<span class="subtle">None</span>'}</div></div></details>`;
+function filterSelector(title, key, values, chosen = []) {
+  const seen = new Set();
+  const options = values.map((value) => (Array.isArray(value) ? value : [value, ""])).filter(([value]) => value && !seen.has(String(value)) && seen.add(String(value)));
+  const count = (chosen || []).length;
+  const hint = key === "material_code" ? "Not in this report: the material has no plan demand in these months (not in a model BOM of the plan). T2 / T3 materials (used inside a supplier's part) are in Demand &amp; PO Plan → T2 / T3 tabs." : "No match in this report.";
+  return `<details class="multi-filter"><summary>${esc(title)}${count ? ` (${count})` : ""}</summary><div class="multi-popover"><input class="form-control multi-search" type="search" placeholder="Search ${esc(title.toLowerCase())}" /><div class="multi-options">${options.map(([value, name]) => `<label><input type="checkbox" data-filter-key="${esc(key)}" value="${esc(value)}" ${(chosen || []).includes(String(value)) ? "checked" : ""} />${esc(value)}${name ? ` <span class="subtle">${esc(name)}</span>` : ""}</label>`).join("") || '<span class="subtle">None</span>'}</div><p class="multi-hint subtle" hidden>${hint}</p></div></details>`;
 }
 
 function reportRows(rows = state.report) {
@@ -2883,9 +2886,6 @@ async function generateReport() {
   state.reportQuery = { start_month: data.get("start_month"), end_month: data.get("end_month"), workspace: state.workspace };
   try {
     await fetchReportPage(0);
-    const suffix = `start_month=${data.get("start_month")}&end_month=${data.get("end_month")}&workspace=${state.workspace}`;
-    $("#reportExcel").href = `/api/planning/report.xlsx?${suffix}`;
-    $("#reportPdf").href = `/api/planning/report.pdf?${suffix}`;
     renderReportTable();
     toast(`${state.reportTotal.toLocaleString()} report rows generated`);
   } catch (error) { toast(error.message, true); }
@@ -2893,7 +2893,15 @@ async function generateReport() {
 
 async function fetchReportPage(offset) {
   const query = new URLSearchParams({ ...state.reportQuery, offset: String(offset), limit: "1000" });
+  // filters run on the server over the whole report (not only this page of 1,000 rows)
+  const chosen = state.reportFilters || {};
+  const params = { material_code: "material", supplier_name: "supplier", tier: "tier", criticality: "criticality" };
+  Object.entries(params).forEach(([key, name]) => (chosen[key] || []).forEach((value) => query.append(name, value)));
   const result = await api(`/api/planning/report?${query}`);
+  state.reportFilterValues = result.filters || {};
+  const download = new URLSearchParams({ ...state.reportQuery });
+  Object.entries(params).forEach(([key, name]) => (chosen[key] || []).forEach((value) => download.append(name, value)));
+  if ($("#reportExcel")) { $("#reportExcel").href = `/api/planning/report.xlsx?${download}`; $("#reportPdf").href = `/api/planning/report.pdf?${download}`; }
   state.report = result.items;
   state.reportTotal = result.total;
   state.reportOffset = result.offset;
@@ -2903,18 +2911,29 @@ async function fetchReportPage(offset) {
 function renderReportTable() {
   const filters = $("#reportFilters");
   if (!filters) return;
-  filters.innerHTML = filterSelector("Material", "material_code", state.report.map((row) => row.material_code))
-    + filterSelector("Supplier", "supplier_name", state.report.map((row) => row.supplier_name))
-    + filterSelector("Tier", "tier", state.report.map((row) => row.tier))
-    + filterSelector("Criticality", "criticality", state.report.map((row) => row.criticality));
+  const values = state.reportFilterValues || {};
+  const chosen = state.reportFilters || {};
+  filters.innerHTML = filterSelector("Material", "material_code", values.material_code || [], chosen.material_code)
+    + filterSelector("Supplier", "supplier_name", values.supplier_name || [], chosen.supplier_name)
+    + filterSelector("Tier", "tier", values.tier || [], chosen.tier)
+    + filterSelector("Criticality", "criticality", values.criticality || [], chosen.criticality);
   const headers = ["Month", "Material", "Supplier", "Upstream parent", "Tier", "SOB", "Plan demand", "Actual demand", "Own stock", "Own stock allocated", "Supplier stock", "Projected balance", "Coverage", "Shortage", "Recommended PO", "Excess", "Lead time", "Criticality", "Plan revision", "SOB change"];
-  $("#reportTable").innerHTML = `${table(headers, reportRows(), "No rows match the active filters.")}<div class="table-toolbar pagination-toolbar"><span>${state.reportTotal ? `${(state.reportOffset + 1).toLocaleString()}–${Math.min(state.reportOffset + state.report.length, state.reportTotal).toLocaleString()} of ${state.reportTotal.toLocaleString()}` : "No report rows"}</span><div><button class="button button-small" data-report-page="${Math.max(0, state.reportOffset - 1000)}" ${state.reportOffset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-report-page="${state.reportOffset + 1000}" ${state.reportOffset + state.report.length >= state.reportTotal ? "disabled" : ""}>Next</button></div></div>`;
-  filters.querySelectorAll("[data-filter-key]").forEach((input) => input.addEventListener("change", () => {
-    $("#reportTable").innerHTML = `${table(headers, reportRows(), "No rows match the active filters.")}<div class="table-toolbar pagination-toolbar"><span>${state.reportTotal ? `${(state.reportOffset + 1).toLocaleString()}–${Math.min(state.reportOffset + state.report.length, state.reportTotal).toLocaleString()} of ${state.reportTotal.toLocaleString()}` : "No report rows"}</span><div><button class="button button-small" data-report-page="${Math.max(0, state.reportOffset - 1000)}" ${state.reportOffset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-report-page="${state.reportOffset + 1000}" ${state.reportOffset + state.report.length >= state.reportTotal ? "disabled" : ""}>Next</button></div></div>`;
+  const pager = `<div class="table-toolbar pagination-toolbar"><span>${state.reportTotal ? `${(state.reportOffset + 1).toLocaleString()}–${Math.min(state.reportOffset + state.report.length, state.reportTotal).toLocaleString()} of ${state.reportTotal.toLocaleString()}` : "No report rows"}</span><div><button class="button button-small" data-report-page="${Math.max(0, state.reportOffset - 1000)}" ${state.reportOffset === 0 ? "disabled" : ""}>Previous</button><button class="button button-small" data-report-page="${state.reportOffset + 1000}" ${state.reportOffset + state.report.length >= state.reportTotal ? "disabled" : ""}>Next</button></div></div>`;
+  $("#reportTable").innerHTML = `${table(headers, reportRows(), "No rows match the active filters.")}${pager}`;
+  filters.querySelectorAll("[data-filter-key]").forEach((input) => input.addEventListener("change", async () => {
+    const picked = {};
+    filters.querySelectorAll("[data-filter-key]:checked").forEach((box) => { (picked[box.dataset.filterKey] ||= []).push(box.value); });
+    state.reportFilters = picked;
+    const open = input.closest("details")?.querySelector("summary")?.textContent;
+    try { await fetchReportPage(0); } catch (error) { toast(error.message, true); }
+    if (open) [...$("#reportFilters").querySelectorAll("details")].find((node) => node.querySelector("summary").textContent === open)?.setAttribute("open", "");
   }));
   filters.querySelectorAll(".multi-search").forEach((input) => input.addEventListener("input", () => {
     const needle = input.value.toLowerCase();
-    input.parentElement.querySelectorAll(".multi-options label").forEach((label) => { label.hidden = !label.textContent.toLowerCase().includes(needle); });
+    let shown = 0;
+    input.parentElement.querySelectorAll(".multi-options label").forEach((label) => { label.hidden = !label.textContent.toLowerCase().includes(needle); if (!label.hidden) shown += 1; });
+    const hint = input.parentElement.querySelector(".multi-hint");
+    if (hint) hint.hidden = shown > 0 || !needle;
   }));
 }
 
@@ -3591,7 +3610,7 @@ document.addEventListener("click", async (event) => {
     return renderMaster();
   }
   if (event.target.closest('[data-action="refresh"]')) return renderPage();
-  if (event.target.closest('[data-action="clear-report-filters"]')) return renderReportTable();
+  if (event.target.closest('[data-action="clear-report-filters"]')) { state.reportFilters = {}; if (state.reportQuery) { try { return await fetchReportPage(0); } catch (error) { return toast(error.message, true); } } return renderReportTable(); }
   const reportPage = event.target.closest("[data-report-page]");
   if (reportPage && state.reportQuery) {
     try { return await fetchReportPage(Number(reportPage.dataset.reportPage)); }

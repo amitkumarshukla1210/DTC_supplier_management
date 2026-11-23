@@ -6588,8 +6588,26 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             db.commit()
             return {"workspace": workspace, "report_month": report_month, "rows": saved}
 
+    REPORT_FILTER_KEYS = ("material_code", "supplier_name", "tier", "criticality")
+
+    def report_filtered(rows: list[dict], chosen: dict[str, list[str]]) -> list[dict]:
+        """The report rows matching the chosen filter values (all rows, not only one page)."""
+        wanted = {key: set(values) for key, values in chosen.items() if values}
+        return [row for row in rows if all(str(row.get(key) or "") in values for key, values in wanted.items())]
+
+    def report_filter_values(rows: list[dict]) -> dict:
+        """Every value of each filter over the whole report (Material: code and name)."""
+        names: dict[str, str] = {}
+        for row in rows:
+            names.setdefault(row["material_code"], row.get("material_name") or "")
+        out = {"material_code": [[code, names[code]] for code in sorted(names, key=str.casefold)]}
+        for key in REPORT_FILTER_KEYS[1:]:
+            out[key] = sorted({str(row.get(key) or "") for row in rows if row.get(key)}, key=str.casefold)
+        return out
+
     @app.get("/api/planning/report")
-    def analysis_report(request: Request, start_month: str, end_month: str, workspace: str = "trial", offset: int = 0, limit: int = 1000):
+    def analysis_report(request: Request, start_month: str, end_month: str, workspace: str = "trial", offset: int = 0, limit: int = 1000,
+                        material: list[str] = Query(default=[]), supplier: list[str] = Query(default=[]), tier: list[str] = Query(default=[]), criticality: list[str] = Query(default=[])):
         current_user(request)
         _check_supply_role(request)
         _validate_workspace(workspace)
@@ -6597,25 +6615,30 @@ def install_planning(app: FastAPI, session_factory: sessionmaker) -> None:
             raise HTTPException(status_code=422, detail="Use limit 1–5000 and a non-negative offset")
         with open_db() as db:
             rows = _planning_report(db, workspace, start_month, end_month)
-            return {"workspace": workspace, "start_month": start_month, "end_month": end_month, "total": len(rows), "offset": offset, "limit": limit, "items": rows[offset:offset + limit]}
+        filters = report_filter_values(rows)
+        rows = report_filtered(rows, {"material_code": material, "supplier_name": supplier, "tier": tier, "criticality": criticality})
+        return {"workspace": workspace, "start_month": start_month, "end_month": end_month, "total": len(rows), "offset": offset, "limit": limit,
+                "items": rows[offset:offset + limit], "filters": filters}
 
     @app.get("/api/planning/report.xlsx")
-    def analysis_excel(request: Request, start_month: str, end_month: str, workspace: str = "trial"):
+    def analysis_excel(request: Request, start_month: str, end_month: str, workspace: str = "trial",
+                    material: list[str] = Query(default=[]), supplier: list[str] = Query(default=[]), tier: list[str] = Query(default=[]), criticality: list[str] = Query(default=[])):
         current_user(request)
         _check_supply_role(request)
         _validate_workspace(workspace)
         with open_db() as db:
-            rows = _planning_report(db, workspace, start_month, end_month)
+            rows = report_filtered(_planning_report(db, workspace, start_month, end_month), {"material_code": material, "supplier_name": supplier, "tier": tier, "criticality": criticality})
         output = _report_workbook(_without_prices(rows, request), f"Shortage and excess · {start_month} to {end_month}")
         return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="dtc-analysis-{start_month}-{end_month}.xlsx"'})
 
     @app.get("/api/planning/report.pdf")
-    def analysis_pdf(request: Request, start_month: str, end_month: str, workspace: str = "trial"):
+    def analysis_pdf(request: Request, start_month: str, end_month: str, workspace: str = "trial",
+                    material: list[str] = Query(default=[]), supplier: list[str] = Query(default=[]), tier: list[str] = Query(default=[]), criticality: list[str] = Query(default=[])):
         current_user(request)
         _check_supply_role(request)
         _validate_workspace(workspace)
         with open_db() as db:
-            rows = _planning_report(db, workspace, start_month, end_month)
+            rows = report_filtered(_planning_report(db, workspace, start_month, end_month), {"material_code": material, "supplier_name": supplier, "tier": tier, "criticality": criticality})
         output = _report_pdf(rows, f"Shortage and excess · {start_month} to {end_month}")
         return StreamingResponse(output, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="dtc-analysis-{start_month}-{end_month}.pdf"'})
 

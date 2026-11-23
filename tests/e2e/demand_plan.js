@@ -103,6 +103,23 @@ const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail
   // Savera's POs are fixed inside its lead time: JGI's requirement does not change
   check("T2: JGI / TATA requirement unchanged (POs fixed in lead time)", imp2.length >= 2 && imp2.every((r) => r[2] === "0"), JSON.stringify(imp2));
   check("Excel link follows the tier", /rev-impact\.xlsx\?.*tier=T2/.test(await page.getAttribute("#impExcel", "href")));
+  // Shortage & excess report: Material filter lists every material of the report (from the server), with a hint when not found
+  await page.click('[data-report-tab="report"]');
+  await page.waitForFunction(() => document.querySelectorAll("#reportFilters details").length === 4);
+  await page.waitForFunction(() => document.querySelectorAll("#reportTable tbody tr td").length > 1);
+  await page.click("#reportFilters details:first-child summary");
+  const options = await page.locator("#reportFilters details:first-child .multi-options label").allTextContents();
+  check("Material filter: code and name of the report's materials", options.some((t) => t.startsWith("UF220BFB010") && t.includes("Base Front Beam")), JSON.stringify(options));
+  await page.fill("#reportFilters details:first-child .multi-search", "FL001MICROCHIP");
+  check("Search for a material not in the report explains why", await page.locator("#reportFilters details:first-child .multi-hint").isVisible() && /no plan demand/.test(await page.textContent("#reportFilters details:first-child .multi-hint")));
+  await page.fill("#reportFilters details:first-child .multi-search", "UF220");
+  await page.check('#reportFilters [data-filter-key="material_code"][value="UF220BFB010"]');
+  await page.waitForFunction(() => document.querySelector("#reportFilters details:first-child summary")?.textContent === "Material (1)");
+  const mats = await page.locator("#reportTable tbody tr").evaluateAll((trs) => [...new Set(trs.map((tr) => tr.cells[1]?.querySelector("strong")?.textContent))]);
+  check("Ticking the material filters the report (server side)", JSON.stringify(mats) === JSON.stringify(["UF220BFB010"]) && /material=UF220BFB010/.test(await page.getAttribute("#reportExcel", "href")), JSON.stringify(mats));
+  await page.click('[data-action="clear-report-filters"]');
+  await page.waitForFunction(() => document.querySelector("#reportFilters details:first-child summary")?.textContent === "Material");
+  check("Clear all filters", true);
   check("No page errors", errors.length === 0, errors.join(" | "));
   await browser.close();
   const failed = results.filter((x) => !x.ok).length;
